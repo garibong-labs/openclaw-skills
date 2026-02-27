@@ -52,3 +52,7 @@ Bug reports, feature requests, and feedback welcome.
 
 - Email: contact@garibong.dev
 - Developer: [Garibong Labs](https://github.com/garibong-labs)
+
+## License
+
+MIT
