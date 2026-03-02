@@ -1,0 +1,34 @@
+# Credentials
+.credentials/
+secrets/
+
+# Daily drafts (generated content)
+blog-drafts/mk-review-*.md
+
+# Anthropic blog drafts (legacy)
+blog-drafts/anthropic-*.html
+blog-drafts/anthropic-*.md
+
+# OS
+.DS_Store
+
+# Node
+node_modules/
+
+# Python venv
+.venv/
+
+# Non-skill directories
+docs/
+projects/
+workspace-ruth/
+
+# Other scripts (not part of skill)
+scripts/ruth_tts.py
+scripts/PUBLISH-GUIDE.md
+scripts/cdp-border.py
+scripts/cleanup-save.py
+scripts/inject-html.py
+scripts/news_deep_dive_publish.py
+scripts/og-cards.py
+scripts/email_notifications.py
