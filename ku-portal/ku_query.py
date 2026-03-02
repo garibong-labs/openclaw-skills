@@ -382,6 +382,137 @@ async def cmd_lms(args):
         print(f"❌ 알 수 없는 LMS 명령: {subcmd}")
 
 
+async def cmd_menu(args):
+    """학생식당 메뉴 조회 (koreapas.com, 로그인 불필요)."""
+    import httpx
+    from bs4 import BeautifulSoup, NavigableString
+    from datetime import date as dt_date
+    import re
+
+    target_date = None
+    restaurant_filter = None
+    if "--date" in args:
+        idx = args.index("--date")
+        target_date = args[idx + 1] if idx + 1 < len(args) else None
+    if "--restaurant" in args:
+        idx = args.index("--restaurant")
+        restaurant_filter = args[idx + 1] if idx + 1 < len(args) else None
+    if not target_date:
+        target_date = str(dt_date.today())
+
+    SKIP = re.compile(r"원산지|알레르기|제공되는 메뉴|리뷰 쓰기|「|」|· \d|식단 업데이트|^\s*$")
+    ICON = re.compile(r"^(restaurant|help_outline|open_in_new|expand_more|expand_less|arrow_forward_ios)$")
+
+    def clean(t):
+        return t.replace("?", "₩").strip()
+
+    def extract_meals(box_bottom):
+        meals = {}
+        for ms in box_bottom.find_all("span", class_="medu"):
+            meal_base = clean(ms.get_text(strip=True))
+            parent = ms.parent  # medu span의 div
+            sibs = [s for s in parent.next_siblings if not isinstance(s, NavigableString)]
+
+            # 다음 div가 A/B 구분자인지 확인
+            suffix = ""
+            menu_div = None
+            for sib in sibs:
+                sib_text = sib.get_text(strip=True)
+                if sib_text in ("A", "B", "C", "D"):
+                    suffix = f" {sib_text}"
+                elif sib_text and not SKIP.search(sib_text) and not ICON.match(sib_text):
+                    menu_div = sib
+                    break
+
+            meal_type = meal_base + suffix
+            if menu_div:
+                items = [clean(l) for l in menu_div.get_text(separator="\n", strip=True).splitlines()
+                         if clean(l) and not SKIP.search(clean(l)) and not ICON.match(clean(l))]
+                if items:
+                    meals[meal_type] = items
+
+        # b 태그 (크림슨테이블 등 고정메뉴)
+        if not meals:
+            for b in box_bottom.find_all("b"):
+                bt = clean(b.get_text(strip=True))
+                if not any(e in bt for e in ["🍛", "🍗", "🍙"]):
+                    continue
+                items = []
+                for sib in b.next_siblings:
+                    if isinstance(sib, NavigableString):
+                        line = clean(str(sib))
+                        if line and not SKIP.search(line) and not ICON.match(line):
+                            items.append(line)
+                    elif hasattr(sib, 'find') and sib.find("b"):
+                        break
+                    elif hasattr(sib, 'get_text'):
+                        for line in sib.get_text(separator="\n", strip=True).splitlines():
+                            line = clean(line)
+                            if line and not SKIP.search(line) and not ICON.match(line):
+                                items.append(line)
+                if items:
+                    meals[bt] = items
+        return meals
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get("https://www.koreapas.com/m/sik.php")
+        html = resp.content.decode("euc-kr", errors="replace")
+
+    soup = BeautifulSoup(html, "lxml")
+    menu_list = soup.find(class_="menu-list")
+    if not menu_list:
+        print("❌ 메뉴 정보를 가져올 수 없어요.")
+        return
+
+    children = [c for c in menu_list.children if not isinstance(c, NavigableString)]
+    current_date = target_date  # date_big 이전 = 오늘
+    current_rest = None
+    results = {target_date: []}
+
+    for child in children:
+        classes = child.get("class") or []
+
+        if "date_big" in classes:
+            m = re.match(r"(\d{4}-\d{2}-\d{2})", child.get_text(strip=True))
+            if m:
+                current_date = m.group(1)
+                if current_date not in results:
+                    results[current_date] = []
+            continue
+
+        if "box_top" in classes:
+            rest_text = child.get_text(strip=True)
+            current_rest = re.sub(r"restaurant|help_outline", "", rest_text).strip()
+            continue
+
+        if "box_bottom" in classes and current_rest and current_date in results:
+            meals = extract_meals(child)
+            if meals:
+                existing = next((r for r in results[current_date] if r[0] == current_rest), None)
+                if existing:
+                    existing[1].update(meals)
+                else:
+                    results[current_date].append([current_rest, meals])
+
+    data = results.get(target_date, [])
+    if restaurant_filter:
+        data = [(r, m) for r, m in data if restaurant_filter in r]
+
+    if not data:
+        print(f"🍽️ {target_date} 메뉴 정보가 없어요.")
+        return
+
+    print(f"🍽️ {target_date} 고려대 학식\n")
+    for rest_name, meals in data:
+        if meals:
+            print(f"🏫 {rest_name}")
+            for meal_type, items in meals.items():
+                print(f"  {meal_type}")
+                for item in items:
+                    print(f"    · {item}")
+            print()
+
+
 COMMANDS = {
     "library": cmd_library,
     "notices": cmd_notices,
@@ -393,6 +524,7 @@ COMMANDS = {
     "syllabus": cmd_syllabus,
     "mycourses": cmd_mycourses,
     "lms": cmd_lms,
+    "menu": cmd_menu,
 }
 
 
