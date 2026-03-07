@@ -5,7 +5,7 @@
  * 
  * 전제조건:
  *   - 티스토리 로그인 완료 상태
- *   - https://bongman.tistory.com/manage/newpost 페이지에 있어야 함
+ *   - https://YOUR-BLOG.tistory.com/manage/newpost 페이지에 있어야 함
  *   - 대표이미지용 배너 파일이 로컬에 준비되어 있어야 함
  * 
  * 순서:
@@ -284,7 +284,7 @@ function selectBorderStyle() {
  */
 /**
  * insertContent() 후 호출: data-og-placeholder 요소를 찾아 OG 카드 URL 목록 반환
- * Ruth가 이 목록을 순서대로 insertOGCard()에 넘기면 됨
+ * 이 목록을 순서대로 insertOGCard()에 넘기면 됨
  */
 function getOGPlaceholders() {
   const editor = tinymce.activeEditor;
@@ -618,7 +618,7 @@ function verifyBannerUpload() {
   if (!firstImg) return { success: false, error: 'no image in editor' };
 
   const src = firstImg.src;
-  const isServer = src.startsWith('https://') && !src.startsWith('https://bongman.tistory.com/manage');
+  const isServer = src.startsWith('https://') && !src.includes('/manage');
   const isBlob = src.startsWith('blob:');
   const isData = src.startsWith('data:');
 
@@ -805,7 +805,7 @@ async function setRepresentImageFromEditor() {
     success: false,
     error: 'represent button not found',
     imageUrl: imgUrl,
-    hint: '아래 버튼 중 대표이미지 버튼 찾아서 Eli에게 셀렉터 알려줘',
+    hint: '아래 버튼 중 대표이미지 버튼 찾아서 셀렉터 확인 필요',
     visibleButtons: visibleBtns.slice(0, 20),
   };
 }

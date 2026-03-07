@@ -10,7 +10,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 
 // --- Configuration ---
-const BLOG_NAME = 'bongman';
+const BLOG_NAME = 'YOUR-BLOG'; // 자신의 블로그명으로 변경
 const CATEGORY_NAME = '신문 리뷰'; // or '주식 기타'
 const TARGET_URL = process.argv[2];
 
@@ -28,7 +28,7 @@ async function main() {
     // 1. Fetch News Content
     console.log("📥 Fetching news content...");
     // (Here we would typically use a fetch tool or library. For this script, we assume the agent runs the steps interactively or via tools)
-    // This script is a placeholder for the logic Eli/Ruth executes via OpenClaw tools.
+    // This script is a placeholder for the logic agents execute via OpenClaw tools.
     
     console.log(`
     [Automation Guide]
