@@ -31,6 +31,11 @@ date "+%Y년 %m월 %d일 (%A)"
 - 경로 예시: `~/.openclaw/workspace-ruth/blog-drafts/mk-review-YYYY-MM-DD.html`
 - OG 카드 자리표시는 반드시 `<p data-og-placeholder="기사URL">&#8203;</p>` 형태 유지
 
+4. **HTML 포맷 규칙 (필수)**
+- **단락 = 여러 문장 묶음**: `<p>` 하나에 2~4문장. 문장마다 `<p>` 분리 금지
+- 카테고리는 반드시 **`신문 리뷰`** 확인 (스크립트가 자동 선택하지만, HTML 준비 단계에서도 인지할 것)
+- 참고 기준: <https://bongman.tistory.com/1309> 수준으로 작성
+
 ---
 
 ## 1단계: 배너 생성
