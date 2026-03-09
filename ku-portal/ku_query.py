@@ -495,8 +495,11 @@ async def cmd_menu(args):
                     results[current_date].append([current_rest, meals])
 
     data = results.get(target_date, [])
+    # 별칭 매핑 (애기능 = 자연계)
+    ALIAS = {"애기능": "자연계"}
     if restaurant_filter:
-        data = [(r, m) for r, m in data if restaurant_filter in r]
+        rf = ALIAS.get(restaurant_filter, restaurant_filter)
+        data = [(r, m) for r, m in data if rf in r]
 
     if not data:
         print(f"🍽️ {target_date} 메뉴 정보가 없어요.")
@@ -543,6 +546,7 @@ def main():
         print("  syllabus    강의계획서")
         print("  mycourses   내 수강과목")
         print("  lms         LMS (courses|assignments|modules|todo|dashboard|grades|submissions|quizzes)")
+        print("  menu        학식 메뉴 조회 (로그인 불필요) [--date YYYY-MM-DD] [--restaurant 식당명]")
         return
 
     cmd = sys.argv[1]

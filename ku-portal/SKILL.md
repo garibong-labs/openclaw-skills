@@ -23,6 +23,9 @@ python3 ~/.openclaw/workspace/skills/ku-portal/ku_query.py <command> [options]
 ### 로그인 불필요
 - `library` — 전체 도서관 좌석 현황
 - `library --name 중앙도서관` — 특정 도서관 좌석
+- `menu` — 오늘 전체 학식 메뉴 (koreapas.com 기반)
+- `menu --restaurant 교직원식당` — 특정 식당만 필터
+- `menu --date 2026-03-10` — 특정 날짜 메뉴
 
 ### 로그인 필요 (KUPID SSO)
 자격 증명: `~/.config/ku-portal/credentials.json`
