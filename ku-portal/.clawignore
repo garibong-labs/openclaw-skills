@@ -1,4 +1,7 @@
+.venv
 .venv/
+.venv/**
 __pycache__/
+**/__pycache__/
 ku_daily_notices.py
 ku_class_reminder.py
