@@ -4,11 +4,31 @@ description: 고려대학교 KUPID 포털 조회. 공지사항, 학사일정, �
 metadata:
   openclaw:
     min: "2026.2.0"
+    requires:
+      bins: ["python3"]
+      config:
+        - "~/.config/ku-portal/credentials.json"
+        - "~/.cache/ku-portal-mcp/session.json"
+        - "~/.cache/ku-portal-mcp/lms_session.json"
+        - "~/.cache/ku-portal-mcp/server.log"
+        - "~/Downloads/ku_timetable.ics"
 ---
 
 # KU Portal - 고려대학교 KUPID 포털 스킬
 
 고려대학교 KUPID 포털, 도서관, LMS 정보를 조회하는 OpenClaw 스킬.
+
+## 로컬 파일 접근
+
+이 스킬은 로그인/캐시/내보내기 기능 때문에 아래 경로를 사용합니다.
+
+- 읽기: `~/.config/ku-portal/credentials.json` — KUPID 자격 증명
+- 쓰기/읽기: `~/.cache/ku-portal-mcp/session.json` — 포털 세션 캐시
+- 쓰기/읽기: `~/.cache/ku-portal-mcp/lms_session.json` — LMS 세션 캐시
+- 쓰기: `~/.cache/ku-portal-mcp/server.log` — MCP 서버 로그
+- 쓰기: `~/Downloads/ku_timetable.ics` — 시간표 ICS 내보내기 (`timetable --ics` 사용 시)
+
+자격 증명 파일은 스킬 디렉터리 밖(`~/.config`)에 두며, git/ClawHub 배포 대상에 포함되지 않습니다.
 
 ## 사용법
 

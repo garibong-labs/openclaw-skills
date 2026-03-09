@@ -86,11 +86,14 @@ python3 ku_query.py lms dashboard
 python3 ku_query.py lms grades <course_id>
 ```
 
-## 보안
+## 로컬 파일 접근 / 보안
 
-- 자격 증명은 `~/.config/ku-portal/credentials.json`에 저장 (chmod 600)
-- 워크스페이스 밖이라 git 추적 안 됨
-- 세션 캐시: `~/.cache/ku-portal-mcp/session.json` (30분 TTL)
+- 자격 증명 읽기: `~/.config/ku-portal/credentials.json` (chmod 600 권장)
+- 포털 세션 캐시: `~/.cache/ku-portal-mcp/session.json` (30분 TTL)
+- LMS 세션 캐시: `~/.cache/ku-portal-mcp/lms_session.json` (약 25분 TTL)
+- 서버 로그: `~/.cache/ku-portal-mcp/server.log`
+- ICS 내보내기: `~/Downloads/ku_timetable.ics` (`timetable --ics` 사용 시 생성)
+- 자격 증명은 스킬 디렉터리 밖이라 git/ClawHub 번들에 포함되지 않음
 
 ## 라이선스
 
