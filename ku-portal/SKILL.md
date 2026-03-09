@@ -12,10 +12,19 @@ metadata:
 
 ## 사용법
 
-모든 명령은 venv 활성화 후 실행:
+모든 명령은 스킬 디렉터리 기준으로 실행하거나, OpenClaw가 제공하는 `{baseDir}`를 사용하세요.
+
 ```bash
-source ~/.openclaw/workspace/skills/ku-portal/.venv/bin/activate
-python3 ~/.openclaw/workspace/skills/ku-portal/ku_query.py <command> [options]
+source {baseDir}/.venv/bin/activate
+python3 {baseDir}/ku_query.py <command> [options]
+```
+
+또는:
+
+```bash
+cd <skill-dir>
+source .venv/bin/activate
+python3 ku_query.py <command> [options]
 ```
 
 ## 명령어
