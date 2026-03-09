@@ -22,13 +22,16 @@
 # 1. 스킬 설치
 clawhub install garibong-labs/ku-portal
 
-# 2. Python venv 생성 + 패키지 설치
-cd ~/.openclaw/workspace/skills/ku-portal
-python3 -m venv .venv
-source .venv/bin/activate
-pip install ku-portal-mcp
+# 2. 스킬 디렉터리로 이동
+cd <skill-dir>
+# 예: ~/.openclaw/workspace/skills/<publisher>/ku-portal
 
-# 3. 자격 증명 설정 (로그인 기능 사용 시)
+# 3. Python venv 생성 + 패키지 설치
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install ku-portal-mcp
+
+# 4. 자격 증명 설정 (로그인 기능 사용 시)
 mkdir -p ~/.config/ku-portal
 cat > ~/.config/ku-portal/credentials.json << 'EOF'
 {"id": "your-kupid-id", "pw": "your-kupid-password"}
@@ -36,11 +39,19 @@ EOF
 chmod 600 ~/.config/ku-portal/credentials.json
 ```
 
+OpenClaw 스킬 문서 안에서는 `{baseDir}`를 사용할 수 있습니다.
+
+```bash
+. {baseDir}/.venv/bin/activate
+python3 {baseDir}/ku_query.py lms courses
+```
+
 ## 사용법
 
 ```bash
-# venv 활성화 후 실행
-source ~/.openclaw/workspace/skills/ku-portal/.venv/bin/activate
+# 먼저 스킬 디렉터리로 이동
+cd <skill-dir>
+. .venv/bin/activate
 
 # 도서관 좌석 (로그인 불필요)
 python3 ku_query.py library
