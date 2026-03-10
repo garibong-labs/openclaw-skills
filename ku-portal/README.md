@@ -2,7 +2,15 @@
 
 고려대학교 KUPID 포털, 도서관, Canvas LMS 정보를 OpenClaw에서 조회하는 스킬.
 
-> 원본: [SonAIengine/ku-portal-mcp](https://github.com/SonAIengine/ku-portal-mcp)를 OpenClaw 스킬로 래핑.
+> 원본: [SonAIengine/ku-portal-mcp](https://github.com/SonAIengine/ku-portal-mcp)를 참고하여 OpenClaw 스킬로 독립 구현.
+
+## 아키텍처 (ku-portal-mcp와의 관계)
+
+- **ku-portal-mcp** (upstream): MCP 서버 프로젝트. Claude Code 등에서 MCP 프로토콜로 연동.
+- **ku-portal 스킬** (이 저장소): `ku_query.py` 기반 **독립 CLI 구현**. MCP 서버와 연동 없음.
+- upstream의 스크래핑 로직/엔드포인트를 **참고**하되, 코드는 별도 작성.
+- upstream에 신기능이 추가되면 **수동 포팅** 필요 (자동 반영 안 됨).
+- fork 저장소 ([garibong-labs/ku-portal-mcp](https://github.com/garibong-labs/ku-portal-mcp))는 upstream 추적/참조용.
 
 ## 기능
 
