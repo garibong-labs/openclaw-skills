@@ -7,7 +7,26 @@ import os
 import sys
 from pathlib import Path
 
+SKILL_DIR = Path(__file__).resolve().parent
+VENV_DIR = SKILL_DIR / ".venv"
 CREDS_FILE = Path.home() / ".config" / "ku-portal" / "credentials.json"
+
+
+def _check_deps():
+    """ku-portal-mcp 패키지 존재 여부 확인. 없으면 안내 후 종료."""
+    try:
+        import ku_portal_mcp  # noqa: F401
+    except ImportError:
+        print("❌ ku-portal-mcp 패키지가 설치되어 있지 않습니다.")
+        print()
+        if VENV_DIR.exists():
+            print("가상환경은 있지만 패키지가 없습니다. 아래 명령으로 설치하세요:")
+            print(f"  source {VENV_DIR}/bin/activate")
+            print(f"  pip install ku-portal-mcp")
+        else:
+            print("자동 설치 스크립트를 실행하세요:")
+            print(f"  bash {SKILL_DIR}/scripts/setup.sh")
+        sys.exit(1)
 
 def load_credentials():
     """Load KUPID credentials from config file."""
@@ -532,6 +551,8 @@ COMMANDS = {
 
 
 def main():
+    _check_deps()
+
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("사용법: ku_query.py <command> [options]")
         print()

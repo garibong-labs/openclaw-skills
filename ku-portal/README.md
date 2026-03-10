@@ -2,14 +2,13 @@
 
 고려대학교 KUPID 포털, 도서관, Canvas LMS 정보를 OpenClaw에서 조회하는 스킬.
 
-> 원본: [SonAIengine/ku-portal-mcp](https://github.com/SonAIengine/ku-portal-mcp)를 참고하여 OpenClaw 스킬로 독립 구현.
+> 원본: [SonAIengine/ku-portal-mcp](https://github.com/SonAIengine/ku-portal-mcp) 패키지를 Python 라이브러리로 사용하는 OpenClaw CLI 래퍼.
 
 ## 아키텍처 (ku-portal-mcp와의 관계)
 
-- **ku-portal-mcp** (upstream): MCP 서버 프로젝트. Claude Code 등에서 MCP 프로토콜로 연동.
-- **ku-portal 스킬** (이 저장소): `ku_query.py` 기반 **독립 CLI 구현**. MCP 서버와 연동 없음.
-- upstream의 스크래핑 로직/엔드포인트를 **참고**하되, 코드는 별도 작성.
-- upstream에 신기능이 추가되면 **수동 포팅** 필요 (자동 반영 안 됨).
+- **ku-portal-mcp** (upstream): MCP 서버 프로젝트이자 PyPI 패키지.
+- **ku-portal 스킬** (이 저장소): `ku_query.py`가 ku-portal-mcp의 내부 모듈(`auth`, `courses`, `library` 등)을 **Python 라이브러리로 직접 import**하여 사용. MCP 프로토콜은 사용하지 않음.
+- upstream 패키지 업데이트(`pip install --upgrade ku-portal-mcp`)로 신기능이 반영됨.
 - fork 저장소 ([garibong-labs/ku-portal-mcp](https://github.com/garibong-labs/ku-portal-mcp))는 upstream 추적/참조용.
 
 ## 기능
@@ -30,16 +29,22 @@
 # 1. 스킬 설치
 clawhub install garibong-labs/ku-portal
 
-# 2. 스킬 디렉터리로 이동
-cd <skill-dir>
-# 예: ~/.openclaw/workspace/skills/<publisher>/ku-portal
+# 2. 자동 설치 (venv 생성 + 패키지 설치 + 안내)
+bash scripts/setup.sh
+```
 
-# 3. Python venv 생성 + 패키지 설치
+또는 수동 설치:
+
+```bash
+# 스킬 디렉터리로 이동
+cd <skill-dir>
+
+# Python venv 생성 + 패키지 설치
 python3 -m venv .venv
 . .venv/bin/activate
 python3 -m pip install ku-portal-mcp
 
-# 4. 자격 증명 설정 (로그인 기능 사용 시)
+# 자격 증명 설정 (로그인 기능 사용 시)
 mkdir -p ~/.config/ku-portal
 cat > ~/.config/ku-portal/credentials.json << 'EOF'
 {"id": "your-kupid-id", "pw": "your-kupid-password"}
