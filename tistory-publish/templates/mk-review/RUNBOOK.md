@@ -41,11 +41,10 @@ bash scripts/publish.sh \
   --category "신문 리뷰" \
   --tags "매경,매일경제,신문리뷰,태그4,태그5" \
   --banner "/tmp/mk-banner-YYYY-MM-DD.jpg" \
-  --blog "your-blog.tistory.com" \
-  --private
+  --blog "your-blog.tistory.com"
 ```
 
-> 실전 발행 시 `--private` 제거.
+> ⚠️ `--private` 플래그 사용 금지 (기본 공개 발행).
 
 ---
 
