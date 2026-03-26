@@ -1,6 +1,6 @@
 # tistory-publish
 
-티스토리 블로그 범용 자동 발행 스킬. agent-browser(Playwright CLI)로 TinyMCE 에디터를 조작해 어떤 형식의 글이든 자동 발행합니다.
+티스토리 블로그 범용 자동 발행 스킬. OpenClaw Playwright CDP로 TinyMCE 에디터를 조작해 어떤 형식의 글이든 자동 발행합니다.
 
 ## 왜 브라우저 자동화?
 
@@ -59,11 +59,11 @@ templates/
 
 ## 기술 스택
 
-- **브라우저**: [agent-browser](https://github.com/anthropics/agent-browser) (Playwright CLI)
-- **에디터**: TinyMCE DOM API, `execCommand`, nativeSetter
+- **브라우저**: OpenClaw Playwright CDP (`connect_over_cdp`)
+- **에디터**: TinyMCE DOM API, `setContent`, `save`, native 이벤트 보조
 - **배너 생성**: Node.js Canvas (`@napi-rs/canvas`, 선택)
 - **OG 카드**: JS(URL 준비) + Playwright(Enter 키) 조합
-- **태그**: nativeSetter + InputEvent + KeyboardEvent
+- **태그**: helper 함수 + 이벤트 디스패치
 
 ## 나만의 템플릿 만들기
 
@@ -78,7 +78,9 @@ templates/my-template/
 
 ## 전제 조건
 
-- [agent-browser](https://github.com/anthropics/agent-browser) + 프로필 (Kakao 로그인 완료)
+- OpenClaw 브라우저 서비스(CDP) 실행 가능 환경
+- 티스토리 카카오 로그인 완료(OpenClaw Chrome)
+- Python 3 + Playwright
 - Node.js 18+ (배너 생성 시)
 
 ## 라이선스

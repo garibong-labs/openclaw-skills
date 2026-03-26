@@ -81,12 +81,19 @@ function setCategory(name = '신문 리뷰') {
   const select = document.getElementById('category');
   if (!select) return { success: false, error: 'category select not found' };
   
-  const option = Array.from(select.options).find(o => o.text.trim() === name);
-  if (!option) return { success: false, error: `category "${name}" not found` };
+  // 정확 매칭 → 하위 카테고리 매칭("- OpenClaw" → "OpenClaw") → contains 매칭
+  let option = Array.from(select.options).find(o => o.text.trim() === name);
+  if (!option) {
+    option = Array.from(select.options).find(o => o.text.replace(/^-\s*/, '').trim() === name);
+  }
+  if (!option) {
+    option = Array.from(select.options).find(o => o.text.trim().includes(name));
+  }
+  if (!option) return { success: false, error: `category "${name}" not found`, available: Array.from(select.options).map(o => o.text.trim()) };
   
   select.value = option.value;
   select.dispatchEvent(new Event('change', { bubbles: true }));
-  return { success: true, category: name };
+  return { success: true, category: option.text.trim() };
 }
 
 /**
@@ -188,6 +195,105 @@ function clickPublish() {
     }
   }
   return 'publish button not found';
+}
+
+function robustClick(el) {
+  if (!el) return false;
+  try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+  try { el.focus(); } catch (e) {}
+  const events = [
+    ['pointerdown', PointerEvent],
+    ['mousedown', MouseEvent],
+    ['pointerup', PointerEvent],
+    ['mouseup', MouseEvent],
+    ['click', MouseEvent],
+  ];
+  for (const [type, Ctor] of events) {
+    try {
+      el.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true, composed: true, button: 0 }));
+    } catch (e) {}
+  }
+  try { el.click(); } catch (e) {}
+  return true;
+}
+
+function getPublishState() {
+  const buttons = Array.from(document.querySelectorAll('button'));
+  const dialog = document.querySelector('[role="dialog"]');
+  const completeBtn = buttons.find(b => b.textContent.trim() === '완료');
+
+  // 공개 발행 버튼 — 다양한 텍스트 패턴 허용
+  const PUBLISH_PATTERNS = ['공개 발행', '발행', '공개발행', '발행하기', 'Publish'];
+  const publishBtn = buttons.find(b => {
+    const t = b.textContent.trim();
+    return PUBLISH_PATTERNS.some(p => t === p || t.includes(p));
+  });
+
+  // 공개 라디오/버튼
+  const publicEl = Array.from(document.querySelectorAll('[role="dialog"] input[type="radio"], [role="dialog"] label, [role="dialog"] .item_radio, [role="dialog"] .btn_public')).find(el => {
+    return (el.textContent || '').trim().startsWith('공개') || el.value === '20' || el.getAttribute('data-value') === '20';
+  });
+
+  // 다이얼로그 내 버튼 목록 (디버그용)
+  const dialogBtns = dialog ? Array.from(dialog.querySelectorAll('button')).map(b => b.textContent.trim()) : [];
+
+  return {
+    url: location.href,
+    hasDialog: !!dialog,
+    hasCompleteButton: !!completeBtn,
+    hasPublishButton: !!publishBtn,
+    publishButtonText: publishBtn ? publishBtn.textContent.trim() : null,
+    publicChecked: !!(publicEl && (publicEl.checked !== false)),
+    dialogButtons: dialogBtns,
+    dialogTitle: dialog ? dialog.textContent.slice(0, 80) : '',
+  };
+}
+
+function openPublishDialog(maxTries = 5) {
+  for (let i = 0; i < maxTries; i++) {
+    if (document.querySelector('[role="dialog"]')) {
+      return { success: true, step: 'dialog-already-open', tries: i + 1, state: getPublishState() };
+    }
+    const btn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '완료');
+    if (!btn) {
+      return { success: false, error: 'complete button not found', tries: i + 1, state: getPublishState() };
+    }
+    robustClick(btn);
+  }
+  return { success: !!document.querySelector('[role="dialog"]'), step: 'after-clicks', tries: maxTries, state: getPublishState() };
+}
+
+function ensurePublicAndPublish(maxTries = 5) {
+  const PUBLISH_PATTERNS = ['공개 발행', '발행', '공개발행', '발행하기', 'Publish'];
+
+  for (let i = 0; i < maxTries; i++) {
+    // 공개 라디오/버튼 선택 (다이얼로그 내부 한정)
+    const dialog = document.querySelector('[role="dialog"]');
+    if (dialog) {
+      const publicTarget = Array.from(dialog.querySelectorAll('input[type="radio"], label, .item_radio, button, div')).find(el => {
+        const t = (el.textContent || '').trim();
+        return t.startsWith('공개') && !t.includes('비공개') && !t.includes('공개 발행');
+      });
+      if (publicTarget) robustClick(publicTarget);
+    }
+
+    // 발행 버튼 — 모든 버튼에서 패턴 매칭
+    const allBtns = Array.from(document.querySelectorAll('button'));
+    const publishBtn = allBtns.find(b => {
+      const t = b.textContent.trim();
+      return PUBLISH_PATTERNS.some(p => t === p || t.includes(p));
+    });
+
+    if (!publishBtn) {
+      const state = getPublishState();
+      if (i === maxTries - 1) {
+        return { success: false, error: 'publish button not found', tries: i + 1, state };
+      }
+      continue;
+    }
+    robustClick(publishBtn);
+  }
+  return { success: true, step: 'publish-clicked', tries: maxTries, state: getPublishState() };
 }
 
 
