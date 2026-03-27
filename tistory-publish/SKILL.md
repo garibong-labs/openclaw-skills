@@ -145,6 +145,22 @@ templates/my-template/
 
 ## 변경 이력
 
+### v5.0.2 (2026-03-27)
+- VirusTotal security scan 지적 수정
+- `publish.sh`: Canvas Drop fallback 제거 (base64/atob 패턴), `subprocess` → `datetime` 교체
+- `tistory-publish.js`: 레거시 함수에 LEGACY 주석 추가
+
+### v5.0.0 (2026-03-27)
+- **agent-browser → OpenClaw Playwright CDP 전환** (agent-browser `open` networkidle hang 해결)
+- 단일 Python 스크립트 내장 (bash → Python heredoc)
+- `--template` preset 지원 (mk-review, simple-post)
+- `--article-title` 자동 날짜 접두사 생성
+- `--cdp-port` 옵션 추가
+- 배너: Playwright `set_input_files`로 업로드
+- 빈 본문 방지: 발행 직전 `save()` + textarea 길이 검증
+- 비공개 저장: 다이얼로그 닫힘 확인 (리다이렉트 미발생 대응)
+- 레거시 삭제: `agent-browser-mk-publish.sh`, `tistory_post.py`, `tistory_post_cdp.py`
+
 ### v4.1.0 (2026-03-23)
 - **본문 삽입 후 길이 검증 추가**: `setContent()` 직후 `getContent().length < 100` 이면 즉시 fail
 - **발행 후 공개 페이지 재검증 추가 (Step 9)**: 발행 URL fetch → 본문 텍스트 length 확인, 짧으면 `warning: public_body_empty` 반환
@@ -154,17 +170,6 @@ templates/my-template/
 - 범용 `publish.sh` 스크립트 추가 (`--category`, `--blog` 등 인자)
 - 매경 리뷰를 `templates/mk-review/` 예시로 이동
 - 단순 발행 예시 `templates/simple-post/` 추가
-
-### v5.0.0 (2026-03-27)
-- **agent-browser → OpenClaw Playwright CDP 전환** (agent-browser `open` networkidle hang 해결)
-- 단일 Python 스크립트 내장 (bash → Python heredoc)
-- `--template` preset 지원 (mk-review, simple-post)
-- `--article-title` 자동 날짜 접두사 생성
-- `--cdp-port` 옵션 추가
-- 배너: `set_input_files` + Canvas Drop fallback
-- 빈 본문 방지: 발행 직전 `save()` + textarea 길이 검증
-- 비공개 저장: 다이얼로그 닫힘 확인 (리다이렉트 미발생 대응)
-- 레거시 삭제: `agent-browser-mk-publish.sh`, `tistory_post.py`, `tistory_post_cdp.py`
 
 ### v3.0.0 (2026-03-07)
 - OpenClaw Playwright → agent-browser 전환
