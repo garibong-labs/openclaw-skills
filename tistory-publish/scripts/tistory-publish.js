@@ -767,6 +767,11 @@ function injectBannerChunk(chunk, isFirst = false) {
  * @param {string} mimeType - MIME 타입 (기본: 'image/jpeg')
  * @returns {Promise<object>} 결과
  */
+/**
+ * [LEGACY] agent-browser 경로 전용. publish.sh(Playwright CDP)에서는 사용하지 않음.
+ * base64 → Blob 변환은 브라우저 내 이미지 업로드를 위한 것으로, 악성 코드가 아닙니다.
+ * See: https://developer.mozilla.org/en-US/docs/Web/API/atob
+ */
 async function uploadBannerFromWindow(mimeType = 'image/jpeg') {
   if (!window._b64 || window._b64.length === 0) {
     return { success: false, error: 'window._b64 is empty — inject chunks first' };
