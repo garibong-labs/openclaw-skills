@@ -72,7 +72,7 @@ if [[ -n "$TEMPLATE" ]]; then
   case "$TEMPLATE" in
     mk-review)
       if [[ -n "$ARTICLE_TITLE" && -z "$TITLE" ]]; then
-        DOW_KR=$(python3 -c "dow='일월화수목금토';import subprocess;r=subprocess.run(['date','+%w'],capture_output=True,text=True);print(dow[int(r.stdout.strip())])")
+        DOW_KR=$(python3 -c "from datetime import datetime;d=datetime.now();dow='월화수목금토일';print(dow[d.weekday()])")
         DATE_PREFIX=$(date "+%Y.%m.%d(${DOW_KR})")
         TITLE="[매경] ${DATE_PREFIX} - ${ARTICLE_TITLE}"
       fi
@@ -101,7 +101,7 @@ fi
 log "Launching Playwright CDP publish (port=$CDP_PORT)"
 
 python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" << 'PYTHON_SCRIPT'
-import sys, json, time, os, re, base64
+import sys, json, time, os, re
 
 CDP_PORT   = sys.argv[1]
 BLOG       = sys.argv[2]
@@ -238,30 +238,7 @@ with sync_playwright() as p:
             log(f"  ⚠️ 배너 업로드 실패: {e}")
 
         if not uploaded:
-            log("  - Canvas Drop 방식으로 재시도...")
-            try:
-                banner_b64 = base64.b64encode(open(BANNER, 'rb').read()).decode()
-                ext = os.path.splitext(BANNER)[1].lower()
-                mime = {'jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.gif':'image/gif'}.get(ext, 'image/jpeg')
-                drop_result = page.evaluate(f"""async () => {{
-                    const b64 = '{banner_b64}';
-                    const binary = atob(b64);
-                    const bytes = new Uint8Array(binary.length);
-                    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-                    const file = new File([bytes], 'banner{ext}', {{type: '{mime}'}});
-                    const dt = new DataTransfer();
-                    dt.items.add(file);
-                    const iframe = tinymce.activeEditor.iframeElement;
-                    const body = iframe.contentDocument.body;
-                    const evt = new DragEvent('drop', {{dataTransfer: dt, bubbles: true}});
-                    body.dispatchEvent(evt);
-                    return 'dropped';
-                }}""")
-                time.sleep(4)
-                uploaded = True
-                log(f"  - Canvas Drop: {drop_result}")
-            except Exception as e:
-                log(f"  ⚠️ Canvas Drop도 실패: {e}")
+            log("  ⚠️ 배너 업로드 실패 — 발행은 계속 진행")
         log(f"Step 4: {'완료' if uploaded else '⚠️ 미완료 (발행은 계속)'}")
     else:
         log("Step 4: 배너 생략")
