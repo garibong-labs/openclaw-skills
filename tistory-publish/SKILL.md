@@ -145,6 +145,11 @@ templates/my-template/
 
 ## 변경 이력
 
+### v5.0.3 (2026-03-27)
+- OpenClaw security scan 지적 수정
+- `banner.js`: `child_process.execSync` 제거 → 클립보드 복사는 터미널 안내로 대체
+- `deep-dive.js`: 미사용 `child_process` import 제거
+
 ### v5.0.2 (2026-03-27)
 - VirusTotal security scan 지적 수정
 - `publish.sh`: Canvas Drop fallback 제거 (base64/atob 패턴), `subprocess` → `datetime` 교체

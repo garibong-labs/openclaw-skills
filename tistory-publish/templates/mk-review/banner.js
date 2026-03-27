@@ -125,11 +125,11 @@ async function cropBanner(inputBuffer, width, height, border = DEFAULT_BORDER) {
 // addBorder() 제거됨 — 테두리는 cropBanner() 내 SVG 오버레이로 처리 (1150x630 고정)
 
 function copyToClipboard(filePath) {
-  const { execSync } = require('child_process');
-  // macOS: osascript로 이미지를 클립보드에 복사
+  // 클립보드 복사는 로컬 환경 전용 편의 기능.
+  // child_process 사용을 피하기 위해 안내 메시지만 출력.
   const absPath = path.resolve(filePath);
-  const script = `set the clipboard to (read (POSIX file "${absPath}") as JPEG picture)`;
-  execSync(`osascript -e '${script}'`);
+  console.error(`📋 클립보드 복사: 터미널에서 직접 실행하세요 →`);
+  console.error(`   osascript -e 'set the clipboard to (read (POSIX file "${absPath}") as JPEG picture)'`);
 }
 
 // ── Main ────────────────────────────────────────────────────

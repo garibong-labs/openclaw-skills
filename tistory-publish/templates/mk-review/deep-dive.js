@@ -7,7 +7,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
 
 // --- Configuration ---
 const BLOG_NAME = 'YOUR-BLOG'; // 자신의 블로그명으로 변경
