@@ -145,10 +145,14 @@ templates/my-template/
 
 ## 변경 이력
 
+### v5.1.1 (2026-03-28)
+- 보안 스캔(VirusTotal/OpenClaw) 지적 수정
+- `publish.sh`에서 자격증명 처리 코드 제거 → 세션 만료 시 에러 메시지 + `scripts/login.sh` 안내로 대체
+- 로그인 기능을 `scripts/login.sh` 전용 스크립트로 분리 (자격증명 처리 범위 명시적 분리)
+
 ### v5.1.0 (2026-03-28)
-- 카카오 로그인 세션 만료 시 자동 재로그인 기능 추가
-- `~/.openclaw/secrets/kakao.json` (또는 환경변수 `KAKAO_EMAIL`/`KAKAO_PASSWORD`) 에서 자격증명 로드
-- 재로그인 성공 후 목적지 URL로 자동 재이동
+- 카카오 로그인 세션 만료 시 자동 재로그인 기능 추가 (deprecated by v5.1.1)
+- 자격증명 파일 처리가 publish.sh 내부에 포함되어 보안 스캔 오탐 발생 → 분리 필요
 
 ### v5.0.3 (2026-03-27)
 - OpenClaw security scan 지적 수정
