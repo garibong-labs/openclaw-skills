@@ -1,6 +1,15 @@
 ---
 name: tistory-publish
 description: Automate Tistory blog publishing via OpenClaw Playwright CDP. Supports any post format — handles TinyMCE editor manipulation, OG card insertion, banner upload, tag registration, category setting, and representative image selection. Includes template presets (mk-review, simple-post). Works around Tistory's isTrusted event filtering.
+runtime:
+  - python3
+  - playwright
+  - node (optional, for banner generation)
+credentials:
+  - path: ~/.openclaw/secrets/kakao.json
+    purpose: Kakao login for Tistory session recovery (used only by scripts/login.sh)
+    required: false
+    format: '{"email": "...", "password": "..."}'
 ---
 
 # Tistory Publish
@@ -15,6 +24,9 @@ Tistory Open API 종료(2024.02) 이후 유일한 자동화 경로인 브라우�
 - 티스토리 카카오 로그인 완료 (OpenClaw Chrome에서)
 - Python 3 + Playwright (`pip install playwright`)
 - Node.js 18+ (배너 생성 시, 선택)
+- (선택) `~/.openclaw/secrets/kakao.json` — 로그인 세션 만료 시 자동 복구용 (`scripts/login.sh`에서 사용)
+  - 형식: `{"email": "카카오 이메일", "password": "비밀번호"}`
+  - `publish.sh`는 이 파일을 읽지 않음 (로그인은 `login.sh`에서만 처리)
 
 ## 구조
 
@@ -144,6 +156,12 @@ templates/my-template/
 - 대표이미지 셀렉터가 Tistory 업데이트마다 변경 가능
 
 ## 변경 이력
+
+### v5.1.2 (2026-03-28)
+- OpenClaw 보안 스캔 Suspicious 지적 수정 (메타데이터 불완전)
+- frontmatter에 `runtime` 및 `credentials` 필드 선언 추가
+- 전제 조건에 `kakao.json` 자격증명 경로 및 용도 명시
+- `publish.sh`는 자격증명을 읽지 않음을 문서에 명시
 
 ### v5.1.1 (2026-03-28)
 - 보안 스캔(VirusTotal/OpenClaw) 지적 수정
