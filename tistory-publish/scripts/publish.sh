@@ -143,10 +143,42 @@ with sync_playwright() as p:
 
     page.goto(NEWPOST_URL, wait_until="domcontentloaded", timeout=30000)
 
-    # 로그인 확인
-    cur = page.url
-    if "auth/login" in cur or "accounts.kakao.com" in cur or "logins.daum.net" in cur:
-        fail(f"카카오 로그인 세션 만료 (redirected to: {cur})")
+    # 로그인 확인 + 자동 재로그인
+    def is_login_page(url):
+        return any(x in url for x in ["auth/login", "accounts.kakao.com", "logins.daum.net", "kauth.kakao.com"])
+
+    if is_login_page(page.url):
+        log("  - 로그인 세션 만료 감지 — 자동 재로그인 시도...")
+        # 자격증명 로드 (kakao.json 우선, 없으면 환경변수)
+        cred_path = os.path.expanduser("~/.openclaw/secrets/kakao.json")
+        if os.path.exists(cred_path):
+            with open(cred_path) as f:
+                cred = json.load(f)
+            kakao_id = cred.get("email") or cred.get("id") or ""
+            kakao_pw = cred.get("password") or cred.get("pw") or ""
+        else:
+            kakao_id = os.environ.get("KAKAO_EMAIL", "")
+            kakao_pw = os.environ.get("KAKAO_PASSWORD", "")
+
+        if not kakao_id or not kakao_pw:
+            fail("카카오 로그인 세션 만료 + 자격증명 없음 (~/.openclaw/secrets/kakao.json 확인 필요)")
+
+        # 카카오 로그인 폼 입력
+        try:
+            email_input = page.locator('input[placeholder*="이메일"], input[placeholder*="아이디"], input[type="email"], input[name="loginId"]').first
+            email_input.fill(kakao_id)
+            pw_input = page.locator('input[type="password"]').first
+            pw_input.fill(kakao_pw)
+            page.locator('button[type="submit"], button:has-text("로그인")').first.click()
+            page.wait_for_url(lambda url: not is_login_page(url), timeout=15000)
+            log(f"  - 재로그인 성공 → {page.url}")
+        except Exception as e:
+            fail(f"카카오 자동 로그인 실패: {e}")
+
+        # 로그인 후 목적지 재이동
+        page.goto(NEWPOST_URL, wait_until="domcontentloaded", timeout=30000)
+        if is_login_page(page.url):
+            fail(f"재로그인 후에도 로그인 페이지로 리다이렉트: {page.url}")
 
     # TinyMCE 대기
     log("  - tinymce 대기...")

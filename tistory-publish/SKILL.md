@@ -145,6 +145,11 @@ templates/my-template/
 
 ## 변경 이력
 
+### v5.1.0 (2026-03-28)
+- 카카오 로그인 세션 만료 시 자동 재로그인 기능 추가
+- `~/.openclaw/secrets/kakao.json` (또는 환경변수 `KAKAO_EMAIL`/`KAKAO_PASSWORD`) 에서 자격증명 로드
+- 재로그인 성공 후 목적지 URL로 자동 재이동
+
 ### v5.0.3 (2026-03-27)
 - OpenClaw security scan 지적 수정
 - `banner.js`: `child_process.execSync` 제거 → 클립보드 복사는 터미널 안내로 대체
