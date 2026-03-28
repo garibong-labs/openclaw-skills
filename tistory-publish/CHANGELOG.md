@@ -3,7 +3,7 @@
 ## v5.1.2 (2026-03-28)
 - OpenClaw 보안 스캔 Suspicious 지적 수정 (메타데이터 불완전)
 - frontmatter에 `runtime` 및 `credentials` 필드 선언 추가
-- 전제 조건에 `kakao.json` 자격증명 경로 및 용도 명시
+- 전제 조건에 자격증명 파일 경로 및 용도 명시
 - `publish.sh`는 자격증명을 읽지 않음을 문서에 명시
 
 ## v5.1.1 (2026-03-28)

@@ -3,27 +3,39 @@
 # publish.sh 실행 전 로그인 세션이 만료됐을 때 사용
 #
 # 사용:
-#   bash scripts/login.sh [--cdp-port 18800]
+#   bash scripts/login.sh --cred-file /path/to/credentials.json [--cdp-port 18800]
 #
-# 필요 조건:
-#   - OpenClaw Chrome CDP 실행 중 (기본 port 18800)
-#   - ~/.openclaw/secrets/kakao.json 에 자격증명
-#     형식: {"email": "...", "password": "..."}
+# 자격증명 파일 형식 (JSON 또는 key: value):
+#   {"email": "...", "password": "..."}
+#   또는
+#   email: ...
+#   password: ...
+#
+# 환경변수로도 지정 가능:
+#   TISTORY_CRED_FILE=/path/to/credentials.json
 
 set -euo pipefail
 
 CDP_PORT=18800
+CRED_FILE="${TISTORY_CRED_FILE:-}"
+
 while [[ $# -gt 0 ]]; do
   case $1 in
     --cdp-port) CDP_PORT="$2"; shift 2 ;;
+    --cred-file) CRED_FILE="$2"; shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
 
-CRED_FILE="${HOME}/.openclaw/secrets/kakao.json"
+if [[ -z "$CRED_FILE" ]]; then
+  echo "❌ 자격증명 파일 미지정"
+  echo "   사용: bash login.sh --cred-file /path/to/credentials.json"
+  echo "   또는: TISTORY_CRED_FILE=/path/to/cred.json bash login.sh"
+  exit 1
+fi
+
 if [[ ! -f "$CRED_FILE" ]]; then
   echo "❌ 자격증명 파일 없음: $CRED_FILE"
-  echo "   형식: {\"email\": \"...\", \"password\": \"...\"}"
   exit 1
 fi
 
@@ -34,9 +46,20 @@ CRED_FILE = sys.argv[2]
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 
 with open(CRED_FILE) as f:
-    cred = json.load(f)
-kakao_id = cred.get("email") or cred.get("id") or ""
-kakao_pw = cred.get("password") or cred.get("pw") or ""
+    content = f.read()
+# Support both JSON and YAML-like (key: value) format
+kakao_id = ""
+kakao_pw = ""
+try:
+    cred = json.loads(content)
+    kakao_id = cred.get("email") or cred.get("id") or ""
+    kakao_pw = cred.get("password") or cred.get("pw") or ""
+except json.JSONDecodeError:
+    import re
+    m_email = re.search(r'email:\s*(.+)', content)
+    m_pw = re.search(r'password:\s*(.+)', content)
+    if m_email: kakao_id = m_email.group(1).strip()
+    if m_pw: kakao_pw = m_pw.group(1).strip()
 if not kakao_id or not kakao_pw:
     print("❌ 자격증명 불완전 (email/password 필드 확인)")
     sys.exit(1)
