@@ -21,7 +21,7 @@ BLOG=""
 HELPER=""
 TEMPLATE=""
 PRIVATE=false
-CDP_PORT="${TISTORY_CDP_PORT:-18800}"
+CDP_PORT="${TISTORY_CDP_PORT:-18801}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ALLOW_DIRECT_TISTORY_PUBLISH="${ALLOW_DIRECT_TISTORY_PUBLISH:-}"
 RUN_TOKEN="${RUN_TOKEN:-}"
@@ -105,10 +105,12 @@ log "Launching Playwright CDP publish (port=$CDP_PORT)"
 DIRECT_NOTIFY_CHANNEL="${DIRECT_NOTIFY_CHANNEL:-}"
 DIRECT_NOTIFY_ACCOUNT="${DIRECT_NOTIFY_ACCOUNT:-}"
 PUBLISH_TRACE_FILE="${PUBLISH_TRACE_FILE:-}"
+TISTORY_LOGIN_SCRIPT="${TISTORY_LOGIN_SCRIPT:-$SCRIPT_DIR/login.sh}"
 TMP_STDERR="$(mktemp -t tistory-publish-stderr.XXXXXX)"
 
-PYTHON_RESULT=$(python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
-import sys, json, time, os, re
+PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
+import sys, json, time, os, re, subprocess
+from pathlib import Path
 
 HARD_FAIL = None
 ALLOW_MISSING_IMAGES = os.environ.get('ALLOW_MISSING_IMAGES', '').lower() in ('1','true','yes')
@@ -133,6 +135,27 @@ def fail(msg):
     print(json.dumps({"success": False, "error": msg}))
     sys.exit(1)
 
+
+def write_debug_artifacts(page, prefix):
+    try:
+        base = os.environ.get('PUBLISH_TRACE_FILE') or f'/tmp/{prefix}'
+        if base.endswith('.log'):
+            base = base[:-4]
+        html_path = f'{base}.{prefix}.html'
+        png_path = f'{base}.{prefix}.png'
+        try:
+            Path(html_path).write_text(page.content(), encoding='utf-8')
+            log(f"  - wrote html dump: {html_path}")
+        except Exception as e:
+            log(f"  ⚠️ html dump failed: {e}")
+        try:
+            page.screenshot(path=png_path, full_page=True)
+            log(f"  - wrote screenshot: {png_path}")
+        except Exception as e:
+            log(f"  ⚠️ screenshot failed: {e}")
+    except Exception as e:
+        log(f"  ⚠️ debug artifact wrapper failed: {e}")
+
 def norm_title(s):
     s = re.sub(r'\s+', ' ', s or '').strip()
     for ch in ['"', "'", '“', '”', '‘', '’']:
@@ -150,6 +173,30 @@ def wait_tinymce(page, timeout_s=40):
             return True
         time.sleep(2)
     return False
+
+def run_login_recovery():
+    cred = os.environ.get('TISTORY_LOGIN_CRED_FILE', '').strip()
+    login_script = os.environ.get('TISTORY_LOGIN_SCRIPT', '').strip()
+    if not cred:
+        return False, 'missing TISTORY_LOGIN_CRED_FILE'
+    if not login_script:
+        return False, 'missing TISTORY_LOGIN_SCRIPT'
+    try:
+        cmd = ['bash', login_script, '--cred-file', cred, '--blog', BLOG]
+        if CDP_PORT:
+            cmd += ['--cdp-port', CDP_PORT]
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            timeout=180,
+        )
+        ok = proc.returncode == 0
+        detail = (proc.stdout or proc.stderr or '').strip()[:800]
+        return ok, detail
+    except Exception as e:
+        return False, str(e)
+
 
 def get_editor_state(page):
     try:
@@ -273,6 +320,61 @@ def find_latest_post(page, title_hint, before_posts=None, timeout_s=60):
                 if m:
                     return {"id": m.group(1), "url": target['href'], "text": target['text']}
         time.sleep(2)
+    return None
+
+def find_public_post_by_rss(title_hint, timeout_s=30):
+    if not BLOG:
+        return None
+    import urllib.request
+    import xml.etree.ElementTree as ET
+    hint = norm_title(title_hint)
+    rss_url = f"https://{BLOG}/rss"
+    deadline = time.time() + timeout_s
+    last_error = None
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(rss_url, headers={'User-Agent': 'Mozilla/5.0'})
+            raw = urllib.request.urlopen(req, timeout=10).read()
+            root = ET.fromstring(raw)
+            for item in root.findall('./channel/item'):
+                title = item.findtext('title') or ''
+                link = item.findtext('link') or ''
+                if norm_title(title) == hint and link:
+                    m = re.search(r'/([0-9]+)$', link)
+                    return {'id': m.group(1) if m else None, 'url': link, 'text': title, 'source': 'rss'}
+        except Exception as e:
+            last_error = e
+        time.sleep(2)
+    if last_error:
+        log(f"  ⚠️ RSS publish confirmation failed: {last_error}")
+    return None
+
+def confirm_public_publish(page, title_hint, before_posts=None, timeout_s=30):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            current_url = page.url
+            if "/manage/posts" in current_url or re.search(r'https://[^/]+/entry/[^/?#]+', current_url):
+                latest = find_latest_post(page, title_hint, before_posts=before_posts, timeout_s=4)
+                return latest or {'id': None, 'url': current_url, 'text': title_hint, 'source': 'navigation'}
+        except Exception as e:
+            log(f"  ⚠️ navigation publish confirmation skipped: {e}")
+
+        # Public RSS is checked before navigating away from the editor. If Tistory already
+        # created the post but left the editor dialog stuck with an alert, this confirms
+        # success without discarding the still-open editor state.
+        rss_post = find_public_post_by_rss(title_hint, timeout_s=4)
+        if rss_post:
+            return rss_post
+
+        try:
+            latest = find_latest_post(page, title_hint, before_posts=before_posts, timeout_s=4)
+            if latest:
+                latest['source'] = latest.get('source') or 'manage-posts'
+                return latest
+        except Exception as e:
+            log(f"  ⚠️ manage-posts publish confirmation skipped: {e}")
+        time.sleep(1)
     return None
 
 def republish_current_editor(page, private):
@@ -400,12 +502,57 @@ with sync_playwright() as p:
     ctx0 = browser.contexts[0] if browser.contexts else browser.new_context()
     page = ctx0.new_page()
     page.on('dialog', handle_dialog)
-    page.goto(NEWPOST_URL, wait_until="domcontentloaded", timeout=30000)
+    log(f"  - target newpost url: {NEWPOST_URL}")
+    try:
+        resp = page.goto(NEWPOST_URL, wait_until="domcontentloaded", timeout=30000)
+        status = None
+        try:
+            status = resp.status if resp else None
+        except Exception:
+            status = None
+        title_now = ''
+        try:
+            title_now = page.title()
+        except Exception:
+            pass
+        log(f"  - after goto: url={page.url}, status={status}, title={title_now}")
+    except Exception as e:
+        title_now = ''
+        try:
+            title_now = page.title()
+        except Exception:
+            pass
+        log(f"  ❌ Step 1 goto exception: type={type(e).__name__}, error={e}")
+        log(f"  - page state on failure: url={getattr(page, 'url', None)}, title={title_now}")
+        write_debug_artifacts(page, 'step1-failed')
+        fail(f"Step 1 newpost goto failed: {type(e).__name__}: {e}")
 
     # 로그인 세션 확인
     _login_domains = ["auth/login", "accounts.kakao.com", "logins.daum.net", "kauth.kakao.com"]
     if any(x in page.url for x in _login_domains):
-        fail(f"카카오 로그인 세션 만료. scripts/login.sh 로 먼저 로그인하세요. (redirected: {page.url})")
+        log(f"  ⚠️ login redirect detected: {page.url}")
+        write_debug_artifacts(page, 'step1-login-redirect')
+        login_ok, login_detail = run_login_recovery()
+        log(f"  - login recovery attempted: ok={login_ok}, detail={login_detail}")
+        if login_ok:
+            try:
+                resp = page.goto(NEWPOST_URL, wait_until="domcontentloaded", timeout=30000)
+                status = None
+                try:
+                    status = resp.status if resp else None
+                except Exception:
+                    status = None
+                title_now = ''
+                try:
+                    title_now = page.title()
+                except Exception:
+                    pass
+                log(f"  - after login recovery goto: url={page.url}, status={status}, title={title_now}")
+            except Exception as e:
+                write_debug_artifacts(page, 'step1-post-login-goto-failed')
+                fail(f"Step 1 post-login goto failed: {type(e).__name__}: {e}")
+        if any(x in page.url for x in _login_domains):
+            fail(f"카카오 로그인 세션 만료. login.sh 자동 복구 후에도 로그인 페이지 유지됨. (redirected: {page.url})")
 
     # TinyMCE 대기
     log("  - tinymce 대기...")
@@ -539,10 +686,19 @@ with sync_playwright() as p:
                 log(f"  - inline image rebuild result: {rebuilt}")
                 image_debug = page.evaluate("() => ({ markers: Array.from(tinymce.activeEditor.getBody().querySelectorAll('[data-image-marker]')).length, figures: Array.from(tinymce.activeEditor.getBody().querySelectorAll('figure[data-ke-type=\"image\"]')).length, contentLength: tinymce.activeEditor.getContent().length })")
                 log(f"  - inline image editor state after rebuild: {image_debug}")
+            log(f"  - inline image editor state: {image_debug}")
+            try:
+                collected = page.evaluate("typeof collectImageFiguresByFilename === 'function' ? collectImageFiguresByFilename() : []")
+                log(f"  - inline image collected figures: {collected}")
+            except Exception as e:
+                log(f"  ⚠️ inline image collect failed: {e}")
             if image_debug.get('figures', 0) < len(image_files):
                 fail(f"inline image figure count mismatch: expected {len(image_files)}, got {image_debug.get('figures', 0)}")
             log("Step 3.5: 완료")
         except Exception as e:
+            import traceback
+            log(f"  ⚠️ inline image exception repr: {repr(e)}")
+            log(traceback.format_exc())
             fail(f"inline image upload failed: {e}")
     else:
         log("Step 3.5: inline 이미지 생략")
@@ -610,8 +766,37 @@ with sync_playwright() as p:
     if TAGS_STR:
         log("Step 7: 태그")
         tags = [t.strip() for t in TAGS_STR.split(',') if t.strip()]
-        page.evaluate(f"typeof setTags === 'function' && setTags({json.dumps(tags)})")
-        time.sleep(1)
+        try:
+            if page.is_closed():
+                fail('page closed before tag step')
+        except Exception:
+            fail('page unavailable before tag step')
+
+        try:
+            live_state = debug_newpost_state(page)
+            log(f"  - pre-tag state: {live_state}")
+        except Exception as e:
+            log(f"  ⚠️ pre-tag debug skipped: {e}")
+
+        try:
+            page.add_script_tag(path=HELPER_JS)
+            time.sleep(0.3)
+        except Exception as e:
+            log(f"  ⚠️ helper reinject skipped: {e}")
+
+        tag_input = page.locator('#tagText').first
+        tag_input.wait_for(state='visible', timeout=5000)
+        for tag in tags:
+            tag_input.click(timeout=5000)
+            tag_input.fill('', timeout=5000)
+            tag_input.type(tag, delay=20, timeout=5000)
+            tag_input.press('Enter', timeout=5000)
+            time.sleep(0.35)
+
+        chip_count = page.evaluate("document.querySelectorAll('.editor_tag .txt_tag').length")
+        log(f"  - tag chips registered: {chip_count}/{len(tags)}")
+        if chip_count < len(tags):
+            fail(f'tag registration incomplete: {chip_count}/{len(tags)}')
         log("Step 7: 완료")
     else:
         log("Step 7: 태그 생략")
@@ -644,6 +829,12 @@ with sync_playwright() as p:
 
     # ── Step 8: 발행 ──
     log("Step 8: 발행")
+    # 이전 단계의 draft recovery confirm 등은 publish 결과 판정에 섞지 않는다.
+    # 이후 publish 중 새로 발생한 alert/confirm은 handle_dialog가 다시 기록한다.
+    last_dialog_message = None
+    warning = None
+    post_info = None
+    gap_check = None
     # 발행 직전 OG 뒤 빈 문단 정리 1회 더 수행 (티스토리 직렬화 과정에서 재삽입되는 케이스 대응)
     step8_has_tinymce = wait_tinymce(page, timeout_s=20)
     if not step8_has_tinymce:
@@ -779,51 +970,27 @@ with sync_playwright() as p:
                 const t = (b.textContent || '').trim();
                 return t.includes('공개 발행') || t == '발행' || t.includes('발행하기') || t == 'Publish';
             });
-            if (btn) {
-                const beforeText = (btn.textContent || '').trim();
-                const beforeDisabled = !!btn.disabled;
-                try { btn.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
-                try { btn.focus(); } catch (e) {}
-                const dispatch = (el, type, Ctor, extra = {}) => {
-                    try { el.dispatchEvent(new Ctor(type, Object.assign({ bubbles: true, cancelable: true, composed: true, button: 0 }, extra))); } catch (e) {}
-                };
-                dispatch(btn, 'pointerover', PointerEvent);
-                dispatch(btn, 'mouseover', MouseEvent);
-                dispatch(btn, 'pointerenter', PointerEvent);
-                dispatch(btn, 'mouseenter', MouseEvent);
-                dispatch(btn, 'pointermove', PointerEvent);
-                dispatch(btn, 'mousemove', MouseEvent);
-                dispatch(btn, 'pointerdown', PointerEvent);
-                dispatch(btn, 'mousedown', MouseEvent);
-                dispatch(btn, 'pointerup', PointerEvent);
-                dispatch(btn, 'mouseup', MouseEvent);
-                dispatch(btn, 'click', MouseEvent);
-                try { btn.click(); } catch (e) {}
-                const form = btn.closest('form');
-                if (form) {
-                    try { form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); } catch (e) {}
-                    try { form.requestSubmit ? form.requestSubmit(btn) : form.submit(); } catch (e) {}
-                }
-                const root = btn.closest('[data-v-app]') || dialog;
-                const vueInstance = btn.__vue__ || btn.__vueParentComponent || root?.__vue_app__ || null;
-                const onclickResult = (() => { try { return typeof btn.onclick === 'function' ? String(btn.onclick()).slice(0,100) : null; } catch (e) { return 'onclick-error:' + e.message; } })();
-                const submitListeners = [btn.onsubmit, form?.onsubmit].filter(Boolean).length;
-                return {
-                    clicked: true,
-                    text: beforeText,
-                    radios: afterRadios,
-                    disabled: !!btn.disabled,
-                    beforeDisabled,
-                    ariaDisabled: btn.getAttribute('aria-disabled'),
-                    className: btn.className || '',
-                    hasForm: !!form,
-                    onclickResult,
-                    hasVue: !!vueInstance,
-                    submitListeners,
-                };
-            }
-            return {clicked: false, text: null, radios: afterRadios};
+            if (!btn) return {clicked: false, text: null, radios: afterRadios};
+            try { btn.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+            try { btn.focus(); } catch (e) {}
+            return {
+                clicked: false,
+                readyForNativeClick: true,
+                text: (btn.textContent || '').trim(),
+                radios: afterRadios,
+                disabled: !!btn.disabled,
+                ariaDisabled: btn.getAttribute('aria-disabled'),
+                className: btn.className || '',
+            };
         })()""")
+        if result.get('readyForNativeClick'):
+            publish_button = page.locator('[role="dialog"] button:has-text("공개 발행")').first
+            try:
+                publish_button.click(timeout=5000)
+            except Exception:
+                page.locator('[role="dialog"] button:has-text("발행")').first.click(timeout=5000)
+            result['clicked'] = True
+            result['clickMethod'] = 'playwright-native-click-once'
     log(f"  - submit click result: {result}")
     if not result.get('clicked'):
         fail(f"publish submit button not found: {get_dialog_state(page)}")
@@ -835,7 +1002,7 @@ with sync_playwright() as p:
     except Exception as e:
         log(f"  - post-submit immediate state skipped: {e}")
     if last_dialog_message:
-        fail(f"browser dialog during publish: {last_dialog_message['message']}")
+        log(f"  - browser dialog before publish wait: {last_dialog_message}")
     if PRIVATE:
         # 비공개 저장은 manage/posts 리다이렉트, 다이얼로그 닫힘, 페이지 교체/닫힘을 모두 성공 경로로 본다.
         private_saved = False
@@ -843,6 +1010,7 @@ with sync_playwright() as p:
         for i in range(15):
             try:
                 current_url = page.url
+                log(f"  - private wait[{i}] url={current_url}")
             except Exception as e:
                 log(f"  - private wait[{i}] page unavailable: {e}")
                 private_saved = True
@@ -854,6 +1022,7 @@ with sync_playwright() as p:
                 break
             try:
                 dlg_gone = page.evaluate("document.querySelector('[role=dialog]') ? 'open' : 'closed'")
+                log(f"  - private wait[{i}] dialog={dlg_gone}")
             except Exception as e:
                 log(f"  - private wait[{i}] dialog check unavailable: {e}")
                 private_saved = True
@@ -884,18 +1053,26 @@ with sync_playwright() as p:
             log(f"  - publish wait[{i}] url={current_url} readyState={load_state}")
             time.sleep(2)
         if last_dialog_message:
-            fail(f"browser dialog during publish: {last_dialog_message['message']}")
+            log(f"  - browser dialog during publish: {last_dialog_message}")
         if not published:
             log(f"  - publish wait final state: {get_dialog_state(page)}")
-            fail(f"publish did not navigate to post/manage page, state={get_dialog_state(page)} url={page.url}")
+            recovered_post = confirm_public_publish(page, final_title, before_posts=before_posts, timeout_s=30)
+            log(f"  - post-submit publish confirmation: {recovered_post}")
+            if recovered_post:
+                published = True
+                post_info = recovered_post
+                try:
+                    page.goto(POSTS_URL, wait_until="domcontentloaded", timeout=30000)
+                except Exception as e:
+                    log(f"  ⚠️ post-submit recovery navigation skipped: {e}")
+            else:
+                if last_dialog_message:
+                    fail(f"browser dialog during publish and no post found: {last_dialog_message['message']}")
+                fail(f"publish did not navigate to post/manage page, state={get_dialog_state(page)} url={page.url}")
 
     elapsed = int((time.time() - start) * 1000)
     final_url = page.url
     log(f"Step 8: 완료 — {final_url}")
-
-    warning = None
-    post_info = None
-    gap_check = None
 
     # ── Step 9: 최신 글 확인 ──
     if BLOG:
