@@ -46,7 +46,7 @@ Options:
   --banner         배너 이미지 파일
   --blog           블로그 도메인 (예: bongman.tistory.com)
   --helper         JS helper 경로
-  --cdp-port       OpenClaw Chrome CDP 포트 (기본: 18800)
+  --cdp-port       OpenClaw Chrome CDP 포트 (기본: TISTORY_CDP_PORT 또는 18801)
   --private        비공개 발행
   --require-public-image-figures N
                   공개 페이지 검증 시 image figure 최소 개수 요구 (기본: 0, 콘텐츠 정책 opt-in)
