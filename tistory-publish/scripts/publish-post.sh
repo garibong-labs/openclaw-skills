@@ -6,7 +6,7 @@
 #   bash publish-post.sh --template mk-review --article-title "기사 제목" --body-file body.html --banner banner.jpg
 #
 # 필수: --title, --body-file, --category
-# 선택: --tags, --banner, --blog, --helper, --private, --template, --article-title, --cdp-port
+# 선택: --tags, --banner, --blog, --helper, --private, --template, --article-title, --cdp-port, --require-public-image-figures
 
 set -euo pipefail
 
@@ -25,6 +25,7 @@ CDP_PORT="${TISTORY_CDP_PORT:-18801}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ALLOW_DIRECT_TISTORY_PUBLISH="${ALLOW_DIRECT_TISTORY_PUBLISH:-}"
 RUN_TOKEN="${RUN_TOKEN:-}"
+REQUIRE_PUBLIC_IMAGE_FIGURES="${REQUIRE_PUBLIC_IMAGE_FIGURES:-0}"
 
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 fail() { echo "{\"success\":false,\"error\":\"$*\"}" ; exit 1; }
@@ -47,6 +48,8 @@ Options:
   --helper         JS helper 경로
   --cdp-port       OpenClaw Chrome CDP 포트 (기본: 18800)
   --private        비공개 발행
+  --require-public-image-figures N
+                  공개 페이지 검증 시 image figure 최소 개수 요구 (기본: 0, 콘텐츠 정책 opt-in)
 EOF
 }
 
@@ -63,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --blog)          BLOG="$2"; shift 2;;
     --helper)        HELPER="$2"; shift 2;;
     --cdp-port)      CDP_PORT="$2"; shift 2;;
+    --require-public-image-figures) REQUIRE_PUBLIC_IMAGE_FIGURES="$2"; shift 2;;
     --private)       PRIVATE=true; shift;;
     -h|--help)       usage; exit 0;;
     *) echo "Unknown option: $1" >&2; usage; exit 1;;
@@ -94,6 +98,7 @@ fi
 [[ ! -f "$BODY_FILE" ]] && fail "body file not found: $BODY_FILE"
 [[ -n "$BANNER" && ! -f "$BANNER" ]] && fail "banner file not found: $BANNER"
 [[ "$TEMPLATE" == "mk-review" && -z "$BANNER" ]] && fail "--banner required for template mk-review"
+[[ ! "$REQUIRE_PUBLIC_IMAGE_FIGURES" =~ ^[0-9]+$ ]] && fail "--require-public-image-figures must be a non-negative integer"
 
 if [[ -z "$HELPER" ]]; then
   HELPER="$SCRIPT_DIR/tistory-editor-helpers.js"
@@ -108,12 +113,12 @@ PUBLISH_TRACE_FILE="${PUBLISH_TRACE_FILE:-}"
 TISTORY_LOGIN_SCRIPT="${TISTORY_LOGIN_SCRIPT:-$SCRIPT_DIR/login.sh}"
 TMP_STDERR="$(mktemp -t tistory-publish-stderr.XXXXXX)"
 
-PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
+PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" "$REQUIRE_PUBLIC_IMAGE_FIGURES" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
 import sys, json, time, os, re, subprocess
 from pathlib import Path
 
 HARD_FAIL = None
-ALLOW_MISSING_IMAGES = os.environ.get('ALLOW_MISSING_IMAGES', '').lower() in ('1','true','yes')
+ALLOW_MISSING_IMAGES = os.environ.get('ALLOW_MISSING_IMAGES', '').lower() in ('1','true','yes')  # legacy: downgrade opt-in image policy failures to warnings
 RUN_TOKEN = os.environ.get('RUN_TOKEN', '').strip()
 
 CDP_PORT   = sys.argv[1]
@@ -125,6 +130,7 @@ TAGS_STR   = sys.argv[6]
 BANNER     = sys.argv[7]
 HELPER_JS  = sys.argv[8]
 PRIVATE    = sys.argv[9] == "true"
+REQUIRE_PUBLIC_IMAGE_FIGURES = int(sys.argv[10])
 
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 NEWPOST_URL = f"https://{BLOG}/manage/newpost/?type=post" if BLOG else "https://www.tistory.com/manage/newpost/?type=post"
@@ -1102,6 +1108,8 @@ with sync_playwright() as p:
         if not post_info:
             post_info = find_latest_post(page, final_title, before_posts=before_posts, timeout_s=60)
         log(f"  - latest post info: {post_info}")
+        if not post_info or not post_info.get('url') or not post_info.get('id'):
+            fail('post publish confirmation failed: postUrl/postId not found')
 
     # ── Step 10: 발행 후 cleanup 재진입 ──
     if post_info and og_urls:
@@ -1146,17 +1154,19 @@ with sync_playwright() as p:
             vlen = len(text)
             log(f"  - 공개 페이지 본문 length: {vlen}")
             if vlen < 100:
-                warning = "public_body_empty"
-                log(f"  ⚠️ 본문 비어있음 ({vlen})")
+                HARD_FAIL = "public_body_empty"
+                log(f"  ❌ 본문 비어있음 ({vlen})")
             image_count = len(re.findall(r'<figure[^>]+data-ke-type="image"', html))
             log(f"  - 공개 페이지 이미지 figure count: {image_count}")
-            if image_count < 3:
+            if REQUIRE_PUBLIC_IMAGE_FIGURES > 0 and image_count < REQUIRE_PUBLIC_IMAGE_FIGURES:
+                policy_error = f"public_image_count_{image_count}_lt_required_{REQUIRE_PUBLIC_IMAGE_FIGURES}"
                 if ALLOW_MISSING_IMAGES:
-                    warning = f"public_image_count_{image_count}"
+                    warning = policy_error
                 else:
-                    HARD_FAIL = f"public_image_count_{image_count}"
+                    HARD_FAIL = policy_error
         except Exception as e:
-            log(f"  ⚠️ 검증 실패: {e}")
+            HARD_FAIL = f"public_verification_failed: {e}"
+            log(f"  ❌ 검증 실패: {e}")
 
     result = {"success": True, "url": final_url, "elapsed_ms": elapsed, "private": PRIVATE}
     if post_info:
