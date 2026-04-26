@@ -71,6 +71,7 @@ bash scripts/publish-post.sh \
 | `--cdp-port` | | Chrome CDP 포트. 운영 파이프라인에서는 명시 권장 |
 | `--helper` | | `tistory-editor-helpers.js` 경로 |
 | `--private` | | 비공개 저장 |
+| `--require-public-image-figures` | | 공개 페이지 image figure 최소 개수 요구. 기본 0 |
 
 ## 주요 환경변수
 
@@ -81,7 +82,8 @@ bash scripts/publish-post.sh \
 | `TISTORY_LOGIN_SCRIPT` | 로그인 복구 스크립트 경로. 기본값은 `scripts/login.sh` |
 | `TISTORY_LOGIN_CRED_FILE` | 로그인 복구용 자격증명 파일. `login.sh`에서만 사용 |
 | `TISTORY_INLINE_IMAGE_FILES` | `:` 구분 이미지 파일 목록. 본문 이미지 marker에 업로드/배치 |
-| `ALLOW_MISSING_IMAGES=1` | 공개 페이지 이미지 개수 부족을 hard fail 대신 warning으로 처리 |
+| `REQUIRE_PUBLIC_IMAGE_FIGURES=N` | 공개 페이지 검증 시 image figure 최소 개수를 요구. 기본값 0, 콘텐츠 정책 opt-in |
+| `ALLOW_MISSING_IMAGES=1` | legacy 호환용. opt-in 이미지 정책 실패를 hard fail 대신 warning으로 낮춤 |
 | `RUN_TOKEN` | 발행 전후 글 목록 비교용 실행 토큰 |
 | `PUBLISH_TRACE_FILE` | 발행 trace 로그 저장 경로 |
 | `DIRECT_NOTIFY_CHANNEL` / `DIRECT_NOTIFY_ACCOUNT` | wrapper가 직접 결과 알림을 보낼 때 사용 |
@@ -93,7 +95,7 @@ bash scripts/publish-post.sh \
 1. `TISTORY_INLINE_IMAGE_FILES`가 있으면 업로드된 inline 이미지 수가 입력 파일 수와 맞는지 검사합니다.
 2. 공개 발행 후 공개 페이지에서 이미지 figure 수를 확인합니다.
 
-Daum Trends처럼 이미지 3장이 글의 핵심 산출물인 파이프라인은 wrapper 단계에서 이미지 파일 수를 먼저 검증하는 방식이 맞습니다. 이미지가 선택 사항인 글(OpenClaw 릴리즈 노트, 단순 공지 등)은 `ALLOW_MISSING_IMAGES=1`을 주거나 wrapper에서 이미지 검증을 비활성화해야 false negative를 피할 수 있습니다.
+Daum Trends처럼 이미지 3장이 글의 핵심 산출물인 파이프라인은 wrapper 단계에서 이미지 파일 수를 먼저 검증하고, 공개 페이지 figure 검증이 필요할 때만 `REQUIRE_PUBLIC_IMAGE_FIGURES=3`을 명시합니다. 이미지가 선택 사항인 글(OpenClaw 릴리즈 노트, 단순 공지 등)은 기본값 그대로 두면 이미지 개수로 hard fail 하지 않습니다.
 
 ## 자동 처리 흐름
 
