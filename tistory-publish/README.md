@@ -12,12 +12,20 @@
 # 설치
 clawhub install tistory-publish
 
-# 가장 단순한 발행
+# 가장 단순한 발행 (권장 래퍼)
 bash scripts/publish.sh \
   --title "글 제목" \
   --body-file body.html \
   --category "카테고리명" \
   --blog "your-blog.tistory.com"
+
+# 저수준 발행 엔진 직접 호출 (자동화/파이프라인용)
+ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
+  --title "글 제목" \
+  --body-file body.html \
+  --category "카테고리명" \
+  --blog "your-blog.tistory.com" \
+  --cdp-port 18800
 ```
 
 ## 기능
@@ -33,8 +41,11 @@ bash scripts/publish.sh \
 
 ```
 scripts/
-├── tistory-publish.js    # 코어 — 에디터 조작 함수 모음
-└── publish.sh            # 범용 발행 스크립트
+├── tistory-publish.js       # 코어 — 에디터 조작 함수 모음
+├── tistory-editor-helpers.js # TinyMCE/티스토리 에디터 보조 함수
+├── publish.sh               # 사용자를 위한 권장 래퍼
+├── publish-post.sh          # 파이프라인용 저수준 발행 엔진
+└── login.sh                 # 카카오/티스토리 로그인 확인 및 복구
 
 templates/
 ├── mk-review/            # 예시: 신문 리뷰 (배너+OG 카드)
@@ -56,6 +67,29 @@ templates/
 | `--banner` | | 배너 이미지 경로 |
 | `--blog` | | 블로그 도메인 |
 | `--private` | | 비공개 발행 |
+| `--cdp-port` | | 연결할 Chrome CDP 포트 (`TISTORY_CDP_PORT`와 같은 용도) |
+
+## `publish.sh`와 `publish-post.sh`
+
+- `publish.sh`: 사람이 직접 쓰기 좋은 권장 진입점입니다. 템플릿 옵션과 기본값을 정리해서 `publish-post.sh`를 호출합니다.
+- `publish-post.sh`: 매경 리뷰, Daum 트렌드, OpenClaw 릴리즈 같은 자동화 파이프라인이 직접 호출하는 저수준 엔진입니다. 안전 가드 때문에 직접 호출할 때는 `ALLOW_DIRECT_TISTORY_PUBLISH=1`을 명시해야 합니다.
+
+`publish-post.sh` 주요 환경변수:
+
+| 환경변수 | 설명 |
+|----------|------|
+| `ALLOW_DIRECT_TISTORY_PUBLISH=1` | 저수준 엔진 직접 호출 허용 |
+| `TISTORY_CDP_PORT` | 기본 CDP 포트. `--cdp-port`가 있으면 해당 인자가 우선 |
+| `TISTORY_INLINE_IMAGE_FILES` | `:` 구분 이미지 파일 목록. 본문 inline 이미지 업로드에 사용 |
+| `ALLOW_MISSING_IMAGES=1` | 공개 페이지 이미지 figure 3개 미만 검증을 hard fail 대신 warning으로 처리 |
+| `PUBLISH_TRACE_FILE` | 발행 trace 로그 파일 경로 |
+| `DIRECT_NOTIFY_CHANNEL` / `DIRECT_NOTIFY_ACCOUNT` | 발행 성공 URL을 Discord 등으로 직접 알릴 때 사용 |
+
+주의:
+
+- `publish-post.sh`는 공개 발행 후 본문 길이, OG 카드 gap, 이미지 figure 수 등을 재검증합니다.
+- 이미지 3개 이상 검증은 Daum 트렌드처럼 “키워드 3개 → 이미지 3개” 구조의 파이프라인을 보호하려고 들어간 가드입니다.
+- 이미지가 필수가 아닌 글(OpenClaw 릴리즈 노트 등)은 `ALLOW_MISSING_IMAGES=1`을 켜거나, 호출 래퍼에서 템플릿별 검증 정책을 분리해야 false negative를 피할 수 있습니다.
 
 ## 기술 스택
 
