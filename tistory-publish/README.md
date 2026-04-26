@@ -1,87 +1,162 @@
 # tistory-publish
 
-티스토리 블로그 범용 자동 발행 스킬. OpenClaw Playwright CDP로 TinyMCE 에디터를 조작해 어떤 형식의 글이든 자동 발행합니다.
+티스토리 블로그 자동 발행 스킬입니다. Tistory Open API 종료 이후 브라우저 자동화로 글쓰기 화면을 조작합니다. TinyMCE 본문 삽입, 카테고리 선택, 태그 등록, OG 카드 생성, 배너 업로드, 대표이미지 설정, 공개/비공개 발행을 처리합니다.
 
-## 왜 브라우저 자동화?
-
-티스토리 Open API가 2024년 2월에 종료됐습니다. 공식 API 없이 발행하려면 브라우저를 직접 제어하는 수밖에 없습니다.
-
-## 빠른 시작
-
-```bash
-# 설치
-clawhub install tistory-publish
-
-# 가장 단순한 발행
-bash scripts/publish.sh \
-  --title "글 제목" \
-  --body-file body.html \
-  --category "카테고리명" \
-  --blog "your-blog.tistory.com"
-```
-
-## 기능
-
-- **본문 삽입**: HTML → TinyMCE 에디터 (`data-ke-*` 속성 지원)
-- **OG 카드**: URL placeholder → 자동 카드 렌더링 (`isTrusted` 우회)
-- **배너/이미지**: 파일 업로드 → 대표이미지 자동 설정
-- **카테고리**: ARIA combobox 자동 선택
-- **태그**: nativeSetter 패턴으로 `isTrusted` 필터링 우회
-- **공개/비공개**: `--private` 플래그로 제어
-
-## 구조
+## 핵심 스크립트
 
 ```
 scripts/
-├── tistory-publish.js    # 코어 — 에디터 조작 함수 모음
-└── publish.sh            # 범용 발행 스크립트
-
-templates/
-├── mk-review/            # 예시: 신문 리뷰 (배너+OG 카드)
-│   ├── RUNBOOK.md
-│   ├── TEMPLATE.md
-│   └── banner.js
-└── simple-post/           # 예시: 단순 글 발행
-    └── RUNBOOK.md
+├── publish-post.sh           # 현재 권장 발행 오케스트레이터
+├── login.sh                  # 카카오/Tistory 로그인 세션 복구
+├── tistory-editor-helpers.js # TinyMCE/OG/태그/이미지 helper
+├── publish.sh                # legacy 발행 스크립트
+└── tistory-publish.js        # legacy JS helper
 ```
 
-## 발행 옵션
+새 워크플로우는 `publish-post.sh`를 기준으로 작성합니다. `publish.sh`와 `tistory-publish.js`는 오래된 파이프라인 호환용입니다.
+
+## 빠른 시작
+
+`publish-post.sh`는 안전장치로 직접 실행을 막습니다. 승인된 wrapper나 오케스트레이터에서 아래 환경변수를 명시해야 합니다.
+
+```bash
+export ALLOW_DIRECT_TISTORY_PUBLISH=1
+
+bash scripts/publish-post.sh \
+  --title "글 제목" \
+  --body-file body.html \
+  --category "카테고리명" \
+  --blog "your-blog.tistory.com" \
+  --cdp-port 18800
+```
+
+비공개 저장:
+
+```bash
+ALLOW_DIRECT_TISTORY_PUBLISH=1 \
+bash scripts/publish-post.sh \
+  --title "글 제목" \
+  --body-file body.html \
+  --category "카테고리명" \
+  --blog "your-blog.tistory.com" \
+  --cdp-port 18800 \
+  --private
+```
+
+매경 리뷰 preset 예시:
+
+```bash
+ALLOW_DIRECT_TISTORY_PUBLISH=1 \
+bash scripts/publish-post.sh \
+  --template mk-review \
+  --article-title "기사 제목" \
+  --body-file body.html \
+  --banner /tmp/banner.jpg \
+  --tags "매경,경제뉴스" \
+  --cdp-port 18800
+```
+
+## 발행 옵션 (`publish-post.sh`)
 
 | 옵션 | 필수 | 설명 |
 |------|------|------|
-| `--title` | ✅ | 글 제목 |
-| `--body-file` | ✅ | 본문 HTML 파일 경로 |
-| `--category` | ✅ | 카테고리 이름 |
-| `--tags` | | 쉼표 구분 태그 |
-| `--banner` | | 배너 이미지 경로 |
+| `--title` | ✅ | 최종 글 제목 |
+| `--body-file` | ✅ | 본문 HTML 파일 |
+| `--category` | ✅ | 티스토리 에디터에 표시되는 카테고리 이름 |
+| `--template` | | preset 이름 (`mk-review`, `simple-post`) |
+| `--article-title` | | `mk-review`용 기사 제목. 날짜 접두사 자동 생성 |
+| `--tags` | | 쉼표 구분 태그 목록 |
+| `--banner` | | 배너 이미지 파일. 업로드 후 대표이미지 후보가 됨 |
 | `--blog` | | 블로그 도메인 |
-| `--private` | | 비공개 발행 |
+| `--cdp-port` | | Chrome CDP 포트. 운영 파이프라인에서는 명시 권장 |
+| `--helper` | | `tistory-editor-helpers.js` 경로 |
+| `--private` | | 비공개 저장 |
 
-## 기술 스택
+## 주요 환경변수
 
-- **브라우저**: OpenClaw Playwright CDP (`connect_over_cdp`)
-- **에디터**: TinyMCE DOM API, `setContent`, `save`, native 이벤트 보조
-- **배너 생성**: Node.js Canvas (`@napi-rs/canvas`, 선택)
-- **OG 카드**: JS(URL 준비) + Playwright(Enter 키) 조합
-- **태그**: helper 함수 + 이벤트 디스패치
+| 변수 | 설명 |
+|------|------|
+| `ALLOW_DIRECT_TISTORY_PUBLISH=1` | 필수 안전장치. wrapper/오케스트레이터가 명시해야 실행됨 |
+| `TISTORY_CDP_PORT` | `--cdp-port` 기본값으로 사용 |
+| `TISTORY_LOGIN_SCRIPT` | 로그인 복구 스크립트 경로. 기본값은 `scripts/login.sh` |
+| `TISTORY_LOGIN_CRED_FILE` | 로그인 복구용 자격증명 파일. `login.sh`에서만 사용 |
+| `TISTORY_INLINE_IMAGE_FILES` | `:` 구분 이미지 파일 목록. 본문 이미지 marker에 업로드/배치 |
+| `ALLOW_MISSING_IMAGES=1` | 공개 페이지 이미지 개수 부족을 hard fail 대신 warning으로 처리 |
+| `RUN_TOKEN` | 발행 전후 글 목록 비교용 실행 토큰 |
+| `PUBLISH_TRACE_FILE` | 발행 trace 로그 저장 경로 |
+| `DIRECT_NOTIFY_CHANNEL` / `DIRECT_NOTIFY_ACCOUNT` | wrapper가 직접 결과 알림을 보낼 때 사용 |
 
-## 나만의 템플릿 만들기
+## 이미지 검증 규칙
 
-`templates/` 안에 폴더를 추가하면 됩니다:
+`publish-post.sh`는 두 단계에서 이미지를 확인합니다.
 
+1. `TISTORY_INLINE_IMAGE_FILES`가 있으면 업로드된 inline 이미지 수가 입력 파일 수와 맞는지 검사합니다.
+2. 공개 발행 후 공개 페이지에서 이미지 figure 수를 확인합니다.
+
+Daum Trends처럼 이미지 3장이 글의 핵심 산출물인 파이프라인은 wrapper 단계에서 이미지 파일 수를 먼저 검증하는 방식이 맞습니다. 이미지가 선택 사항인 글(OpenClaw 릴리즈 노트, 단순 공지 등)은 `ALLOW_MISSING_IMAGES=1`을 주거나 wrapper에서 이미지 검증을 비활성화해야 false negative를 피할 수 있습니다.
+
+## 자동 처리 흐름
+
+1. CDP로 Chrome에 attach
+2. 새 글 페이지 열기
+3. 로그인 페이지로 redirect되면 `login.sh`로 세션 복구 시도
+4. helper JS 주입
+5. 카테고리와 제목 입력
+6. 본문 HTML 삽입 및 TinyMCE 저장 동기화
+7. inline 이미지 marker 처리
+8. 배너 업로드
+9. OG 카드 생성과 cleanup
+10. 대표이미지 설정
+11. 태그 등록
+12. 공개/비공개 발행
+13. 최신 글 확인 및 공개 페이지 검증
+14. JSON 결과 출력
+
+성공 시 마지막 줄에 JSON을 출력합니다.
+
+```json
+{"success":true,"url":"https://.../manage/posts/","postUrl":"https://blog.tistory.com/123","postId":"123"}
 ```
-templates/my-template/
-├── RUNBOOK.md       # 발행 순서
-├── TEMPLATE.md      # 원고 작성 가이드
-└── banner.js        # 배너 생성 (선택)
-```
+
+실패 시 `success:false` JSON을 출력하고 non-zero로 종료합니다.
+
+## 본문 HTML 작성 규칙
+
+- 단락은 `<p data-ke-size="size16">...</p>` 사용
+- OG 카드 위치는 `<p data-og-placeholder="https://example.com">&#8203;</p>` 사용
+- inline 이미지 위치는 `<p data-image-marker="trend-image-1">&#8203;</p>` 같은 marker 사용
+- 구분선은 `<hr contenteditable="false" data-ke-type="horizontalRule" data-ke-style="style1">` 사용
+- 외부 이미지 URL 직접 삽입보다 로컬 파일 업로드 후 Tistory CDN URL 사용을 권장
 
 ## 전제 조건
 
-- OpenClaw 브라우저 서비스(CDP) 실행 가능 환경
-- 티스토리 카카오 로그인 완료(OpenClaw Chrome)
+- Chrome CDP에 Playwright가 attach 가능한 상태
+- 티스토리 로그인 세션 또는 `login.sh`로 복구 가능한 자격증명
 - Python 3 + Playwright
-- Node.js 18+ (배너 생성 시)
+- Node.js 18+ (배너 생성 스크립트 사용 시)
+
+CDP attach preflight:
+
+```bash
+python3 - <<'PY'
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    browser = p.chromium.connect_over_cdp('http://127.0.0.1:18800', timeout=15000)
+    print('CDP attach OK, contexts=', len(browser.contexts))
+    browser.close()
+PY
+```
+
+## 템플릿 추가
+
+`templates/` 아래에 워크플로우별 폴더를 추가합니다.
+
+```
+templates/my-template/
+├── RUNBOOK.md
+├── TEMPLATE.md
+└── banner.js
+```
 
 ## 라이선스
 
