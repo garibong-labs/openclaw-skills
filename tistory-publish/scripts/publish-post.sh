@@ -469,6 +469,86 @@ def inspect_gap(page, post_url):
             pass
 
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+import fcntl, atexit
+
+# ── Publish lock ──────────────────────────────────────────────────────────
+# Prevents concurrent publish jobs on the same blog/CDP browser from
+# interfering with each other (e.g. closing the other run's editor page).
+
+class PublishLock:
+    def __init__(self):
+        self._fd = None
+        self._path = None
+        enabled = os.environ.get('TISTORY_PUBLISH_LOCK', '1') == '1'
+        if not enabled:
+            return
+        key = BLOG if BLOG else f"cdp-{CDP_PORT}"
+        key = re.sub(r'[^a-zA-Z0-9._-]', '_', key)
+        self._path = f"/tmp/tistory-publish-{key}.lock"
+
+    def acquire(self):
+        if not self._path:
+            log("Publish lock: disabled (TISTORY_PUBLISH_LOCK=0)")
+            return
+        timeout = int(os.environ.get('TISTORY_PUBLISH_LOCK_TIMEOUT_SECONDS', '1200'))
+        mode = os.environ.get('TISTORY_PUBLISH_LOCK_MODE', 'wait')
+        log(f"Publish lock: waiting ({self._path}, mode={mode}, timeout={timeout}s)")
+        self._fd = open(self._path, 'w')
+        if mode == 'fail':
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (IOError, OSError):
+                self._fd.close()
+                self._fd = None
+                fail("publish/lock-busy: another publish job holds the lock")
+        else:
+            deadline = time.time() + timeout
+            while True:
+                try:
+                    fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (IOError, OSError):
+                    if time.time() >= deadline:
+                        self._fd.close()
+                        self._fd = None
+                        fail(f"publish/lock-timeout: waited {timeout}s for {self._path}")
+                    time.sleep(1)
+        log(f"Publish lock: acquired ({self._path})")
+
+    def release(self):
+        if self._fd:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+                self._fd.close()
+                log(f"Publish lock: released ({self._path})")
+            except Exception as e:
+                log(f"Publish lock: release error: {e}")
+            self._fd = None
+
+publish_lock = PublishLock()
+atexit.register(publish_lock.release)
+
+# ── TargetClosedError classification ──────────────────────────────────────
+def _is_target_closed(exc):
+    msg = str(exc)
+    name = type(exc).__name__
+    return (name == 'TargetClosedError'
+            or 'Target page, context or browser has been closed' in msg
+            or 'Target closed' in msg)
+
+_orig_excepthook = sys.excepthook
+def _classify_excepthook(etype, evalue, etb):
+    publish_lock.release()
+    if _is_target_closed(evalue):
+        print(json.dumps({
+            "success": False,
+            "error": "publish/target-closed",
+            "detail": str(evalue),
+            "hint": "Concurrent publish job may have closed the page, or the browser was shut down externally.",
+        }))
+        sys.exit(1)
+    _orig_excepthook(etype, evalue, etb)
+sys.excepthook = _classify_excepthook
 
 start = time.time()
 last_dialog_message = None
@@ -489,6 +569,8 @@ def handle_dialog(dialog):
     except Exception as e:
         log(f"  ⚠️ dialog handler failed: {e}")
 
+publish_lock.acquire()
+
 with sync_playwright() as p:
     log('Preflight: Playwright CDP attach')
     browser = p.chromium.connect_over_cdp(CDP_URL)
@@ -497,11 +579,16 @@ with sync_playwright() as p:
     # ── Step 1: 새 글 페이지 열기 ──
     log("Step 1: 새 글 페이지 열기")
     # 기존 newpost 탭 재사용 금지. 같은 브라우저 세션의 이전 글 상태가 섞이는 걸 막는다.
+    # Lock 획득 후에도 같은 CDP에서 다른 블로그가 열려 있을 수 있으므로 현재 BLOG의 newpost만 닫는다.
     for ctx in browser.contexts:
         for pg in list(ctx.pages):
             try:
-                if "newpost" in (pg.url or ""):
-                    pg.close()
+                pg_url = pg.url or ""
+                if "newpost" not in pg_url:
+                    continue
+                if BLOG and f"https://{BLOG}/manage/newpost" not in pg_url:
+                    continue
+                pg.close()
             except Exception:
                 pass
 
@@ -1185,6 +1272,7 @@ with sync_playwright() as p:
     if result.get("postUrl"):
         print(f"TISTORY_POST_URL={result['postUrl']}", file=sys.stderr)
     browser.close()
+    publish_lock.release()
 
 PYTHON_SCRIPT
 )

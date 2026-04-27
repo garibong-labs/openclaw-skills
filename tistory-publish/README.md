@@ -87,6 +87,21 @@ bash scripts/publish-post.sh \
 | `RUN_TOKEN` | 발행 전후 글 목록 비교용 실행 토큰 |
 | `PUBLISH_TRACE_FILE` | 발행 trace 로그 저장 경로 |
 | `DIRECT_NOTIFY_CHANNEL` / `DIRECT_NOTIFY_ACCOUNT` | wrapper가 직접 결과 알림을 보낼 때 사용 |
+| `TISTORY_PUBLISH_LOCK` | 발행 잠금 활성화. 기본값 `1`. `0`으로 비활성화 |
+| `TISTORY_PUBLISH_LOCK_TIMEOUT_SECONDS` | 잠금 대기 제한 시간(초). 기본값 `1200` |
+| `TISTORY_PUBLISH_LOCK_MODE` | `wait`(대기, 기본) 또는 `fail`(즉시 실패) |
+
+## 동시 발행 잠금
+
+같은 블로그(또는 같은 CDP 포트)에서 두 발행 작업이 동시에 실행되면 뒤에 시작한 작업이 앞 작업의 에디터 탭을 닫아 `TargetClosedError`가 발생할 수 있습니다. 이를 방지하기 위해 `publish-post.sh`는 Playwright CDP attach 전에 `fcntl.flock` 기반 파일 잠금을 획득합니다.
+
+- 잠금 키: 블로그 도메인 우선, 없으면 CDP 포트
+- 잠금 파일: `/tmp/tistory-publish-{key}.lock`
+- `TISTORY_PUBLISH_LOCK_MODE=wait` — 다른 작업이 끝날 때까지 대기 (기본값)
+- `TISTORY_PUBLISH_LOCK_MODE=fail` — 잠금을 즉시 획득할 수 없으면 `publish/lock-busy` 오류로 종료
+- 잠금은 브라우저 종료 후 해제되며, 비정상 종료 시에도 `atexit`로 해제됩니다
+
+`TargetClosedError`가 발생하면 `publish/target-closed` 오류 코드와 함께 동시 발행 또는 외부 브라우저 종료 가능성을 안내합니다.
 
 ## 이미지 검증 규칙
 
