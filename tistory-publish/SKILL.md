@@ -1,6 +1,6 @@
 ---
 name: tistory-publish
-description: Automate Tistory blog publishing via OpenClaw Playwright CDP. Supports any post format — handles TinyMCE editor manipulation, OG card insertion, banner upload, tag registration, category setting, and representative image selection. Includes template presets (mk-review, simple-post). Works around Tistory's isTrusted event filtering.
+description: Automate Tistory blog publishing via OpenClaw Playwright CDP. Supports any post format — handles TinyMCE editor manipulation, OG card insertion, banner upload, tag registration, category setting, and representative image selection. Includes template presets (mk-review, daum-trends, simple-post). Works around Tistory's isTrusted event filtering.
 runtime:
   - python3
   - playwright
@@ -78,7 +78,7 @@ bash scripts/publish.sh \
 | `--title` | ✅ | 글 제목 |
 | `--body-file` | ✅ | 본문 HTML 파일 경로 |
 | `--category` | ✅ | 카테고리 이름 (에디터에 표시되는 이름 그대로) |
-| `--template` | | 템플릿 preset (mk-review, simple-post) |
+| `--template` | | 템플릿 preset (mk-review, daum-trends, simple-post) |
 | `--article-title` | | mk-review용 기사 제목 (자동 날짜 접두사) |
 | `--tags` | | 쉼표 구분 태그 목록 |
 | `--banner` | | 배너 이미지 파일 경로 |
@@ -94,6 +94,20 @@ bash scripts/publish.sh \
 | `simple-post` | (직접 지정) | (직접 지정) | (직접 지정) | 선택 |
 
 > 자신만의 preset을 추가하려면 `templates/` 아래에 폴더를 만들고 `publish.sh --template <이름>` 으로 사용하세요.
+
+### Daum Trends preset
+
+Use `--template daum-trends` for Daum 실시간 트렌드 posts. This preset supplies content defaults such as tags only. The caller must still pass `--blog` and `--category` explicitly.
+
+```bash
+ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
+  --template daum-trends \
+  --title "Daum 실시간 트렌드 ..." \
+  --body-file body.html \
+  --blog "$DAUM_TRENDS_TISTORY_BLOG" \
+  --category "$DAUM_TRENDS_TISTORY_CATEGORY" \
+  --cdp-port "$TISTORY_CDP_PORT"
+```
 
 ## 자동 처리 항목
 

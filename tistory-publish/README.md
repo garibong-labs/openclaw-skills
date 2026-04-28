@@ -63,7 +63,7 @@ bash scripts/publish-post.sh \
 | `--title` | ✅ | 최종 글 제목 |
 | `--body-file` | ✅ | 본문 HTML 파일 |
 | `--category` | ✅ | 티스토리 에디터에 표시되는 카테고리 이름 |
-| `--template` | | preset 이름 (`mk-review`, `simple-post`) |
+| `--template` | | preset 이름 (`mk-review`, `daum-trends`, `simple-post`) |
 | `--article-title` | | `mk-review`용 기사 제목. 날짜 접두사 자동 생성 |
 | `--tags` | | 쉼표 구분 태그 목록 |
 | `--banner` | | 배너 이미지 파일. 업로드 후 대표이미지 후보가 됨 |
@@ -72,6 +72,20 @@ bash scripts/publish-post.sh \
 | `--helper` | | `tistory-editor-helpers.js` 경로 |
 | `--private` | | 비공개 저장 |
 | `--require-public-image-figures` | | 공개 페이지 image figure 최소 개수 요구. 기본 0 |
+
+## Daum Trends preset
+
+`daum-trends` preset is intentionally target-agnostic. It only supplies Daum Trends content defaults such as tags. The caller or wrapper must pass `--blog` and `--category` explicitly.
+
+```bash
+ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
+  --template daum-trends \
+  --title "Daum 실시간 트렌드 ..." \
+  --body-file body.html \
+  --blog "$DAUM_TRENDS_TISTORY_BLOG" \
+  --category "$DAUM_TRENDS_TISTORY_CATEGORY" \
+  --cdp-port "$TISTORY_CDP_PORT"
+```
 
 ## 주요 환경변수
 

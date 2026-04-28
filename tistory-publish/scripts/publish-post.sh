@@ -37,7 +37,7 @@ Usage:
   bash publish-post.sh --template mk-review --article-title "기사 제목" --body-file body.html --banner banner.jpg
 
 Options:
-  --template       템플릿 preset (mk-review, simple-post)
+  --template       템플릿 preset (mk-review, daum-trends, simple-post)
   --title          최종 제목
   --article-title  mk-review용 기사 제목 (자동 접두사 생성)
   --body-file      본문 HTML 파일
@@ -84,6 +84,9 @@ if [[ -n "$TEMPLATE" ]]; then
       fi
       [[ -z "$CATEGORY" ]] && CATEGORY="신문 리뷰"
       [[ -z "$BLOG" ]] && BLOG="bongman.tistory.com"
+      ;;
+    daum-trends)
+      [[ -z "$TAGS" ]] && TAGS="Daum,실시간트렌드,Daum-Trends"
       ;;
     simple-post) ;;
     *) fail "unknown template: $TEMPLATE" ;;
