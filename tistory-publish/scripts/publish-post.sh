@@ -861,7 +861,7 @@ with sync_playwright() as p:
     # ── Step 7: 태그 ──
     if TAGS_STR:
         log("Step 7: 태그")
-        tags = [t.strip() for t in TAGS_STR.split(',') if t.strip()]
+        tags = list(dict.fromkeys(t.strip() for t in TAGS_STR.split(',') if t.strip()))
         try:
             if page.is_closed():
                 fail('page closed before tag step')
