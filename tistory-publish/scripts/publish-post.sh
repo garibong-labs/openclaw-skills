@@ -766,6 +766,45 @@ with sync_playwright() as p:
                 mapping.append({"marker": marker_names[idx], "filename": os.path.basename(img_path)})
             moved = page.evaluate("(mapping) => moveImagesToMarkers(mapping)", mapping)
             log(f"  - inline image mapping results: {moved}")
+            comic_display_width = int(os.environ.get('DAUM_TRENDS_COMIC_DISPLAY_WIDTH', '680'))
+            comic_presentation = page.evaluate(
+                """
+                ({width}) => {
+                  const editor = tinymce?.activeEditor;
+                  if (!editor || !editor.getBody) return {success:false, error:'tinymce unavailable'};
+                  const body = editor.getBody();
+                  const figures = Array.from(body.querySelectorAll('figure[data-ke-type="image"]'));
+                  const changed = [];
+                  for (const figure of figures) {
+                    const img = figure.querySelector('img');
+                    const filename = img?.getAttribute('data-filename') || '';
+                    if (!/^00-comic\.(jpe?g|png|webp)$/i.test(filename)) continue;
+                    figure.setAttribute('data-ke-style', 'alignLeft');
+                    figure.classList?.remove('alignCenter', 'alignRight');
+                    figure.classList?.add('alignLeft');
+                    figure.style.textAlign = 'left';
+                    figure.style.width = `${width}px`;
+                    figure.style.maxWidth = '100%';
+                    if (img) {
+                      img.setAttribute('width', String(width));
+                      img.style.width = `${width}px`;
+                      img.style.maxWidth = '100%';
+                      img.style.height = 'auto';
+                    }
+                    changed.push({filename, width});
+                  }
+                  editor.setDirty(true);
+                  editor.fire('change');
+                  editor.save();
+                  const cm = document.querySelector('.CodeMirror');
+                  if (cm && cm.CodeMirror) cm.CodeMirror.setValue(editor.getContent());
+                  document.querySelectorAll('textarea').forEach(t => { if (t.value.length > 100) t.value = editor.getContent(); });
+                  return {success:true, changed};
+                }
+                """,
+                {"width": comic_display_width},
+            )
+            log(f"  - Daum comic presentation result: {comic_presentation}")
             image_debug = page.evaluate("() => ({ markers: Array.from(tinymce.activeEditor.getBody().querySelectorAll('[data-image-marker]')).length, figures: Array.from(tinymce.activeEditor.getBody().querySelectorAll('figure[data-ke-type=\"image\"]')).length, contentLength: tinymce.activeEditor.getContent().length })")
             log(f"  - inline image editor state: {image_debug}")
             marker_figures = page.evaluate("(filenames) => typeof collectUploadedImageFiguresByFilename === 'function' ? collectUploadedImageFiguresByFilename(filenames) : []", [os.path.basename(p) for p in image_files])
