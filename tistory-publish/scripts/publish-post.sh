@@ -118,6 +118,7 @@ TMP_STDERR="$(mktemp -t tistory-publish-stderr.XXXXXX)"
 
 PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" "$REQUIRE_PUBLIC_IMAGE_FIGURES" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
 import sys, json, time, os, re, subprocess
+import html as htmlmod
 from pathlib import Path
 
 HARD_FAIL = None
@@ -166,10 +167,15 @@ def write_debug_artifacts(page, prefix):
         log(f"  ⚠️ debug artifact wrapper failed: {e}")
 
 def norm_title(s):
+    s = htmlmod.unescape(s or '')
+    s = s.replace('&hellip;', '…')
     s = re.sub(r'\s+', ' ', s or '').strip()
     for ch in ['"', "'", '“', '”', '‘', '’']:
         s = s.replace(ch, '')
     return s
+
+def same_title(a, b):
+    return norm_title(a) == norm_title(b)
 
 def wait_tinymce(page, timeout_s=40):
     ready = False
@@ -336,7 +342,6 @@ def find_public_post_by_rss(title_hint, timeout_s=30):
         return None
     import urllib.request
     import xml.etree.ElementTree as ET
-    hint = norm_title(title_hint)
     rss_url = f"https://{BLOG}/rss"
     deadline = time.time() + timeout_s
     last_error = None
@@ -348,7 +353,7 @@ def find_public_post_by_rss(title_hint, timeout_s=30):
             for item in root.findall('./channel/item'):
                 title = item.findtext('title') or ''
                 link = item.findtext('link') or ''
-                if norm_title(title) == hint and link:
+                if same_title(title, title_hint) and link:
                     m = re.search(r'/([0-9]+)$', link)
                     return {'id': m.group(1) if m else None, 'url': link, 'text': title, 'source': 'rss'}
         except Exception as e:
@@ -356,6 +361,48 @@ def find_public_post_by_rss(title_hint, timeout_s=30):
         time.sleep(2)
     if last_error:
         log(f"  ⚠️ RSS publish confirmation failed: {last_error}")
+    return None
+
+def find_manage_post_by_title(context, title_hint):
+    if not BLOG:
+        return None
+    manage_page = context.new_page()
+    try:
+        manage_page.goto(POSTS_URL, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(1)
+        posts = list_recent_posts(manage_page, navigate=False)
+        for post in posts:
+            if same_title(post.get('text', ''), title_hint):
+                href = post.get('href') or ''
+                m = re.search(r'/([0-9]+)$', href)
+                return {
+                    'id': m.group(1) if m else None,
+                    'url': href,
+                    'text': post.get('text', ''),
+                    'source': 'manage-posts',
+                }
+    finally:
+        try:
+            manage_page.close()
+        except Exception:
+            pass
+    return None
+
+def assert_no_duplicate_title_before_publish(context, title_hint):
+    if not BLOG:
+        log("  - duplicate preflight skipped: BLOG not set")
+        return None
+    existing = find_public_post_by_rss(title_hint, timeout_s=4)
+    if existing:
+        fail(f"duplicate title preflight failed: existing public post {existing.get('url')} ({existing.get('source')})")
+    try:
+        existing = find_manage_post_by_title(context, title_hint)
+    except Exception as e:
+        log(f"  ⚠️ duplicate preflight manage-posts check failed: {e}")
+        existing = None
+    if existing:
+        fail(f"duplicate title preflight failed: existing managed post {existing.get('url')} ({existing.get('source')})")
+    log("  - duplicate preflight: no existing post with same title")
     return None
 
 def confirm_public_publish(page, title_hint, before_posts=None, timeout_s=30):
@@ -958,6 +1005,9 @@ with sync_playwright() as p:
                 time.sleep(3)
             cleanup_result = page.evaluate("typeof cleanupOGResiduals === 'function' ? cleanupOGResiduals() : null")
             log(f"  - recovery OG cleanup result: {cleanup_result}")
+
+    log("Step 7.5: 중복 제목 preflight")
+    assert_no_duplicate_title_before_publish(ctx0, final_title)
 
     before_posts = list_recent_posts(page, navigate=False)
     log(f"  - before posts count: {len(before_posts)}")
