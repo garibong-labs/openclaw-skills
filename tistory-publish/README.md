@@ -105,6 +105,14 @@ ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
 | `TISTORY_PUBLISH_LOCK_TIMEOUT_SECONDS` | 잠금 대기 제한 시간(초). 기본값 `1200` |
 | `TISTORY_PUBLISH_LOCK_MODE` | `wait`(대기, 기본) 또는 `fail`(즉시 실패) |
 
+## 중복 발행 방지
+
+자동화 runner에서 `publish-post.sh` 실행이 `Command still running (session <id>, pid <pid>)` 형태로 background 처리되면 실패가 아닙니다. 같은 명령을 다시 실행하지 말고 해당 session의 최종 stdout/stderr를 회수해야 합니다.
+
+- OpenClaw runner: `process poll`로 종료까지 기다린 뒤 `process log` 또는 최종 결과에서 `TISTORY_POST_URL=` / JSON `postUrl` 확인
+- URL을 찾지 못한 경우: 재실행 전에 RSS와 관리글 목록에서 같은 제목이 이미 발행됐는지 확인
+- `publish-post.sh`는 공개 발행 버튼을 누르기 직전에 RSS와 관리글 목록을 조회해 같은 제목이 있으면 `duplicate title preflight failed`로 중단
+
 ## 동시 발행 잠금
 
 같은 블로그(또는 같은 CDP 포트)에서 두 발행 작업이 동시에 실행되면 뒤에 시작한 작업이 앞 작업의 에디터 탭을 닫아 `TargetClosedError`가 발생할 수 있습니다. 이를 방지하기 위해 `publish-post.sh`는 Playwright CDP attach 전에 `fcntl.flock` 기반 파일 잠금을 획득합니다.
@@ -139,9 +147,10 @@ Daum Trends처럼 이미지 3장이 글의 핵심 산출물인 파이프라인�
 9. OG 카드 생성과 cleanup
 10. 대표이미지 설정
 11. 태그 등록
-12. 공개/비공개 발행
-13. 최신 글 확인 및 공개 페이지 검증
-14. JSON 결과 출력
+12. 중복 제목 preflight(RSS/관리글)
+13. 공개/비공개 발행
+14. 최신 글 확인 및 공개 페이지 검증
+15. JSON 결과 출력
 
 성공 시 마지막 줄에 JSON을 출력합니다.
 
