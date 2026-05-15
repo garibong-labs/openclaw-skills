@@ -111,7 +111,8 @@ ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
 
 - OpenClaw runner: `process poll`로 종료까지 기다린 뒤 `process log` 또는 최종 결과에서 `TISTORY_POST_URL=` / JSON `postUrl` 확인
 - URL을 찾지 못한 경우: 재실행 전에 RSS와 관리글 목록에서 같은 제목이 이미 발행됐는지 확인
-- `publish-post.sh`는 공개 발행 버튼을 누르기 직전에 RSS와 관리글 목록을 조회해 같은 제목이 있으면 `duplicate title preflight failed`로 중단
+- `publish-post.sh`는 공개 발행 버튼을 누르기 직전에 RSS와 관리글 목록을 조회해 같은 제목이 있으면 `duplicate preflight failed`로 중단
+- `mk-review` preset은 제목이 달라도 같은 `[매경] YYYY.MM.DD(요일)` 날짜 prefix의 기존 글이 있으면 중단
 
 ## 동시 발행 잠금
 
