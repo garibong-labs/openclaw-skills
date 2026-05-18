@@ -514,11 +514,11 @@ async def cmd_menu(args):
                     results[current_date].append([current_rest, meals])
 
     data = results.get(target_date, [])
-    # 별칭 매핑 (애기능 = 자연계)
-    ALIAS = {"애기능": "자연계"}
+    # 애기능 건물에는 자연계 학생식당과 애기능 교직원식당이 함께 있음.
+    RESTAURANT_FILTERS = {"애기능": ("자연계", "애기능")}
     if restaurant_filter:
-        rf = ALIAS.get(restaurant_filter, restaurant_filter)
-        data = [(r, m) for r, m in data if rf in r]
+        filters = RESTAURANT_FILTERS.get(restaurant_filter, (restaurant_filter,))
+        data = [(r, m) for r, m in data if any(f in r for f in filters)]
 
     if not data:
         print(f"🍽️ {target_date} 메뉴 정보가 없어요.")

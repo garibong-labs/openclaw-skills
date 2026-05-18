@@ -54,6 +54,7 @@ python3 ku_query.py <command> [options]
 - `library --name 중앙도서관` — 특정 도서관 좌석
 - `menu` — 오늘 전체 학식 메뉴 (koreapas.com 기반)
 - `menu --restaurant 교직원식당` — 특정 식당만 필터
+- `menu --restaurant 애기능` — 자연계 학생식당 + 애기능 교직원식당 함께 조회
 - `menu --date 2026-03-10` — 특정 날짜 메뉴
 
 ### 로그인 필요 (KUPID SSO)
