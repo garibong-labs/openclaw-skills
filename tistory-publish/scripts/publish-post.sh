@@ -145,6 +145,36 @@ def fail(msg):
     print(json.dumps({"success": False, "error": msg}))
     sys.exit(1)
 
+OG_GATE_ENABLED = os.environ.get('TISTORY_OG_MATCH_GATE', '1').lower() not in ('0', 'false', 'no')
+OG_VALIDATOR = os.environ.get('TISTORY_OG_VALIDATOR', '').strip()
+
+def should_run_og_gate():
+    return OG_GATE_ENABLED and bool(OG_VALIDATOR)
+
+def run_og_gate(mode, *args):
+    if not should_run_og_gate():
+        return None
+    validator = Path(OG_VALIDATOR)
+    if not validator.exists():
+        fail(f"OG validation gate unavailable: {validator}")
+    cmd = [sys.executable, str(validator), mode]
+    if mode == 'draft':
+        cmd += ['--body-file', BODY_FILE]
+    elif mode == 'public':
+        cmd += ['--body-file', BODY_FILE, '--post-url', args[0]]
+    else:
+        fail(f"unknown OG validation mode: {mode}")
+    proc = subprocess.run(cmd, text=True, capture_output=True, timeout=90)
+    detail = (proc.stdout or proc.stderr or '').strip()
+    if detail:
+        log(f"  - OG {mode} gate: {detail[:1200]}")
+    if proc.returncode != 0:
+        fail(f"OG {mode} validation failed: {detail[:1000]}")
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception:
+        return {"success": True, "raw": proc.stdout.strip()}
+
 
 def write_debug_artifacts(page, prefix):
     try:
@@ -618,6 +648,14 @@ sys.excepthook = _classify_excepthook
 
 start = time.time()
 last_dialog_message = None
+body_html = open(BODY_FILE, 'r', encoding='utf-8').read()
+draft_og_gate = None
+public_og_gate = None
+
+if should_run_og_gate():
+    log("Preflight: OG URL/title validation")
+    draft_og_gate = run_og_gate('draft')
+    log(f"  - OG draft gate OK ({draft_og_gate.get('count', 0)} cards)")
 
 def handle_dialog(dialog):
     global last_dialog_message
@@ -782,7 +820,6 @@ with sync_playwright() as p:
 
     # ── Step 3: 본문 삽입 ──
     log("Step 3: 본문 삽입")
-    body_html = open(BODY_FILE, 'r', encoding='utf-8').read()
     if not ensure_tinymce_ready(page, timeout_s=20, step_name='step3'):
         fail('tinymce unavailable before content insert')
     page.evaluate("""(html) => {
@@ -1359,6 +1396,10 @@ with sync_playwright() as p:
                     warning = policy_error
                 else:
                     HARD_FAIL = policy_error
+            if should_run_og_gate():
+                log("  - public OG source/canonical/title 검증")
+                public_og_gate = run_og_gate('public', post_url)
+                log(f"  - OG public gate OK ({public_og_gate.get('card_count', 0)} cards)")
         except Exception as e:
             HARD_FAIL = f"public_verification_failed: {e}"
             log(f"  ❌ 검증 실패: {e}")
@@ -1369,6 +1410,10 @@ with sync_playwright() as p:
         result["postId"] = post_info.get('id')
     if gap_check:
         result["gapCheck"] = gap_check
+    if draft_og_gate:
+        result["draftOgValidation"] = {"success": True, "count": draft_og_gate.get('count')}
+    if public_og_gate:
+        result["publicOgValidation"] = {"success": True, "cardCount": public_og_gate.get('card_count')}
     if warning:
         result["warning"] = warning
     if HARD_FAIL:
