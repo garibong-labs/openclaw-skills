@@ -177,6 +177,17 @@ def norm_title(s):
 def same_title(a, b):
     return norm_title(a) == norm_title(b)
 
+def mk_review_date_prefix(title):
+    if TEMPLATE != 'mk-review':
+        return None
+    m = re.match(r'^(\[매경\]\s+\d{4}\.\d{2}\.\d{2}\([^)]*\))', norm_title(title))
+    return m.group(1) if m else None
+
+def same_mk_review_date(a, b):
+    pa = mk_review_date_prefix(a)
+    pb = mk_review_date_prefix(b)
+    return bool(pa and pb and pa == pb)
+
 def wait_tinymce(page, timeout_s=40):
     ready = False
     for _ in range(int(timeout_s / 2)):
@@ -337,7 +348,7 @@ def find_latest_post(page, title_hint, before_posts=None, timeout_s=60):
         time.sleep(2)
     return None
 
-def find_public_post_by_rss(title_hint, timeout_s=30):
+def find_public_post_by_rss(title_hint, timeout_s=30, match_date_prefix=False):
     if not BLOG:
         return None
     import urllib.request
@@ -353,7 +364,8 @@ def find_public_post_by_rss(title_hint, timeout_s=30):
             for item in root.findall('./channel/item'):
                 title = item.findtext('title') or ''
                 link = item.findtext('link') or ''
-                if same_title(title, title_hint) and link:
+                matched = same_title(title, title_hint) or (match_date_prefix and same_mk_review_date(title, title_hint))
+                if matched and link:
                     m = re.search(r'/([0-9]+)$', link)
                     return {'id': m.group(1) if m else None, 'url': link, 'text': title, 'source': 'rss'}
         except Exception as e:
@@ -363,7 +375,7 @@ def find_public_post_by_rss(title_hint, timeout_s=30):
         log(f"  ⚠️ RSS publish confirmation failed: {last_error}")
     return None
 
-def find_manage_post_by_title(context, title_hint):
+def find_manage_post_by_title(context, title_hint, match_date_prefix=False):
     if not BLOG:
         return None
     manage_page = context.new_page()
@@ -372,7 +384,8 @@ def find_manage_post_by_title(context, title_hint):
         time.sleep(1)
         posts = list_recent_posts(manage_page, navigate=False)
         for post in posts:
-            if same_title(post.get('text', ''), title_hint):
+            matched = same_title(post.get('text', ''), title_hint) or (match_date_prefix and same_mk_review_date(post.get('text', ''), title_hint))
+            if matched:
                 href = post.get('href') or ''
                 m = re.search(r'/([0-9]+)$', href)
                 return {
@@ -392,17 +405,20 @@ def assert_no_duplicate_title_before_publish(context, title_hint):
     if not BLOG:
         log("  - duplicate preflight skipped: BLOG not set")
         return None
-    existing = find_public_post_by_rss(title_hint, timeout_s=4)
+    match_date_prefix = TEMPLATE == 'mk-review'
+    existing = find_public_post_by_rss(title_hint, timeout_s=4, match_date_prefix=match_date_prefix)
     if existing:
-        fail(f"duplicate title preflight failed: existing public post {existing.get('url')} ({existing.get('source')})")
+        reason = 'same date prefix' if match_date_prefix and same_mk_review_date(existing.get('text', ''), title_hint) and not same_title(existing.get('text', ''), title_hint) else 'same title'
+        fail(f"duplicate preflight failed: existing public post {existing.get('url')} ({existing.get('source')}, {reason})")
     try:
-        existing = find_manage_post_by_title(context, title_hint)
+        existing = find_manage_post_by_title(context, title_hint, match_date_prefix=match_date_prefix)
     except Exception as e:
         log(f"  ⚠️ duplicate preflight manage-posts check failed: {e}")
         existing = None
     if existing:
-        fail(f"duplicate title preflight failed: existing managed post {existing.get('url')} ({existing.get('source')})")
-    log("  - duplicate preflight: no existing post with same title")
+        reason = 'same date prefix' if match_date_prefix and same_mk_review_date(existing.get('text', ''), title_hint) and not same_title(existing.get('text', ''), title_hint) else 'same title'
+        fail(f"duplicate preflight failed: existing managed post {existing.get('url')} ({existing.get('source')}, {reason})")
+    log("  - duplicate preflight: no existing post with same title/date prefix")
     return None
 
 def confirm_public_publish(page, title_hint, before_posts=None, timeout_s=30):
