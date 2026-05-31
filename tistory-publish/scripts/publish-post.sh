@@ -116,6 +116,7 @@ PUBLISH_TRACE_FILE="${PUBLISH_TRACE_FILE:-}"
 TISTORY_LOGIN_SCRIPT="${TISTORY_LOGIN_SCRIPT:-$SCRIPT_DIR/login.sh}"
 TMP_STDERR="$(mktemp -t tistory-publish-stderr.XXXXXX)"
 
+set +e
 PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" "$REQUIRE_PUBLIC_IMAGE_FIGURES" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
 import sys, json, time, os, re, subprocess
 import html as htmlmod
@@ -1430,6 +1431,7 @@ with sync_playwright() as p:
 PYTHON_SCRIPT
 )
 EXIT_CODE=$?
+set -e
 printf '%s\n' "$PYTHON_RESULT"
 if [[ -n "$PUBLISH_TRACE_FILE" ]]; then
   mkdir -p "$(dirname "$PUBLISH_TRACE_FILE")"
