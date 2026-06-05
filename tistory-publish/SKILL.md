@@ -28,6 +28,7 @@ Tistory Open API 종료(2024.02) 이후 유일한 자동화 경로인 브라우�
   - JSON 형식: `{"email": "...", "password": "..."}`
   - 또는 key-value 형식: `email: ...\npassword: ...`
   - `publish.sh`는 자격증명을 읽지 않음 (로그인은 `login.sh`에서만 처리)
+  - `publish-post.sh` 자동 복구는 현재 `--blog`와 `--cdp-port`를 `login.sh`로 전달함
 
 ## 구조
 
@@ -83,7 +84,7 @@ bash scripts/publish.sh \
 | `--tags` | | 쉼표 구분 태그 목록 |
 | `--banner` | | 배너 이미지 파일 경로 |
 | `--blog` | | 블로그 도메인 (기본: tistory.com 첫 번째 블로그) |
-| `--cdp-port` | | OpenClaw Chrome CDP 포트 (기본: 18800) |
+| `--cdp-port` | | OpenClaw Chrome CDP 포트 (기본: `TISTORY_CDP_PORT` 또는 스크립트 기본값) |
 | `--helper` | | tistory-publish.js 경로 (기본: scripts/ 내) |
 | `--private` | | 비공개 발행 |
 
@@ -106,6 +107,15 @@ ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
   --body-file body.html \
   --blog "$DAUM_TRENDS_TISTORY_BLOG" \
   --category "$DAUM_TRENDS_TISTORY_CATEGORY" \
+  --cdp-port "$TISTORY_CDP_PORT"
+```
+
+세션 복구를 직접 실행할 때도 같은 포트를 명시한다:
+
+```bash
+bash scripts/login.sh \
+  --cred-file "$TISTORY_LOGIN_CRED_FILE" \
+  --blog "$DAUM_TRENDS_TISTORY_BLOG" \
   --cdp-port "$TISTORY_CDP_PORT"
 ```
 
