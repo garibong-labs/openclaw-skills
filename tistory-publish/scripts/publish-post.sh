@@ -232,14 +232,16 @@ def wait_tinymce(page, timeout_s=40):
     return False
 
 def run_login_recovery():
-    cred = os.environ.get('TISTORY_LOGIN_CRED_FILE', '').strip()
+    cred = (os.environ.get('TISTORY_LOGIN_CRED_FILE') or os.environ.get('TISTORY_CRED_FILE') or '').strip()
     login_script = os.environ.get('TISTORY_LOGIN_SCRIPT', '').strip()
     if not cred:
-        return False, 'missing TISTORY_LOGIN_CRED_FILE'
+        return False, 'missing TISTORY_LOGIN_CRED_FILE or TISTORY_CRED_FILE'
     if not login_script:
         return False, 'missing TISTORY_LOGIN_SCRIPT'
     try:
-        cmd = ['bash', login_script, '--cred-file', cred, '--blog', BLOG]
+        cmd = ['bash', login_script, '--cred-file', cred]
+        if BLOG:
+            cmd += ['--blog', BLOG]
         if CDP_PORT:
             cmd += ['--cdp-port', CDP_PORT]
         proc = subprocess.run(
