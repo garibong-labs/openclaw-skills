@@ -3,7 +3,7 @@
 # publish.sh 실행 전 로그인 세션이 만료됐을 때 사용
 #
 # 사용:
-#   bash scripts/login.sh --cred-file /path/to/credentials.json [--cdp-port 18800]
+#   bash scripts/login.sh --cred-file /path/to/credentials.json [--cdp-port 18800] [--blog bongman.tistory.com]
 #
 # 자격증명 파일 형식 (JSON 또는 key: value):
 #   {"email": "...", "password": "..."}
@@ -18,18 +18,21 @@ set -euo pipefail
 
 CDP_PORT=18800
 CRED_FILE="${TISTORY_CRED_FILE:-}"
+# publish-post.sh passes this as context; login cookies are shared across Tistory domains.
+BLOG=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --cdp-port) CDP_PORT="$2"; shift 2 ;;
     --cred-file) CRED_FILE="$2"; shift 2 ;;
+    --blog) BLOG="$2"; shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
 
 if [[ -z "$CRED_FILE" ]]; then
   echo "❌ 자격증명 파일 미지정"
-  echo "   사용: bash login.sh --cred-file /path/to/credentials.json"
+  echo "   사용: bash login.sh --cred-file /path/to/credentials.json [--cdp-port 18800] [--blog bongman.tistory.com]"
   echo "   또는: TISTORY_CRED_FILE=/path/to/cred.json bash login.sh"
   exit 1
 fi
