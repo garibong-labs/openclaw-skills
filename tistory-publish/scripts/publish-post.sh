@@ -239,7 +239,9 @@ def run_login_recovery():
     if not login_script:
         return False, 'missing TISTORY_LOGIN_SCRIPT'
     try:
-        cmd = ['bash', login_script, '--cred-file', cred, '--blog', BLOG]
+        cmd = ['bash', login_script, '--cred-file', cred]
+        if BLOG:
+            cmd += ['--blog', BLOG]
         if CDP_PORT:
             cmd += ['--cdp-port', CDP_PORT]
         proc = subprocess.run(

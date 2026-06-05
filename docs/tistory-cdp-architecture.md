@@ -43,6 +43,8 @@ bash scripts/login.sh --cred-file ~/.openclaw/workspace-ruth/.credentials/tistor
 bash scripts/login.sh --cdp-port 18801 --cred-file ~/.openclaw/secrets/kakao.json
 ```
 
+발행 스크립트가 세션 복구를 호출할 때는 현재 발행 대상의 `--blog`와 `--cdp-port`를 그대로 넘긴다. 수동 복구도 같은 포트를 명시하거나 `TISTORY_CDP_PORT`를 설정해서 실행한다.
+
 ## 블로그-계정 매핑
 
 ```

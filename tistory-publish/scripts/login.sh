@@ -3,7 +3,7 @@
 # publish.sh 실행 전 로그인 세션이 만료됐을 때 사용
 #
 # 사용:
-#   bash scripts/login.sh --cred-file /path/to/credentials.json [--cdp-port 18800]
+#   bash scripts/login.sh --cred-file /path/to/credentials.json [--blog your-blog.tistory.com] [--cdp-port 18800]
 #
 # 자격증명 파일 형식 (JSON 또는 key: value):
 #   {"email": "...", "password": "..."}
@@ -16,13 +16,15 @@
 
 set -euo pipefail
 
-CDP_PORT=18800
+CDP_PORT="${TISTORY_CDP_PORT:-18800}"
 CRED_FILE="${TISTORY_CRED_FILE:-}"
+BLOG=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --cdp-port) CDP_PORT="$2"; shift 2 ;;
     --cred-file) CRED_FILE="$2"; shift 2 ;;
+    --blog) BLOG="$2"; shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -39,11 +41,13 @@ if [[ ! -f "$CRED_FILE" ]]; then
   exit 1
 fi
 
-python3 - "$CDP_PORT" "$CRED_FILE" << 'PYTHON_SCRIPT'
+python3 - "$CDP_PORT" "$CRED_FILE" "$BLOG" << 'PYTHON_SCRIPT'
 import sys, json, time
 CDP_PORT = sys.argv[1]
 CRED_FILE = sys.argv[2]
+BLOG = sys.argv[3].strip()
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
+TARGET_URL = f"https://{BLOG}/manage" if BLOG else "https://www.tistory.com/auth/login"
 
 with open(CRED_FILE) as f:
     content = f.read()
@@ -71,8 +75,8 @@ with sync_playwright() as p:
     ctx = browser.contexts[0] if browser.contexts else browser.new_context()
     page = ctx.new_page()
 
-    print(f"[{time.strftime('%H:%M:%S')}] Tistory 로그인 페이지 이동...")
-    page.goto("https://www.tistory.com/auth/login", wait_until="domcontentloaded", timeout=20000)
+    print(f"[{time.strftime('%H:%M:%S')}] Tistory 로그인 확인: {TARGET_URL}")
+    page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
 
     login_domains = ["auth/login", "accounts.kakao.com", "logins.daum.net"]
     if not any(x in page.url for x in login_domains):

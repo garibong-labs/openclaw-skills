@@ -105,6 +105,8 @@ ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
 | `TISTORY_PUBLISH_LOCK_TIMEOUT_SECONDS` | 잠금 대기 제한 시간(초). 기본값 `1200` |
 | `TISTORY_PUBLISH_LOCK_MODE` | `wait`(대기, 기본) 또는 `fail`(즉시 실패) |
 
+`publish-post.sh`가 로그인 복구를 실행할 때는 현재 발행 대상의 `--blog`와 `--cdp-port`를 그대로 `login.sh`에 전달한다. `login.sh`도 `--cdp-port`를 직접 받으며, 인자가 없으면 `TISTORY_CDP_PORT` 값을 기본값으로 사용한다.
+
 ## 중복 발행 방지
 
 자동화 runner에서 `publish-post.sh` 실행이 `Command still running (session <id>, pid <pid>)` 형태로 background 처리되면 실패가 아닙니다. 같은 명령을 다시 실행하지 말고 해당 session의 최종 stdout/stderr를 회수해야 합니다.
@@ -139,7 +141,7 @@ Daum Trends처럼 이미지 3장이 글의 핵심 산출물인 파이프라인�
 
 1. CDP로 Chrome에 attach
 2. 새 글 페이지 열기
-3. 로그인 페이지로 redirect되면 `login.sh`로 세션 복구 시도
+3. 로그인 페이지로 redirect되면 같은 blog/CDP 포트로 `login.sh` 세션 복구 시도
 4. helper JS 주입
 5. 카테고리와 제목 입력
 6. 본문 HTML 삽입 및 TinyMCE 저장 동기화

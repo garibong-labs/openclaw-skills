@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+- `publish-post.sh` 로그인 자동 복구가 현재 `--blog`와 `--cdp-port`를 `login.sh`에 전달하도록 수정
+- `login.sh`에서 `--blog` 옵션과 `TISTORY_CDP_PORT` 기본값 지원
+
 ## v5.1.2 (2026-03-28)
 - OpenClaw 보안 스캔 Suspicious 지적 수정 (메타데이터 불완전)
 - frontmatter에 `runtime` 및 `credentials` 필드 선언 추가
