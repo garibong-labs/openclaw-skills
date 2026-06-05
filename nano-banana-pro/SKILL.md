@@ -1,11 +1,19 @@
 ---
 name: nano-banana-pro
-description: Generate/edit images with Nano Banana Pro (Gemini 3 Pro Image). Use for image create/modify requests incl. edits. Supports text-to-image + image-to-image; 1K/2K/4K; use --input-image.
+description: "Generate/edit images with Nano Banana Pro (Gemini 3 Pro Image). Use for image create/modify requests incl. edits. Supports text-to-image + image-to-image; 1K/2K/4K; use --input-image."
 ---
 
 # Nano Banana Pro Image Generation & Editing
 
 Generate new images or edit existing ones using Google's Nano Banana Pro API (Gemini 3 Pro Image).
+
+## Paid Route Guard
+
+Nano Banana / Gemini image generation may incur paid usage.
+Use this skill only when the user explicitly asks for Nano Banana/Gemini image generation or has approved this paid route for the task.
+If a cheaper or configured default image route is available, use that route unless Nano Banana was specifically requested or approved.
+
+When using a non-default or paid image route, tell the user which model/provider was used and why.
 
 ## Usage
 
