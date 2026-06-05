@@ -18,7 +18,7 @@ set -euo pipefail
 
 CDP_PORT="${TISTORY_CDP_PORT:-18800}"
 CRED_FILE="${TISTORY_CRED_FILE:-}"
-BLOG=""
+BLOG="${TISTORY_BLOG:-}"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -47,7 +47,7 @@ CDP_PORT = sys.argv[1]
 CRED_FILE = sys.argv[2]
 BLOG = sys.argv[3].strip()
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
-TARGET_URL = f"https://{BLOG}/manage" if BLOG else "https://www.tistory.com/auth/login"
+TARGET_URL = f"https://{BLOG}/manage/newpost/?type=post" if BLOG else "https://www.tistory.com/manage/newpost/?type=post"
 
 with open(CRED_FILE) as f:
     content = f.read()
@@ -78,7 +78,7 @@ with sync_playwright() as p:
     print(f"[{time.strftime('%H:%M:%S')}] Tistory 로그인 확인: {TARGET_URL}")
     page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
 
-    login_domains = ["auth/login", "accounts.kakao.com", "logins.daum.net"]
+    login_domains = ["auth/login", "accounts.kakao.com", "logins.daum.net", "kauth.kakao.com"]
     if not any(x in page.url for x in login_domains):
         print(f"✅ 이미 로그인됨 ({page.url})")
         sys.exit(0)
@@ -95,6 +95,10 @@ with sync_playwright() as p:
     page.locator('input[type="password"]').first.fill(kakao_pw)
     page.locator('button[type="submit"], button:has-text("로그인")').first.click()
     page.wait_for_url(lambda url: not any(x in url for x in login_domains), timeout=15000)
+    page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20000)
+    if any(x in page.url for x in login_domains):
+        print(f"❌ 로그인 후에도 로그인 페이지 유지됨 ({page.url})")
+        sys.exit(1)
     print(f"✅ 로그인 성공 → {page.url}")
     page.close()
 PYTHON_SCRIPT

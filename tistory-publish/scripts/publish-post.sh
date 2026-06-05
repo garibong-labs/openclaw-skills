@@ -112,12 +112,14 @@ fi
 log "Launching Playwright CDP publish (port=$CDP_PORT)"
 DIRECT_NOTIFY_CHANNEL="${DIRECT_NOTIFY_CHANNEL:-}"
 DIRECT_NOTIFY_ACCOUNT="${DIRECT_NOTIFY_ACCOUNT:-}"
+DIRECT_NOTIFY_WORKFLOW="${DIRECT_NOTIFY_WORKFLOW:-}"
+DIRECT_NOTIFY_AUTHOR="${DIRECT_NOTIFY_AUTHOR:-}"
 PUBLISH_TRACE_FILE="${PUBLISH_TRACE_FILE:-}"
 TISTORY_LOGIN_SCRIPT="${TISTORY_LOGIN_SCRIPT:-$SCRIPT_DIR/login.sh}"
 TMP_STDERR="$(mktemp -t tistory-publish-stderr.XXXXXX)"
 
 set +e
-PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" "$REQUIRE_PUBLIC_IMAGE_FIGURES" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
+PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" "$REQUIRE_PUBLIC_IMAGE_FIGURES" "$TEMPLATE" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
 import sys, json, time, os, re, subprocess
 import html as htmlmod
 from pathlib import Path
@@ -136,6 +138,7 @@ BANNER     = sys.argv[7]
 HELPER_JS  = sys.argv[8]
 PRIVATE    = sys.argv[9] == "true"
 REQUIRE_PUBLIC_IMAGE_FIGURES = int(sys.argv[10])
+TEMPLATE   = sys.argv[11]
 
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 NEWPOST_URL = f"https://{BLOG}/manage/newpost/?type=post" if BLOG else "https://www.tistory.com/manage/newpost/?type=post"
@@ -232,10 +235,10 @@ def wait_tinymce(page, timeout_s=40):
     return False
 
 def run_login_recovery():
-    cred = os.environ.get('TISTORY_LOGIN_CRED_FILE', '').strip()
+    cred = (os.environ.get('TISTORY_LOGIN_CRED_FILE') or os.environ.get('TISTORY_CRED_FILE') or '').strip()
     login_script = os.environ.get('TISTORY_LOGIN_SCRIPT', '').strip()
     if not cred:
-        return False, 'missing TISTORY_LOGIN_CRED_FILE'
+        return False, 'missing TISTORY_LOGIN_CRED_FILE or TISTORY_CRED_FILE'
     if not login_script:
         return False, 'missing TISTORY_LOGIN_SCRIPT'
     try:
@@ -1391,8 +1394,14 @@ with sync_playwright() as p:
             if vlen < 100:
                 HARD_FAIL = "public_body_empty"
                 log(f"  ❌ 본문 비어있음 ({vlen})")
-            image_count = len(re.findall(r'<figure[^>]+data-ke-type="image"', html))
-            log(f"  - 공개 페이지 이미지 figure count: {image_count}")
+            content_html = m.group(1) if m else html
+            data_ke_image_count = len(re.findall(r'<figure[^>]+data-ke-type=.image.', content_html, re.IGNORECASE))
+            figure_count = len(re.findall(r'<figure\b', content_html, re.IGNORECASE))
+            img_count = len(re.findall(r'<img\b', content_html, re.IGNORECASE))
+            expected_filenames = [os.path.basename(p) for p in image_files] if 'image_files' in locals() else []
+            filename_hit_count = sum(1 for name in expected_filenames if name and name in html)
+            image_count = max(data_ke_image_count, figure_count, img_count, filename_hit_count)
+            log(f"  - 공개 페이지 이미지 count: effective={image_count}, data-ke={data_ke_image_count}, figure={figure_count}, img={img_count}, filenameHits={filename_hit_count}")
             if REQUIRE_PUBLIC_IMAGE_FIGURES > 0 and image_count < REQUIRE_PUBLIC_IMAGE_FIGURES:
                 policy_error = f"public_image_count_{image_count}_lt_required_{REQUIRE_PUBLIC_IMAGE_FIGURES}"
                 if ALLOW_MISSING_IMAGES:
@@ -1461,9 +1470,25 @@ for line in reversed(raw):
 PY
 )
   if [[ -n "$POST_URL" ]]; then
-    echo "[direct-notify] target=$DIRECT_NOTIFY_CHANNEL postUrl=$POST_URL" >&2
+    NOTIFY_WORKFLOW="$DIRECT_NOTIFY_WORKFLOW"
+    if [[ -z "$NOTIFY_WORKFLOW" ]]; then
+      NOTIFY_WORKFLOW="${TEMPLATE:-Tistory}"
+    fi
+    NOTIFY_MESSAGE="발행됨: $NOTIFY_WORKFLOW"
+    NOTIFY_MESSAGE+=$'\n'"제목: $TITLE"
+    NOTIFY_MESSAGE+=$'\n'"카테고리: $CATEGORY"
+    if [[ -n "$DIRECT_NOTIFY_AUTHOR" ]]; then
+      NOTIFY_MESSAGE+=$'\n'"작성자: $DIRECT_NOTIFY_AUTHOR"
+    elif [[ -n "$DIRECT_NOTIFY_ACCOUNT" ]]; then
+      NOTIFY_MESSAGE+=$'\n'"계정: $DIRECT_NOTIFY_ACCOUNT"
+    fi
+    if [[ -n "$BLOG" ]]; then
+      NOTIFY_MESSAGE+=$'\n'"블로그: $BLOG"
+    fi
+    NOTIFY_MESSAGE+=$'\n'"URL: <$POST_URL>"
+    echo "[direct-notify] target=$DIRECT_NOTIFY_CHANNEL workflow=$NOTIFY_WORKFLOW title=$TITLE category=$CATEGORY postUrl=$POST_URL" >&2
     set +e
-    openclaw message send --channel discord --target "$DIRECT_NOTIFY_CHANNEL" --message "발행됨: $POST_URL"
+    openclaw message send --channel discord --target "$DIRECT_NOTIFY_CHANNEL" --message "$NOTIFY_MESSAGE"
     NOTIFY_EXIT=$?
     set -e
     echo "[direct-notify] exit=$NOTIFY_EXIT" >&2
