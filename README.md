@@ -2,6 +2,28 @@
 
 A collection of [OpenClaw](https://github.com/openclaw/openclaw) skills built and maintained by [Garibong Labs](https://github.com/garibong-labs).
 
+## What this repo is
+
+This repository contains reusable OpenClaw skills for agent workflows that need documented setup steps, repeatable commands, and clear operational guardrails.
+
+Each skill is designed to be copied into an OpenClaw workspace and used by agents or maintainers as a focused tool for one recurring job, such as API setup, alerts, publishing support, or image generation.
+
+## Who uses it
+
+The skills are intended for OpenClaw users, agent maintainers, and small teams that want to turn repeated manual workflows into shareable, reviewable automation.
+
+Garibong Labs uses this repository to maintain public skills that can be reviewed, improved, and reused outside a single private workspace.
+
+## Why Codex and API credits help
+
+This project benefits from Codex for pull request review, regression checks, documentation updates, and security-oriented review of automation scripts.
+
+Many skills interact with browsers, local configuration, or external services. Codex helps maintainers inspect changes, catch unsafe assumptions, and keep high-risk operational code small and auditable.
+
+## Maintenance cadence
+
+Maintenance is driven by real OpenClaw workflow issues and pull requests. Changes are reviewed as small, focused updates with verification notes in the PR when a skill script or workflow behavior changes.
+
 ## Skills
 
 ### 🔍 [brave-api-setup](./brave-api-setup)
