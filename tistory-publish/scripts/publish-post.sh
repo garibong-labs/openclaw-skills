@@ -1488,7 +1488,11 @@ PY
     NOTIFY_MESSAGE+=$'\n'"URL: <$POST_URL>"
     echo "[direct-notify] target=$DIRECT_NOTIFY_CHANNEL workflow=$NOTIFY_WORKFLOW title=$TITLE category=$CATEGORY postUrl=$POST_URL" >&2
     set +e
-    openclaw message send --channel discord --target "$DIRECT_NOTIFY_CHANNEL" --message "$NOTIFY_MESSAGE"
+    NOTIFY_ARGS=(message send --channel discord --target "$DIRECT_NOTIFY_CHANNEL" --message "$NOTIFY_MESSAGE")
+    if [[ -n "$DIRECT_NOTIFY_ACCOUNT" ]]; then
+      NOTIFY_ARGS+=(--account "$DIRECT_NOTIFY_ACCOUNT")
+    fi
+    openclaw "${NOTIFY_ARGS[@]}"
     NOTIFY_EXIT=$?
     set -e
     echo "[direct-notify] exit=$NOTIFY_EXIT" >&2
