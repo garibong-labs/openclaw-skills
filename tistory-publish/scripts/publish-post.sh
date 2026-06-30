@@ -286,6 +286,231 @@ def ensure_tinymce_ready(page, timeout_s=20, step_name='tinymce-check', allow_te
         return True
     return False
 
+def open_attach_image_menu(page):
+    page.evaluate("""(() => {
+        const btns = document.querySelectorAll('[aria-label="첨부"]');
+        for (const b of btns) {
+            if (b.offsetParent !== null) { b.click(); return 'clicked-visible'; }
+        }
+        if (btns[0]) { btns[0].click(); return 'clicked-first'; }
+        return 'not-found';
+    })()""")
+    time.sleep(0.5)
+
+    selectors = [
+        '#attach-image',
+        '[role=menuitem]#attach-image',
+        '[role=menuitem]:has-text("사진")',
+    ]
+    last_error = None
+    for selector in selectors:
+        try:
+            item = page.locator(selector).first
+            item.wait_for(state='attached', timeout=3000)
+            try:
+                item.click(timeout=3000)
+                return
+            except Exception as e:
+                last_error = e
+                item.click(timeout=3000, force=True)
+                return
+        except Exception as e:
+            last_error = e
+
+    clicked = page.evaluate("""(() => {
+        const item =
+            document.querySelector('#attach-image') ||
+            Array.from(document.querySelectorAll('[role="menuitem"]'))
+                .find(el => (el.textContent || '').includes('사진'));
+        if (!item) return false;
+        item.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
+        item.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
+        item.click();
+        return true;
+    })()""")
+    if not clicked:
+        raise RuntimeError(f"attach image menu item not clickable: {last_error}")
+
+def focus_tag_input(page, tag_input):
+    last_error = None
+    try:
+        tag_input.wait_for(state='attached', timeout=5000)
+    except Exception as e:
+        last_error = e
+
+    for force in (False, True):
+        try:
+            tag_input.click(timeout=5000, force=force)
+            return
+        except Exception as e:
+            last_error = e
+
+    focused = page.evaluate("""(() => {
+        const input = document.querySelector('#tagText');
+        if (!input) return false;
+        try { input.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
+        try { input.click(); } catch (e) {}
+        input.focus();
+        return document.activeElement === input;
+    })()""")
+    if not focused:
+        raise RuntimeError(f"tag input not focusable: {last_error}")
+
+def enter_tag(page, tag_input, tag):
+    focus_tag_input(page, tag_input)
+    try:
+        tag_input.fill('', timeout=5000)
+    except Exception:
+        page.evaluate("""(() => {
+            const input = document.querySelector('#tagText');
+            if (!input) return false;
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+            if (setter) setter.call(input, '');
+            else input.value = '';
+            input.dispatchEvent(new InputEvent('input', {bubbles:true, cancelable:true, inputType:'deleteContentBackward'}));
+            input.focus();
+            return true;
+        })()""")
+
+    typed = False
+    try:
+        tag_input.type(tag, delay=20, timeout=5000)
+        typed = True
+    except Exception:
+        focus_tag_input(page, tag_input)
+        try:
+            page.keyboard.insert_text(tag)
+            typed = True
+        except Exception:
+            typed = False
+    if not typed:
+        page.evaluate("""(tag) => {
+            const input = document.querySelector('#tagText');
+            if (!input) return false;
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+            if (setter) setter.call(input, tag);
+            else input.value = tag;
+            input.dispatchEvent(new InputEvent('input', {
+                bubbles:true, cancelable:true, inputType:'insertText', data:tag
+            }));
+            input.focus();
+            return true;
+        }""", tag)
+
+    try:
+        tag_input.press('Enter', timeout=5000)
+    except Exception:
+        try:
+            page.keyboard.press('Enter')
+        except Exception:
+            page.evaluate("""(() => {
+                const input = document.querySelector('#tagText');
+                if (!input) return false;
+                input.focus();
+                ['keydown', 'keypress', 'keyup'].forEach(type => {
+                    input.dispatchEvent(new KeyboardEvent(type, {
+                        key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true
+                    }));
+                });
+                return true;
+            })()""")
+
+def click_complete_button(page):
+    selectors = [
+        '#publish-layer-btn',
+        'button#publish-layer-btn',
+        "button:has-text('완료')",
+    ]
+    last_error = None
+    for selector in selectors:
+        try:
+            button = page.locator(selector).first
+            button.wait_for(state='attached', timeout=5000)
+            try:
+                button.click(timeout=5000)
+                return
+            except Exception as e:
+                last_error = e
+                button.click(timeout=5000, force=True)
+                return
+        except Exception as e:
+            last_error = e
+
+    clicked = page.evaluate("""(() => {
+        const button =
+            document.querySelector('#publish-layer-btn') ||
+            Array.from(document.querySelectorAll('button'))
+                .find(btn => (btn.textContent || '').trim() === '완료');
+        if (!button) return false;
+        try { button.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
+        try { button.focus(); } catch (e) {}
+        button.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
+        button.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
+        button.click();
+        return true;
+    })()""")
+    if not clicked:
+        raise RuntimeError(f"complete button not clickable: {last_error}")
+
+def click_publish_submit_button(page, private=False):
+    selectors = []
+    if private:
+        selectors = [
+            '#publish-btn',
+            'button#publish-btn',
+            '[role="dialog"] button:has-text("비공개 저장")',
+            '[role="dialog"] button:has-text("저장")',
+        ]
+    else:
+        selectors = [
+            '#publish-btn',
+            'button#publish-btn',
+            '[role="dialog"] button:has-text("공개 발행")',
+            '[role="dialog"] button:has-text("발행")',
+        ]
+
+    last_error = None
+    for selector in selectors:
+        try:
+            button = page.locator(selector).first
+            button.wait_for(state='attached', timeout=5000)
+            try:
+                button.click(timeout=5000)
+                return {'clicked': True, 'clickMethod': f'playwright:{selector}'}
+            except Exception as e:
+                last_error = e
+                button.click(timeout=5000, force=True)
+                return {'clicked': True, 'clickMethod': f'playwright-force:{selector}'}
+        except Exception as e:
+            last_error = e
+
+    result = page.evaluate("""(privateMode) => {
+        const dialog = document.querySelector('[role="dialog"]') || document;
+        const btns = Array.from(dialog.querySelectorAll('button'));
+        const btn = btns.find(b => {
+            const t = (b.textContent || '').trim();
+            if (privateMode) return t.includes('비공개 저장') || t === '저장';
+            return t.includes('공개 발행') || t === '발행' || t.includes('발행하기') || t === 'Publish';
+        }) || document.querySelector('#publish-btn');
+        if (!btn) return {clicked:false, text:null};
+        try { btn.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
+        try { btn.focus(); } catch (e) {}
+        btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
+        btn.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
+        btn.click();
+        return {
+            clicked:true,
+            clickMethod:'dom-events',
+            text:(btn.textContent || '').trim(),
+            disabled:!!btn.disabled,
+            ariaDisabled:btn.getAttribute('aria-disabled'),
+            className:btn.className || ''
+        };
+    }""", private)
+    if not result.get('clicked'):
+        raise RuntimeError(f"publish submit button not clickable: {last_error}")
+    return result
+
 def debug_newpost_state(page):
     try:
         return page.evaluate("""() => {
@@ -489,7 +714,7 @@ def republish_current_editor(page, private):
     ensure_tinymce_ready(page, timeout_s=10, step_name='republish', allow_textarea_fallback=True, min_textarea_len=100)
     page.evaluate("typeof cleanupOGResiduals === 'function' ? cleanupOGResiduals() : null")
     page.evaluate("typeof tinymce !== 'undefined' && tinymce.activeEditor ? (tinymce.activeEditor.save(), 'ok') : 'no-tinymce'")
-    page.locator("button:has-text('완료')").first.click(timeout=5000)
+    click_complete_button(page)
     time.sleep(2)
 
     for _ in range(10):
@@ -852,15 +1077,7 @@ with sync_playwright() as p:
             page.evaluate("typeof uploadInlineImages === 'function' && typeof moveImagesToMarkers === 'function'")
             mapping = []
             for idx, img_path in enumerate(image_files):
-                page.evaluate("""(() => {
-                    const btns = document.querySelectorAll('[aria-label="첨부"]');
-                    for (const b of btns) {
-                        if (b.offsetParent !== null) { b.click(); return 'clicked'; }
-                    }
-                    return 'not found';
-                })()""")
-                time.sleep(0.5)
-                page.click('[role=menuitem]:has-text("사진")', timeout=3000)
+                open_attach_image_menu(page)
                 time.sleep(0.5)
                 fi = page.query_selector('#openFile')
                 if not fi:
@@ -951,15 +1168,7 @@ with sync_playwright() as p:
         uploaded = False
         try:
             # 메뉴 열기 (첨부 → 사진)
-            page.evaluate("""(() => {
-                const btns = document.querySelectorAll('[aria-label="첨부"]');
-                for (const b of btns) {
-                    if (b.offsetParent !== null) { b.click(); return 'clicked'; }
-                }
-                return 'not found';
-            })()""")
-            time.sleep(0.5)
-            page.click('[role=menuitem]:has-text("사진")', timeout=3000)
+            open_attach_image_menu(page)
             time.sleep(0.5)
             fi = page.query_selector('#openFile')
             if fi:
@@ -1026,16 +1235,29 @@ with sync_playwright() as p:
             log(f"  ⚠️ helper reinject skipped: {e}")
 
         tag_input = page.locator('#tagText').first
-        tag_input.wait_for(state='visible', timeout=5000)
+        tag_input.wait_for(state='attached', timeout=5000)
         for tag in tags:
-            tag_input.click(timeout=5000)
-            tag_input.fill('', timeout=5000)
-            tag_input.type(tag, delay=20, timeout=5000)
-            tag_input.press('Enter', timeout=5000)
+            enter_tag(page, tag_input, tag)
             time.sleep(0.35)
 
         chip_count = page.evaluate("document.querySelectorAll('.editor_tag .txt_tag').length")
         log(f"  - tag chips registered: {chip_count}/{len(tags)}")
+        if chip_count < len(tags):
+            registered_tags = page.evaluate("""() =>
+                Array.from(document.querySelectorAll('.editor_tag .txt_tag'))
+                    .map(el => (el.textContent || '').replace(/\\s*삭제\\s*$/, '').trim())
+                    .filter(Boolean)
+            """)
+            missing_tags = [tag for tag in tags if tag not in registered_tags]
+            if missing_tags:
+                fallback_result = page.evaluate(
+                    "(tags) => typeof setTags === 'function' ? setTags(tags) : {success:false,error:'setTags unavailable'}",
+                    missing_tags,
+                )
+                log(f"  - tag helper fallback result: {fallback_result}")
+                time.sleep(0.5)
+                chip_count = page.evaluate("document.querySelectorAll('.editor_tag .txt_tag').length")
+                log(f"  - tag chips after fallback: {chip_count}/{len(tags)}")
         if chip_count < len(tags):
             fail(f'tag registration incomplete: {chip_count}/{len(tags)}')
         log("Step 7: 완료")
@@ -1103,8 +1325,8 @@ with sync_playwright() as p:
     except Exception as e:
         log(f"  ⚠️ pre-complete debug skipped: {e}")
 
-    # 완료 버튼 — Playwright locator (first visible match)
-    page.locator("button:has-text('완료')").first.click(timeout=5000)
+    # 완료 버튼 — Tistory can leave it attached but not "stable" for Playwright.
+    click_complete_button(page)
     time.sleep(2)
     try:
         post_complete_state = debug_newpost_state(page)
@@ -1186,7 +1408,7 @@ with sync_playwright() as p:
         log(f"  - public mode normalized state: {get_dialog_state(page)}")
 
     if PRIVATE:
-        result = page.evaluate("""(() => {
+        page.evaluate("""(() => {
             const dialog = document.querySelector('[role="dialog"]') || document;
             const radio = dialog.querySelector('input[type="radio"][value="0"]');
             if (radio) {
@@ -1194,17 +1416,8 @@ with sync_playwright() as p:
                 radio.checked = true;
                 radio.dispatchEvent(new Event('change', {bubbles:true}));
             }
-            const btns = Array.from(dialog.querySelectorAll('button'));
-            const btn = btns.find(b => {
-                const t = (b.textContent || '').trim();
-                return t.includes('비공개 저장') || t == '저장' || t.includes('발행');
-            });
-            if (btn) {
-                btn.click();
-                return {clicked: true, text: (btn.textContent || '').trim()};
-            }
-            return {clicked: false, text: null};
         })()""")
+        result = click_publish_submit_button(page, private=True)
     else:
         result = page.evaluate("""(() => {
             const dialog = document.querySelector('[role="dialog"]') || document;
@@ -1228,13 +1441,8 @@ with sync_playwright() as p:
             };
         })()""")
         if result.get('readyForNativeClick'):
-            publish_button = page.locator('[role="dialog"] button:has-text("공개 발행")').first
-            try:
-                publish_button.click(timeout=5000)
-            except Exception:
-                page.locator('[role="dialog"] button:has-text("발행")').first.click(timeout=5000)
-            result['clicked'] = True
-            result['clickMethod'] = 'playwright-native-click-once'
+            click_result = click_publish_submit_button(page, private=False)
+            result.update(click_result)
     log(f"  - submit click result: {result}")
     if not result.get('clicked'):
         fail(f"publish submit button not found: {get_dialog_state(page)}")
