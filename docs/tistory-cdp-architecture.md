@@ -1,69 +1,52 @@
-# Tistory CDP 아키텍처
+# Tistory CDP Architecture
 
-## 개요
+## Overview
 
-티스토리 자동 발행은 두 개의 독립된 Chrome CDP 인스턴스를 사용한다.
-각 인스턴스는 별도 카카오 계정으로 로그인된 세션을 유지한다.
+The Tistory publish skill automates the Tistory editor through a Chrome
+DevTools Protocol (CDP) endpoint. It assumes that the caller provides the
+runtime target explicitly instead of relying on repository-specific defaults.
 
-## 포트 구성
+This public repository intentionally avoids documenting production account
+names, credential paths, cron identifiers, browser profile locations, or blog
+permission maps. Keep those details in a private operational repository.
 
-| 포트 | 계정 | 블로그 | 용도 | 크론 |
-|------|------|--------|------|------|
-| 18800 | ruth@ | bongman (멤버) + anthropic (관리자) | 매경 리뷰, anthropic 데일리, 댓글 체크 | `b846720b`, `6ad82072`, `687817a6` |
-| 18801 | eli@ | bongman (멤버) | OpenClaw 릴리즈 포스트 | `ab83db6d` |
+## Runtime Inputs
 
-## Chrome 인스턴스
+Pass deployment-specific values from a private wrapper, CI job, or local
+environment:
 
-### Port 18800 (기본)
-- OpenClaw 내장 브라우저 서비스
-- user-data: `~/.openclaw/browser/openclaw/user-data`
-- 관리: OpenClaw 자동 관리
+- `--blog`: target Tistory blog domain.
+- `--category`: visible Tistory category name.
+- `--cdp-port`: Chrome CDP port for the active browser session.
+- `TISTORY_CDP_PORT`: optional default for `--cdp-port`.
+- `TISTORY_LOGIN_CRED_FILE`: optional credential file for `scripts/login.sh`.
 
-### Port 18801 (Eli 전용)
-- launchd: `dev.garibong.chrome-eli-tistory`
-- plist: `~/Library/LaunchAgents/dev.garibong.chrome-eli-tistory.plist`
-- user-data: `~/.openclaw/browser/eli-tistory/user-data`
-- headless, KeepAlive
+The `publish-post.sh` orchestrator forwards the active `--blog` and
+`--cdp-port` values to `login.sh` when it attempts login recovery.
 
-## 자격증명
+## Session Model
 
-| 계정 | 파일 | 용도 |
-|------|------|------|
-| ruth@ | `~/.openclaw/workspace-ruth/.credentials/tistory-kakao.enc` | bongman 매경/anthropic 발행 |
-| eli@ | `~/.openclaw/secrets/kakao.json` | bongman 릴리즈 발행 |
+- Each CDP browser profile should be treated as a separate authenticated
+  session.
+- A workflow that uses more than one account or blog should keep those browser
+  sessions isolated.
+- Public skill code should not hardcode production account names, private file
+  paths, cron identifiers, or account-to-blog mappings.
 
-## 로그인 복구
+## Public Example
 
-세션 만료 시 `login.sh` 사용:
 ```bash
-# Ruth (port 18800)
-bash scripts/login.sh --cred-file ~/.openclaw/workspace-ruth/.credentials/tistory-kakao.enc
-
-# Eli (port 18801)
-bash scripts/login.sh --cdp-port 18801 --cred-file ~/.openclaw/secrets/kakao.json
+ALLOW_DIRECT_TISTORY_PUBLISH=1 \
+bash scripts/publish-post.sh \
+  --title "Post title" \
+  --body-file body.html \
+  --category "$TISTORY_CATEGORY" \
+  --blog "$TISTORY_BLOG" \
+  --cdp-port "$TISTORY_CDP_PORT"
 ```
 
-발행 스크립트가 세션 복구를 호출할 때는 현재 발행 대상의 `--blog`와 `--cdp-port`를 그대로 넘긴다. 수동 복구도 같은 포트를 명시하거나 `TISTORY_CDP_PORT`를 설정해서 실행한다.
+## Operational Notes
 
-## 블로그-계정 매핑
-
-```
-bongman.tistory.com
-├── 관리자: Gary (개인 카카오)
-├── 멤버: 에이전트 루스 (ruth@) — 매경 리뷰 발행
-└── 멤버: 에이전트 일라이 (eli@) — OpenClaw 릴리즈 발행
-
-anthropic.tistory.com
-└── 관리자: 에이전트 루스 (ruth@) — 세금/사업자 데일리 발행
-```
-
-## 주의사항
-
-- 두 포트의 세션은 독립적 — 한쪽 로그아웃이 다른 쪽에 영향 없음
-- `publish.sh --cdp-port` 로 포트 지정 (기본: 18800)
-- 18801은 크론 payload에서만 지정, 스킬 배포 코드에 하드코딩 금지
-
-## 변경 이력
-
-- 2026-03-28: 별도 CDP 포트 구조 도입 (이전: 세션 전환 방식)
-- 2026-03-27: agent-browser → OpenClaw Playwright CDP 전환
+Store private deployment details in the repository or runbook that owns the
+actual publishing workflow. This skill repository should stay reusable and safe
+to publish.
