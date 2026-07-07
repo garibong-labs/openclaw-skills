@@ -183,6 +183,42 @@ function setImageAlt(alt, index = 0) {
 }
 
 /**
+ * 업로드 직후 새로 추가된 이미지에 alt 텍스트 설정.
+ * 기존 본문/inline 이미지의 alt를 배너 alt로 덮지 않도록 filename → 업로드 전 count → 마지막 이미지 순으로 찾는다.
+ */
+function setImageAltForUploadedImage(alt, filename = '', previousCount = 0) {
+  const editor = tinymce.activeEditor;
+  if (!editor) return { success: false, error: 'tinymce unavailable' };
+  const imgs = Array.from(editor.getBody().querySelectorAll('img'));
+  if (!imgs.length) return { success: false, error: 'no images in editor' };
+
+  const basename = String(filename || '').split(/[\\/]/).pop();
+  let img = null;
+  if (basename) {
+    img = imgs.find((candidate) => {
+      const dataFilename = candidate.getAttribute('data-filename') || '';
+      const src = candidate.getAttribute('src') || '';
+      let decodedSrc = src;
+      try { decodedSrc = decodeURIComponent(src); } catch (_) {}
+      return dataFilename === basename || decodedSrc.includes(basename);
+    });
+  }
+  if (!img && previousCount >= 0 && previousCount < imgs.length) {
+    img = imgs[previousCount];
+  }
+  if (!img) {
+    img = imgs[imgs.length - 1];
+  }
+
+  img.setAttribute('alt', alt);
+  const index = imgs.indexOf(img);
+  editor.setDirty(true);
+  editor.fire('change');
+  editor.save();
+  return { success: true, index, alt, filename: basename, previousCount, src: (img.src || '').slice(0, 100) };
+}
+
+/**
  * 완료 버튼 클릭 → 발행 다이얼로그 열기
  */
 function clickComplete() {

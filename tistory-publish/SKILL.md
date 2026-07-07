@@ -94,6 +94,7 @@ bash scripts/publish.sh \
 | `--private` | | 비공개 발행 |
 | `--seo-check` | | 발행 전 SEO 검사 모드: `off`(기본)/`warn`/`strict`. `strict`는 error 발견 시 발행 중단 |
 | `--seo-keyword` | | SEO 핵심 키워드 (기본: 제목 첫 단어). 제목/도입부/소제목 내 키워드 배치 검사에 사용 |
+| `--seo-min-body-chars` | `1000` | SEO 본문 최소 노출 글자수. `strict`에서는 미달 시 발행 중단 |
 
 ### 템플릿 preset
 
@@ -169,7 +170,7 @@ Tistory는 본문 시작부를 meta description / og:description으로 사용하
 python3 scripts/seo_check.py \
   --title "글 제목" --body-file body.html \
   --tags "태그1,태그2" --keyword "핵심키워드" \
-  --blog "your-blog.tistory.com" --mode strict
+  --blog "your-blog.tistory.com" --mode strict --min-body-chars 1000
 ```
 
 ## 템플릿 추가하기
@@ -198,6 +199,7 @@ templates/my-template/
 - `setTags(tags[])` — 태그 등록
 - `setRepresentImageFromEditor()` — 대표이미지 설정
 - `setImageAlt(alt, index)` — 에디터 내 이미지 alt 텍스트 설정 (SEO)
+- `setImageAltForUploadedImage(alt, filename, previousCount)` — 업로드 직후 새 이미지 alt 텍스트 설정 (기존 이미지 덮어쓰기 방지)
 
 ### 배너
 - `verifyBannerUpload()` — 업로드 확인

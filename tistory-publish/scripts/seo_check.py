@@ -77,7 +77,7 @@ class BodyParser(HTMLParser):
         return self._clean(self.lead_parts)
 
 
-def check(title, body_html, tags, keyword, blog, min_body_chars):
+def check(title, body_html, tags, keyword, blog, min_body_chars, strict=False):
     errors, warnings = [], []
     parser = BodyParser()
     parser.feed(body_html)
@@ -134,7 +134,11 @@ def check(title, body_html, tags, keyword, blog, min_body_chars):
 
     # ── 본문 분량 ──
     if len(body_text) < min_body_chars:
-        warnings.append(f"W-BODY-SHORT: 본문 노출 텍스트 {len(body_text)}자 — {min_body_chars}자 이상 권장 (단순 발췌 수준은 검색 노출 불리)")
+        msg = f"BODY-SHORT: 본문 노출 텍스트 {len(body_text)}자 — {min_body_chars}자 이상 필요 (단순 발췌 수준은 검색 노출 불리)"
+        if strict:
+            errors.append(f"E-{msg}")
+        else:
+            warnings.append(f"W-{msg}")
 
     # ── 태그 ──
     if tags:
@@ -143,7 +147,7 @@ def check(title, body_html, tags, keyword, blog, min_body_chars):
         dupes = sorted({t for t in lowered if lowered.count(t) > 1})
         if dupes:
             errors.append(f"E-TAG-DUP: 중복 태그 {dupes}")
-        if len(normalized) < 3:
+        if len(normalized) < 5:
             warnings.append(f"W-TAGS-FEW: 태그 {len(normalized)}개 — 5~10개 권장 (범용 + 롱테일 혼합)")
         elif len(normalized) > 10:
             warnings.append(f"W-TAGS-MANY: 태그 {len(normalized)}개 — 10개 이하 권장 (과다 태그는 희석됨)")
@@ -184,7 +188,15 @@ def main():
     keyword = args.keyword.strip() or (args.title.split()[0] if args.title.split() else "")
     tags = args.tags.split(",") if args.tags else []
 
-    errors, warnings, stats = check(args.title, body_html, tags, keyword, args.blog.strip(), args.min_body_chars)
+    errors, warnings, stats = check(
+        args.title,
+        body_html,
+        tags,
+        keyword,
+        args.blog.strip(),
+        args.min_body_chars,
+        strict=args.mode == "strict",
+    )
 
     for line in errors:
         print(f"  ❌ {line}", file=sys.stderr)

@@ -24,6 +24,7 @@ TEMPLATE=""
 PRIVATE=false
 SEO_CHECK="${TISTORY_SEO_CHECK:-off}"
 SEO_KEYWORD=""
+SEO_MIN_BODY_CHARS="${TISTORY_SEO_MIN_BODY_CHARS:-1000}"
 CDP_PORT="${TISTORY_CDP_PORT:-18800}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ALLOW_DIRECT_TISTORY_PUBLISH="${ALLOW_DIRECT_TISTORY_PUBLISH:-}"
@@ -54,6 +55,8 @@ Options:
   --private        비공개 발행
   --seo-check      발행 전 SEO 검사: off|warn|strict (기본: off, strict는 error 시 발행 중단)
   --seo-keyword    SEO 핵심 키워드 (기본: 제목 첫 단어)
+  --seo-min-body-chars
+                  SEO 본문 최소 노출 글자수 (기본: 1000)
   --require-public-image-figures N
                   공개 페이지 검증 시 image figure 최소 개수 요구 (기본: 0, 콘텐츠 정책 opt-in)
 EOF
@@ -75,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     --cdp-port)      CDP_PORT="$2"; shift 2;;
     --seo-check)     SEO_CHECK="$2"; shift 2;;
     --seo-keyword)   SEO_KEYWORD="$2"; shift 2;;
+    --seo-min-body-chars) SEO_MIN_BODY_CHARS="$2"; shift 2;;
     --require-public-image-figures) REQUIRE_PUBLIC_IMAGE_FIGURES="$2"; shift 2;;
     --private)       PRIVATE=true; shift;;
     -h|--help)       usage; exit 0;;
@@ -112,6 +116,7 @@ fi
 [[ "$TEMPLATE" == "mk-review" && -z "$BANNER" ]] && fail "--banner required for template mk-review"
 [[ ! "$REQUIRE_PUBLIC_IMAGE_FIGURES" =~ ^[0-9]+$ ]] && fail "--require-public-image-figures must be a non-negative integer"
 [[ "$SEO_CHECK" != "off" && "$SEO_CHECK" != "warn" && "$SEO_CHECK" != "strict" ]] && fail "--seo-check must be off|warn|strict"
+[[ ! "$SEO_MIN_BODY_CHARS" =~ ^[0-9]+$ ]] && fail "--seo-min-body-chars must be a non-negative integer"
 
 # 배너가 있는데 alt가 없으면 제목을 alt로 사용 (빈 alt로 올라가는 것 방지)
 if [[ -n "$BANNER" && -z "$BANNER_ALT" ]]; then
@@ -126,7 +131,7 @@ fi
 # ── SEO 검사 (발행 전) ──
 if [[ "$SEO_CHECK" != "off" ]]; then
   log "SEO 검사 실행 (mode=$SEO_CHECK)"
-  SEO_ARGS=(--title "$TITLE" --body-file "$BODY_FILE" --mode "$SEO_CHECK")
+  SEO_ARGS=(--title "$TITLE" --body-file "$BODY_FILE" --mode "$SEO_CHECK" --min-body-chars "$SEO_MIN_BODY_CHARS")
   [[ -n "$TAGS" ]]        && SEO_ARGS+=(--tags "$TAGS")
   [[ -n "$SEO_KEYWORD" ]] && SEO_ARGS+=(--keyword "$SEO_KEYWORD")
   [[ -n "$BLOG" ]]        && SEO_ARGS+=(--blog "$BLOG")
@@ -1200,6 +1205,7 @@ with sync_playwright() as p:
             time.sleep(0.5)
             fi = page.query_selector('#openFile')
             if fi:
+                before_banner_image_count = page.evaluate("() => typeof tinymce !== 'undefined' && tinymce.activeEditor ? tinymce.activeEditor.getBody().querySelectorAll('img').length : 0")
                 fi.set_input_files(BANNER)
                 time.sleep(4)
                 uploaded = True
@@ -1212,8 +1218,8 @@ with sync_playwright() as p:
         if uploaded and BANNER_ALT:
             try:
                 alt_result = page.evaluate(
-                    "(alt) => typeof setImageAlt === 'function' ? setImageAlt(alt, 0) : {success: false, error: 'setImageAlt unavailable'}",
-                    BANNER_ALT,
+                    "({alt, filename, previousCount}) => typeof setImageAltForUploadedImage === 'function' ? setImageAltForUploadedImage(alt, filename, previousCount) : {success: false, error: 'setImageAltForUploadedImage unavailable'}",
+                    {"alt": BANNER_ALT, "filename": os.path.basename(BANNER), "previousCount": before_banner_image_count},
                 )
                 log(f"  - 배너 alt 설정: {alt_result}")
             except Exception as e:
