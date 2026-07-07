@@ -21,7 +21,7 @@ BLOG=""
 HELPER=""
 TEMPLATE=""
 PRIVATE=false
-CDP_PORT="${TISTORY_CDP_PORT:-18801}"
+CDP_PORT="${TISTORY_CDP_PORT:-18800}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ALLOW_DIRECT_TISTORY_PUBLISH="${ALLOW_DIRECT_TISTORY_PUBLISH:-}"
 RUN_TOKEN="${RUN_TOKEN:-}"
@@ -44,9 +44,9 @@ Options:
   --category       카테고리명
   --tags           쉼표 구분 태그
   --banner         배너 이미지 파일
-  --blog           블로그 도메인 (예: bongman.tistory.com)
+  --blog           블로그 도메인 (예: anthropic.tistory.com)
   --helper         JS helper 경로
-  --cdp-port       OpenClaw Chrome CDP 포트 (기본: TISTORY_CDP_PORT 또는 18801)
+  --cdp-port       OpenClaw Chrome CDP 포트 (기본: TISTORY_CDP_PORT 또는 18800)
   --private        비공개 발행
   --require-public-image-figures N
                   공개 페이지 검증 시 image figure 최소 개수 요구 (기본: 0, 콘텐츠 정책 opt-in)
@@ -82,8 +82,8 @@ if [[ -n "$TEMPLATE" ]]; then
         DATE_PREFIX=$(date "+%Y.%m.%d(${DOW_KR})")
         TITLE="[매경] ${DATE_PREFIX} - ${ARTICLE_TITLE}"
       fi
-      [[ -z "$CATEGORY" ]] && CATEGORY="신문 리뷰"
-      [[ -z "$BLOG" ]] && BLOG="bongman.tistory.com"
+      [[ -z "$CATEGORY" ]] && CATEGORY="재테크 이야기/경제신문 리뷰"
+      [[ -z "$BLOG" ]] && BLOG="anthropic.tistory.com"
       ;;
     daum-trends)
       [[ -z "$TAGS" ]] && TAGS="Daum,실시간트렌드,Daum-Trends"
