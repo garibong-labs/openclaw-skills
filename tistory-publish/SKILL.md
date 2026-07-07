@@ -60,7 +60,10 @@ bash scripts/publish.sh \
   --article-title "기사 제목" \
   --body-file body.html \
   --banner /tmp/banner.jpg \
-  --tags "매경,경제뉴스"
+  --tags "매경,경제뉴스" \
+  --blog "anthropic.tistory.com" \
+  --category "재테크 이야기/경제신문 리뷰" \
+  --cdp-port 18800
 
 # 배너 + 태그 + 비공개
 bash scripts/publish.sh \
@@ -92,6 +95,7 @@ bash scripts/publish.sh \
 
 | 이름 | 카테고리 | 블로그 | 제목 형식 | 배너 |
 |------|---------|--------|----------|------|
+| `mk-review` | 재테크 이야기/경제신문 리뷰 | anthropic.tistory.com | `[매경] YYYY.MM.DD(요일) - 기사 제목` | 필수 |
 | `simple-post` | (직접 지정) | (직접 지정) | (직접 지정) | 선택 |
 
 > 자신만의 preset을 추가하려면 `templates/` 아래에 폴더를 만들고 `publish.sh --template <이름>` 으로 사용하세요.

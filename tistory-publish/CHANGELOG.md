@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- `mk-review` preset 기본 발행 대상을 `anthropic.tistory.com` / `재테크 이야기/경제신문 리뷰`로 변경
+- `publish-post.sh` 기본 CDP 포트를 Ruth/Tistory 운영 포트인 `18800`으로 정렬
 - `publish-post.sh` 로그인 자동 복구가 현재 `--blog`와 `--cdp-port`를 `login.sh`에 전달하도록 수정
 - `login.sh`에서 `--blog` 옵션과 `TISTORY_CDP_PORT` 기본값 지원
 

@@ -41,7 +41,7 @@ Options:
   --category       카테고리명
   --tags           쉼표 구분 태그
   --banner         배너 이미지 파일
-  --blog           블로그 도메인 (예: bongman.tistory.com)
+  --blog           블로그 도메인 (예: anthropic.tistory.com)
   --helper         JS helper 경로
   --cdp-port       OpenClaw Chrome CDP 포트 (기본: 18800)
   --private        비공개 발행
@@ -76,8 +76,8 @@ if [[ -n "$TEMPLATE" ]]; then
         DATE_PREFIX=$(date "+%Y.%m.%d(${DOW_KR})")
         TITLE="[매경] ${DATE_PREFIX} - ${ARTICLE_TITLE}"
       fi
-      [[ -z "$CATEGORY" ]] && CATEGORY="신문 리뷰"
-      [[ -z "$BLOG" ]] && BLOG="bongman.tistory.com"
+      [[ -z "$CATEGORY" ]] && CATEGORY="재테크 이야기/경제신문 리뷰"
+      [[ -z "$BLOG" ]] && BLOG="anthropic.tistory.com"
       ;;
     daum-trends)
       [[ -z "$TAGS" ]] && TAGS="Daum,실시간트렌드,Daum-Trends"

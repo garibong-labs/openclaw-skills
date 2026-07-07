@@ -10,7 +10,7 @@
  * 
  * 순서:
  *   0. (사전) node mk-banner.js -c  — 매경 1면 1150x630 배너 생성 + 클립보드
- *   1. setCategory()           — 카테고리 "신문 리뷰" 선택
+ *   1. setCategory()           — 카테고리 "재테크 이야기/경제신문 리뷰" 선택
  *   2. setTitle(title)          — 제목 입력
  *   3. (에디터 맨 위 Cmd+V)     — 배너 이미지 붙여넣기
  *   4. insertContent(html)      — 본문 HTML 삽입 (OG placeholder 포함)
@@ -75,9 +75,9 @@ function buildBlogHTML({ intro, articles }) {
 
 /**
  * 카테고리 선택 (셀렉트 박스에서 이름으로 선택)
- * @param {string} name - 카테고리 이름 (기본: "신문 리뷰")
+ * @param {string} name - 카테고리 이름 (기본: "재테크 이야기/경제신문 리뷰")
  */
-function setCategory(name = '신문 리뷰') {
+function setCategory(name = '재테크 이야기/경제신문 리뷰') {
   const select = document.getElementById('category');
   if (!select) return { success: false, error: 'category select not found' };
   
@@ -981,7 +981,7 @@ function getEditorImageCount() {
 
 const CONFIG = {
   separator: '<hr contenteditable="false" data-ke-type="horizontalRule" data-ke-style="style1">',
-  category: '신문 리뷰',
+  category: '재테크 이야기/경제신문 리뷰',
   author: '가리봉뉘우스',
   mkImageUrlPattern: 'https://file2.mk.co.kr/mkde/{YYYY}/{MM}/{DD}/page/01_01_ORG.jpg',
   bannerCropSize: { width: 1150, height: 630 },

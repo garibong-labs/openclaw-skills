@@ -53,6 +53,8 @@ bash scripts/publish-post.sh \
   --body-file body.html \
   --banner /tmp/banner.jpg \
   --tags "매경,경제뉴스" \
+  --blog "anthropic.tistory.com" \
+  --category "재테크 이야기/경제신문 리뷰" \
   --cdp-port 18800
 ```
 
