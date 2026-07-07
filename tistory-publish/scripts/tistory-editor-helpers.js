@@ -175,6 +175,27 @@ function insertContent(html) {
 }
 
 /**
+ * 에디터 내 이미지에 alt 텍스트 설정 (SEO: 이미지 검색 유입 + 접근성)
+ * 배너 업로드 직후 호출 — 업로드된 이미지는 alt가 비어 있음
+ *
+ * @param {string} alt - alt 텍스트 (예: "OpenClaw 2026.6.10 릴리즈 노트 요약 배너")
+ * @param {number} index - 대상 이미지 인덱스 (기본: 0 = 첫 번째/배너)
+ */
+function setImageAlt(alt, index = 0) {
+  const editor = getSafeTinyEditor();
+  if (!editor) return { success: false, error: 'tinymce unavailable' };
+  const imgs = editor.getBody().querySelectorAll('img');
+  if (!imgs.length || index >= imgs.length) {
+    return { success: false, error: `no image at index ${index} (count: ${imgs.length})` };
+  }
+  const img = imgs[index];
+  img.setAttribute('alt', alt);
+  editor.setDirty(true);
+  editor.save();
+  return { success: true, index, alt, src: (img.src || '').slice(0, 100) };
+}
+
+/**
  * 완료 버튼 클릭 → 발행 다이얼로그 열기
  */
 function clickComplete() {

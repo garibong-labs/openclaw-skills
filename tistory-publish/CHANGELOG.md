@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- **SEO 지원 추가**
+  - `scripts/seo_check.py` 신규: 발행 전 SEO 정적 검사 (제목 길이/키워드 위치, 도입부(메타 디스크립션) 존재·분량, h2/h3 구조, 이미지 alt, 내부/외부 링크, 본문 분량, 태그 중복·개수)
+  - `publish-post.sh`/`publish.sh`에 `--seo-check off|warn|strict`, `--seo-keyword` 옵션 추가 (`TISTORY_SEO_CHECK` 환경변수로 기본값 지정 가능)
+  - `--banner-alt` 옵션 추가: 배너 업로드 후 alt 텍스트 설정 (미지정 시 제목 사용 — 빈 alt 업로드 방지)
+  - JS helper에 `setImageAlt(alt, index)` 추가 (`tistory-editor-helpers.js`, `tistory-publish.js`)
+  - SKILL.md에 본문 SEO 작성 규칙 문서화
 - `mk-review` preset 기본 발행 대상을 `anthropic.tistory.com` / `재테크 이야기/경제신문 리뷰`로 변경
 - `publish-post.sh` 기본 CDP 포트를 Ruth/Tistory 운영 포트인 `18800`으로 정렬
 - `publish-post.sh` 로그인 자동 복구가 현재 `--blog`와 `--cdp-port`를 `login.sh`에 전달하도록 수정

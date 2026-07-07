@@ -38,6 +38,7 @@ tistory-publish/
 ├── scripts/
 │   ├── tistory-publish.js       # 코어 — 에디터 조작 함수 모음
 │   ├── publish.sh               # 범용 발행 스크립트
+│   ├── seo_check.py             # 발행 전 SEO 정적 검사
 │   └── login.sh                 # 카카오 로그인 세션 복구
 └── templates/
     └── simple-post/             # 예시: 단순 글 발행
@@ -86,10 +87,13 @@ bash scripts/publish.sh \
 | `--article-title` | | mk-review용 기사 제목 (자동 날짜 접두사) |
 | `--tags` | | 쉼표 구분 태그 목록 |
 | `--banner` | | 배너 이미지 파일 경로 |
+| `--banner-alt` | | 배너 이미지 alt 텍스트 (기본: 제목 — 빈 alt로 업로드되지 않도록) |
 | `--blog` | | 블로그 도메인 (기본: tistory.com 첫 번째 블로그) |
 | `--cdp-port` | | OpenClaw Chrome CDP 포트 (기본: `TISTORY_CDP_PORT` 또는 스크립트 기본값) |
 | `--helper` | | tistory-publish.js 경로 (기본: scripts/ 내) |
 | `--private` | | 비공개 발행 |
+| `--seo-check` | | 발행 전 SEO 검사 모드: `off`(기본)/`warn`/`strict`. `strict`는 error 발견 시 발행 중단 |
+| `--seo-keyword` | | SEO 핵심 키워드 (기본: 제목 첫 단어). 제목/도입부/소제목 내 키워드 배치 검사에 사용 |
 
 ### 템플릿 preset
 
@@ -127,12 +131,13 @@ bash scripts/login.sh \
 
 스크립트가 순서대로 처리:
 
+0. SEO 검사 (`--seo-check warn|strict` 지정 시, 발행 전 정적 검사)
 1. 새 글 페이지 열기
 2. JS 헬퍼 함수 주입
 3. 카테고리 선택 (ARIA combobox → Playwright click)
 4. 제목 입력 (base64 디코딩으로 한글 처리)
 5. 본문 HTML 삽입
-6. 배너 이미지 업로드 (첨부→사진 메뉴 → file input)
+6. 배너 이미지 업로드 (첨부→사진 메뉴 → file input) + alt 텍스트 설정
 7. OG 카드 생성 (placeholder URL → Enter 키 → 카드 렌더링)
 8. 대표이미지 설정
 9. 태그 등록
@@ -144,6 +149,28 @@ bash scripts/login.sh \
 - 단락 = 여러 문장 묶음 (`<p>` 하나에 2~4문장)
 - OG 카드 위치: `<p data-og-placeholder="URL">&#8203;</p>`
 - 구분선: `<hr contenteditable="false" data-ke-type="horizontalRule" data-ke-style="style1">`
+
+### SEO 규칙 (검색 노출용 — `--seo-check`가 검사하는 항목)
+
+Tistory는 본문 시작부를 meta description / og:description으로 사용하므로 본문 구조가 곧 검색 스니펫이다.
+
+- **도입부 필수**: 첫 `<h2>` 이전에 80~150자 요약 문단 1개. 핵심 키워드를 첫 150자 안에 배치 (검색 결과 요약문으로 노출됨)
+- **제목**: 핵심 키워드를 앞쪽(20자 이내)에 배치, 전체 60자 이하 (SERP에서 한글 30~35자만 노출)
+- **소제목**: h2 2개 이상, 최소 1개 h2/h3에 핵심 키워드 포함
+- **이미지 alt**: 본문 내 모든 `<img>`에 alt 필수, 배너는 `--banner-alt`로 지정
+- **내부 링크**: 같은 블로그의 관련 글 2~3개 링크 (크롤링 경로 + 체류시간)
+- **외부 출처**: 원문 링크 또는 OG 카드 1개 이상
+- **본문 분량**: 노출 텍스트 1,000자 이상 (단순 발췌는 저품질 콘텐츠로 분류될 수 있음)
+- **태그**: 5~10개, 중복 금지, 범용 키워드 + 롱테일 키워드 혼합
+
+단독 실행:
+
+```bash
+python3 scripts/seo_check.py \
+  --title "글 제목" --body-file body.html \
+  --tags "태그1,태그2" --keyword "핵심키워드" \
+  --blog "your-blog.tistory.com" --mode strict
+```
 
 ## 템플릿 추가하기
 
@@ -170,6 +197,7 @@ templates/my-template/
 ### 메타데이터
 - `setTags(tags[])` — 태그 등록
 - `setRepresentImageFromEditor()` — 대표이미지 설정
+- `setImageAlt(alt, index)` — 에디터 내 이미지 alt 텍스트 설정 (SEO)
 
 ### 배너
 - `verifyBannerUpload()` — 업로드 확인

@@ -17,10 +17,13 @@ BODY_FILE=""
 CATEGORY=""
 TAGS=""
 BANNER=""
+BANNER_ALT=""
 BLOG=""
 HELPER=""
 TEMPLATE=""
 PRIVATE=false
+SEO_CHECK="${TISTORY_SEO_CHECK:-off}"
+SEO_KEYWORD=""
 CDP_PORT="${TISTORY_CDP_PORT:-18800}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -41,10 +44,13 @@ Options:
   --category       카테고리명
   --tags           쉼표 구분 태그
   --banner         배너 이미지 파일
+  --banner-alt     배너 이미지 alt 텍스트 (SEO, 기본: 제목)
   --blog           블로그 도메인 (예: anthropic.tistory.com)
   --helper         JS helper 경로
   --cdp-port       OpenClaw Chrome CDP 포트 (기본: 18800)
   --private        비공개 발행
+  --seo-check      발행 전 SEO 검사: off|warn|strict (기본: off)
+  --seo-keyword    SEO 핵심 키워드 (기본: 제목 첫 단어)
 EOF
 }
 
@@ -58,9 +64,12 @@ while [[ $# -gt 0 ]]; do
     --category)      CATEGORY="$2"; shift 2;;
     --tags)          TAGS="$2"; shift 2;;
     --banner)        BANNER="$2"; shift 2;;
+    --banner-alt)    BANNER_ALT="$2"; shift 2;;
     --blog)          BLOG="$2"; shift 2;;
     --helper)        HELPER="$2"; shift 2;;
     --cdp-port)      CDP_PORT="$2"; shift 2;;
+    --seo-check)     SEO_CHECK="$2"; shift 2;;
+    --seo-keyword)   SEO_KEYWORD="$2"; shift 2;;
     --private)       PRIVATE=true; shift;;
     -h|--help)       usage; exit 0;;
     *) echo "Unknown option: $1" >&2; usage; exit 1;;
@@ -99,11 +108,29 @@ if [[ -z "$HELPER" ]]; then
   HELPER="$SCRIPT_DIR/tistory-publish.js"
 fi
 [[ ! -f "$HELPER" ]] && fail "helper JS not found: $HELPER"
+[[ "$SEO_CHECK" != "off" && "$SEO_CHECK" != "warn" && "$SEO_CHECK" != "strict" ]] && fail "--seo-check must be off|warn|strict"
+
+# 배너가 있는데 alt가 없으면 제목을 alt로 사용 (빈 alt로 올라가는 것 방지)
+if [[ -n "$BANNER" && -z "$BANNER_ALT" ]]; then
+  BANNER_ALT="$TITLE"
+fi
+
+# ── SEO 검사 (발행 전) ──
+if [[ "$SEO_CHECK" != "off" ]]; then
+  log "SEO 검사 실행 (mode=$SEO_CHECK)"
+  SEO_ARGS=(--title "$TITLE" --body-file "$BODY_FILE" --mode "$SEO_CHECK")
+  [[ -n "$TAGS" ]]        && SEO_ARGS+=(--tags "$TAGS")
+  [[ -n "$SEO_KEYWORD" ]] && SEO_ARGS+=(--keyword "$SEO_KEYWORD")
+  [[ -n "$BLOG" ]]        && SEO_ARGS+=(--blog "$BLOG")
+  if ! python3 "$SCRIPT_DIR/seo_check.py" "${SEO_ARGS[@]}"; then
+    fail "SEO check failed (mode=strict) — 위 error 항목을 수정 후 재발행"
+  fi
+fi
 
 # ── 메인: Python Playwright CDP ──
 log "Launching Playwright CDP publish (port=$CDP_PORT)"
 
-python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" << 'PYTHON_SCRIPT'
+python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" "$BANNER_ALT" << 'PYTHON_SCRIPT'
 import sys, json, time, os, re
 
 CDP_PORT   = sys.argv[1]
@@ -115,6 +142,7 @@ TAGS_STR   = sys.argv[6]
 BANNER     = sys.argv[7]
 HELPER_JS  = sys.argv[8]
 PRIVATE    = sys.argv[9] == "true"
+BANNER_ALT = sys.argv[10] if len(sys.argv) > 10 else ""
 
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 NEWPOST_URL = f"https://{BLOG}/manage/newpost/?type=post" if BLOG else "https://www.tistory.com/manage/newpost/?type=post"
@@ -239,6 +267,16 @@ with sync_playwright() as p:
                 log("  ⚠️ #openFile not found after menu open")
         except Exception as e:
             log(f"  ⚠️ 배너 업로드 실패: {e}")
+
+        if uploaded and BANNER_ALT:
+            try:
+                alt_result = page.evaluate(
+                    "(alt) => typeof setImageAlt === 'function' ? setImageAlt(alt, 0) : {success: false, error: 'setImageAlt unavailable'}",
+                    BANNER_ALT,
+                )
+                log(f"  - 배너 alt 설정: {alt_result}")
+            except Exception as e:
+                log(f"  ⚠️ 배너 alt 설정 실패 (발행은 계속): {e}")
 
         if not uploaded:
             log("  ⚠️ 배너 업로드 실패 — 발행은 계속 진행")
