@@ -1076,12 +1076,32 @@ function normalizeImagePresentation(node, options = {}) {
   return figure;
 }
 
+function applyImageCaption(node, caption) {
+  const text = String(caption || '').trim();
+  if (!node || !text) return null;
+  const figure = node.matches && node.matches('figure[data-ke-type="image"]')
+    ? node
+    : (node.closest && node.closest('figure[data-ke-type="image"]')) || node;
+  if (!figure || !figure.querySelector) return null;
+
+  let figcaption = figure.querySelector('figcaption');
+  if (!figcaption) {
+    figcaption = document.createElement('figcaption');
+    figure.appendChild(figcaption);
+  }
+  figcaption.textContent = text;
+  figcaption.removeAttribute('style');
+  figcaption.removeAttribute('data-placeholder');
+  return figcaption;
+}
+
 function imagePresentationOptions(item = {}) {
   const filename = String(item.filename || '');
+  const caption = item.caption || '';
   if (/^00-comic\.(jpe?g|png|webp)$/i.test(filename)) {
-    return { width: Number(item.width || 680), align: item.align || 'left' };
+    return { width: Number(item.width || 680), align: item.align || 'left', caption };
   }
-  return { width: Number(item.width || 0), align: item.align || '' };
+  return { width: Number(item.width || 0), align: item.align || '', caption };
 }
 
 function moveImageByFilenameAfterMarker(filename, markerName, options = {}) {
@@ -1111,6 +1131,7 @@ function moveImageByFilenameAfterMarker(filename, markerName, options = {}) {
   const cloned = wrapper.firstElementChild;
   if (!cloned) return 'clone failed';
   normalizeImagePresentation(cloned, options);
+  applyImageCaption(cloned, options.caption);
 
   marker.insertAdjacentElement('afterend', cloned);
   marker.remove();
@@ -1160,6 +1181,7 @@ function moveImagesToMarkers(mapping) {
       const fallbackFigure = detachedFigures[0];
       if (marker && fallbackFigure) {
         normalizeImagePresentation(fallbackFigure, options);
+        applyImageCaption(fallbackFigure, options.caption);
         marker.insertAdjacentElement('afterend', fallbackFigure);
         marker.remove();
         result = 'moved by order fallback';
@@ -1234,8 +1256,13 @@ function rebuildContentWithImageFigures(sectionMarkers) {
   let html = editor.getContent();
   for (const item of sectionMarkers) {
     if (!item.outerHTML) continue;
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = item.outerHTML;
+    if (wrapper.firstElementChild) {
+      applyImageCaption(wrapper.firstElementChild, item.caption);
+    }
     const markerHtml = `<p data-ke-size="size16" data-image-marker="${item.marker}">&#8203;</p>`;
-    html = html.replace(markerHtml, item.outerHTML);
+    html = html.replace(markerHtml, wrapper.innerHTML || item.outerHTML);
   }
   editor.setContent(html);
   editor.setDirty(true);

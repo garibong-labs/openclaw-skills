@@ -1068,7 +1068,9 @@ with sync_playwright() as p:
     log("Step 3: 완료")
 
     # ── Step 3.5: inline 이미지 업로드 + marker 이동 ──
+    image_files = []
     image_files_env = os.environ.get('TISTORY_INLINE_IMAGE_FILES', '').strip()
+    inline_image_caption = os.environ.get('TISTORY_INLINE_IMAGE_CAPTION', '').strip()
     if image_files_env:
         log("Step 3.5: inline 이미지 업로드")
         image_files = [p for p in image_files_env.split(':') if p]
@@ -1086,7 +1088,10 @@ with sync_playwright() as p:
                 time.sleep(4)
                 debug_blocks = page.evaluate("typeof debugImageBlocks === 'function' ? debugImageBlocks() : []")
                 log(f"  - inline image {idx+1}/{len(image_files)} blocks: {debug_blocks}")
-                mapping.append({"marker": marker_names[idx], "filename": os.path.basename(img_path)})
+                item = {"marker": marker_names[idx], "filename": os.path.basename(img_path)}
+                if inline_image_caption:
+                    item["caption"] = inline_image_caption
+                mapping.append(item)
             moved = page.evaluate("(mapping) => moveImagesToMarkers(mapping)", mapping)
             log(f"  - inline image mapping results: {moved}")
             comic_display_width = int(os.environ.get('DAUM_TRENDS_COMIC_DISPLAY_WIDTH', '680'))
@@ -1138,12 +1143,32 @@ with sync_playwright() as p:
                 for idx, item in enumerate(marker_figures):
                     rebuild_payload.append({
                         'marker': marker_names[idx],
-                        'outerHTML': item.get('outerHTML')
+                        'outerHTML': item.get('outerHTML'),
+                        'caption': inline_image_caption,
                     })
                 rebuilt = page.evaluate("(payload) => rebuildContentWithImageFigures(payload)", rebuild_payload)
                 log(f"  - inline image rebuild result: {rebuilt}")
                 image_debug = page.evaluate("() => ({ markers: Array.from(tinymce.activeEditor.getBody().querySelectorAll('[data-image-marker]')).length, figures: Array.from(tinymce.activeEditor.getBody().querySelectorAll('figure[data-ke-type=\"image\"]')).length, contentLength: tinymce.activeEditor.getContent().length })")
                 log(f"  - inline image editor state after rebuild: {image_debug}")
+            if inline_image_caption:
+                caption_debug = page.evaluate(
+                    """
+                    (caption) => {
+                      const editor = tinymce?.activeEditor;
+                      if (!editor || !editor.getBody) return {caption, matchingCaptions: 0, totalCaptions: 0};
+                      const captions = Array.from(editor.getBody().querySelectorAll('figure[data-ke-type="image"] figcaption'));
+                      return {
+                        caption,
+                        matchingCaptions: captions.filter((node) => node.textContent.trim() === caption).length,
+                        totalCaptions: captions.length,
+                      };
+                    }
+                    """,
+                    inline_image_caption,
+                )
+                log(f"  - inline image caption state: {caption_debug}")
+                if caption_debug.get('matchingCaptions', 0) < len(image_files):
+                    fail(f"inline image caption count mismatch: expected {len(image_files)}, got {caption_debug.get('matchingCaptions', 0)}")
             log(f"  - inline image editor state: {image_debug}")
             try:
                 collected = page.evaluate("typeof collectImageFiguresByFilename === 'function' ? collectImageFiguresByFilename() : []")
@@ -1616,6 +1641,13 @@ with sync_playwright() as p:
                     warning = policy_error
                 else:
                     HARD_FAIL = policy_error
+            required_caption = os.environ.get('REQUIRE_PUBLIC_IMAGE_CAPTION', inline_image_caption).strip()
+            if required_caption:
+                required_caption_count = len(image_files) if image_files else REQUIRE_PUBLIC_IMAGE_FIGURES
+                caption_count = len(re.findall(re.escape(required_caption), content_html))
+                log(f"  - 공개 페이지 이미지 캡션 count: caption={required_caption!r}, count={caption_count}, required={required_caption_count}")
+                if required_caption_count > 0 and caption_count < required_caption_count:
+                    HARD_FAIL = f"public_image_caption_count_{caption_count}_lt_required_{required_caption_count}"
             if should_run_og_gate():
                 log("  - public OG source/canonical/title 검증")
                 public_og_gate = run_og_gate('public', post_url)
