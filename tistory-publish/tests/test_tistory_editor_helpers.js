@@ -25,7 +25,7 @@ function loadHelpers() {
   };
   vm.createContext(sandbox);
   vm.runInContext(
-    `${source}\nthis.__helpers = { applyImageCaption, imagePresentationOptions };`,
+    `${source}\nthis.__helpers = { applyImageCaption, buildBlogHTML, imagePresentationOptions };`,
     sandbox,
     { filename: helperPath },
   );
@@ -76,4 +76,22 @@ function makeFigure() {
   );
 }
 
-console.log('tistory-editor-helpers caption tests passed');
+{
+  const { buildBlogHTML } = loadHelpers();
+  const html = buildBlogHTML({
+    intro: '<p data-ke-size="size16">intro</p>',
+    articles: [{
+      title: '① title',
+      url: 'https://www.mk.co.kr/news/economy/123',
+      body: '<p data-ke-size="size16">body</p>',
+      commentLabel: '가리봉늬우스 코멘트:',
+      comment: 'comment',
+    }],
+  });
+
+  assert.ok(
+    html.includes('<p data-ke-size="size16">body</p>\n<p data-ke-size="size16">&nbsp;</p>\n<p data-ke-size="size16"><b>가리봉늬우스 코멘트:</b> - comment 끝.</p>'),
+  );
+}
+
+console.log('tistory-editor-helpers tests passed');
