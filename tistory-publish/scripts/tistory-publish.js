@@ -39,6 +39,7 @@
  */
 function buildBlogHTML({ intro, articles }) {
   const HR = '<hr contenteditable="false" data-ke-type="horizontalRule" data-ke-style="style1">';
+  const COMMENT_SPACER = '<p data-ke-size="size16">&nbsp;</p>';
   
   let html = '';
   
@@ -55,6 +56,7 @@ function buildBlogHTML({ intro, articles }) {
     html += `<p data-ke-size="size16" data-og-placeholder="${article.url}">&#8203;</p>\n`;
     html += article.body + '\n';
     // 코멘트: 각 기사 안에 삽입
+    html += COMMENT_SPACER + '\n';
     html += `<p data-ke-size="size16"><b>가리봉뉘우스의 한마디</b> - ${article.comment}`;
     // 마지막 기사면 "끝." 붙이기
     if (i === articles.length - 1) {
