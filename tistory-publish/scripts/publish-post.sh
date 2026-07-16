@@ -152,9 +152,10 @@ TMP_STDERR="$(mktemp -t tistory-publish-stderr.XXXXXX)"
 
 set +e
 PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" "$REQUIRE_PUBLIC_IMAGE_FIGURES" "$TEMPLATE" "$BANNER_ALT" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
-import sys, json, time, os, re, subprocess
+import sys, json, time, os, re, subprocess, urllib.request, urllib.error
 import html as htmlmod
 from pathlib import Path
+from urllib.parse import quote
 
 HARD_FAIL = None
 ALLOW_MISSING_IMAGES = os.environ.get('ALLOW_MISSING_IMAGES', '').lower() in ('1','true','yes')  # legacy: downgrade opt-in image policy failures to warnings
@@ -181,6 +182,44 @@ def log(msg): print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr)
 def fail(msg):
     print(json.dumps({"success": False, "error": msg}))
     sys.exit(1)
+
+def cdp_get_json(path, timeout=5):
+    url = f"{CDP_URL}{path}"
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def cdp_close_target(target_id, timeout=5):
+    url = f"{CDP_URL}/json/close/{quote(target_id, safe='')}"
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+def is_target_newpost(url):
+    if "newpost" not in (url or ""):
+        return False
+    if BLOG and f"https://{BLOG}/manage/newpost" not in url:
+        return False
+    return True
+
+def cleanup_newpost_targets(reason):
+    try:
+        targets = cdp_get_json("/json/list")
+    except Exception as e:
+        log(f"  ⚠️ {reason}: cannot list CDP targets before attach: {type(e).__name__}: {e}")
+        return 0
+
+    closed = 0
+    for target in targets:
+        url = target.get("url") or ""
+        target_id = target.get("id") or ""
+        if not target_id or not is_target_newpost(url):
+            continue
+        try:
+            cdp_close_target(target_id)
+            closed += 1
+            log(f"  - closed stale newpost target before attach: id={target_id}, url={url}")
+        except Exception as e:
+            log(f"  ⚠️ failed to close stale newpost target id={target_id}: {type(e).__name__}: {e}")
+    return closed
 
 OG_GATE_ENABLED = os.environ.get('TISTORY_OG_MATCH_GATE', '1').lower() not in ('0', 'false', 'no')
 OG_VALIDATOR = os.environ.get('TISTORY_OG_VALIDATOR', '').strip()
@@ -938,6 +977,10 @@ def handle_dialog(dialog):
         log(f"  ⚠️ dialog handler failed: {e}")
 
 publish_lock.acquire()
+
+log('Preflight: stale newpost target cleanup')
+closed_targets = cleanup_newpost_targets('stale newpost target cleanup')
+log(f"Preflight: stale newpost target cleanup OK (closed={closed_targets})")
 
 with sync_playwright() as p:
     log('Preflight: Playwright CDP attach')

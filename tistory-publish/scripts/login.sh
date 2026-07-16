@@ -81,6 +81,10 @@ with sync_playwright() as p:
     login_domains = ["auth/login", "accounts.kakao.com", "logins.daum.net", "kauth.kakao.com"]
     if not any(x in page.url for x in login_domains):
         print(f"✅ 이미 로그인됨 ({page.url})")
+        try:
+            page.close()
+        except Exception:
+            pass
         sys.exit(0)
 
     # 카카오계정으로 로그인 버튼 클릭
