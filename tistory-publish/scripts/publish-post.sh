@@ -155,7 +155,7 @@ PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_POR
 import sys, json, time, os, re, subprocess, urllib.request, urllib.error
 import html as htmlmod
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 HARD_FAIL = None
 ALLOW_MISSING_IMAGES = os.environ.get('ALLOW_MISSING_IMAGES', '').lower() in ('1','true','yes')  # legacy: downgrade opt-in image policy failures to warnings
@@ -177,6 +177,37 @@ BANNER_ALT = sys.argv[12] if len(sys.argv) > 12 else ""
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 NEWPOST_URL = f"https://{BLOG}/manage/newpost/?type=post" if BLOG else "https://www.tistory.com/manage/newpost/?type=post"
 POSTS_URL = f"https://{BLOG}/manage/posts/" if BLOG else "https://www.tistory.com/manage/posts/"
+
+def normalize_public_base_url(base='', blog=''):
+    value = (base or '').strip() or (blog or '').strip()
+    if not value:
+        return ''
+    if '://' not in value:
+        value = f"https://{value}"
+    parts = urlsplit(value)
+    if not parts.netloc:
+        return ''
+    return urlunsplit((parts.scheme or 'https', parts.netloc, '', '', '')).rstrip('/')
+
+PUBLIC_BASE_URL = normalize_public_base_url(
+    os.environ.get('TISTORY_PUBLIC_BASE_URL', ''),
+    os.environ.get('TISTORY_PUBLIC_BLOG', ''),
+)
+
+def public_url_for(url):
+    if not PUBLIC_BASE_URL or not url:
+        return url
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return url
+    if not parts.netloc or '/manage/' in parts.path:
+        return url
+    blog_host = (BLOG or '').lower()
+    if blog_host and parts.netloc.lower() != blog_host:
+        return url
+    public_parts = urlsplit(PUBLIC_BASE_URL)
+    return urlunsplit((public_parts.scheme, public_parts.netloc, parts.path, parts.query, parts.fragment))
 
 def log(msg): print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr)
 def fail(msg):
@@ -1668,6 +1699,9 @@ with sync_playwright() as p:
         log(f"  - latest post info: {post_info}")
         if not post_info or not post_info.get('url') or not post_info.get('id'):
             fail('post publish confirmation failed: postUrl/postId not found')
+        post_info['publicUrl'] = public_url_for(post_info.get('url'))
+        if post_info.get('publicUrl') != post_info.get('url'):
+            log(f"  - public post url: {post_info['publicUrl']}")
 
     # ── Step 10: 발행 후 cleanup 재진입 ──
     if post_info and og_urls:
@@ -1691,7 +1725,8 @@ with sync_playwright() as p:
                 log(f"  ⚠️ post-publish resave raced with navigation: {e}")
                 saved = False
 
-        gap_check = inspect_gap(page, post_info['url'])
+        gap_url = post_info.get('publicUrl') or post_info['url']
+        gap_check = inspect_gap(page, gap_url)
         log(f"  - gap check: {gap_check}")
         if gap_check and gap_check.get('gapPersists'):
             warning = "og_gap_persisted"
@@ -1700,7 +1735,7 @@ with sync_playwright() as p:
     if not PRIVATE and post_info and post_info.get('url'):
         log("Step 11: 공개 페이지 검증")
         import urllib.request
-        post_url = post_info['url']
+        post_url = post_info.get('publicUrl') or post_info['url']
         log(f"  - 검증 URL: {post_url}")
         try:
             req = urllib.request.Request(post_url, headers={'User-Agent':'Mozilla/5.0'})
@@ -1745,8 +1780,12 @@ with sync_playwright() as p:
 
     result = {"success": True, "url": final_url, "elapsed_ms": elapsed, "private": PRIVATE}
     if post_info:
-        result["postUrl"] = post_info.get('url')
+        result["postUrl"] = post_info.get('publicUrl') or post_info.get('url')
         result["postId"] = post_info.get('id')
+        if post_info.get('url') and post_info.get('publicUrl') and post_info.get('url') != post_info.get('publicUrl'):
+            result["managePostUrl"] = post_info.get('url')
+    if PUBLIC_BASE_URL:
+        result["publicBaseUrl"] = PUBLIC_BASE_URL
     if gap_check:
         result["gapCheck"] = gap_check
     if draft_og_gate:
