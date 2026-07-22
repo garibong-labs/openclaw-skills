@@ -25,7 +25,7 @@ function loadHelpers() {
   };
   vm.createContext(sandbox);
   vm.runInContext(
-    `${source}\nthis.__helpers = { applyImageCaption, buildBlogHTML, imagePresentationOptions };`,
+    `${source}\nthis.__helpers = { applyImageCaption, buildBlogHTML, ensureIntroArticleSeparator, imagePresentationOptions };`,
     sandbox,
     { filename: helperPath },
   );
@@ -77,7 +77,7 @@ function makeFigure() {
 }
 
 {
-  const { buildBlogHTML } = loadHelpers();
+  const { buildBlogHTML, ensureIntroArticleSeparator } = loadHelpers();
   const html = buildBlogHTML({
     intro: '<p data-ke-size="size16">intro</p>',
     articles: [{
@@ -88,10 +88,26 @@ function makeFigure() {
       comment: 'comment',
     }],
   });
+  const separator = '<hr contenteditable="false" data-ke-type="horizontalRule" data-ke-style="style1">';
 
+  assert.ok(
+    html.includes(`<p data-ke-size="size16">intro</p>\n${separator}\n<h2 data-ke-size="size26">① title</h2>`),
+  );
   assert.ok(
     html.includes('<p data-ke-size="size16">body</p>\n<p data-ke-size="size16">&nbsp;</p>\n<p data-ke-size="size16"><b>가리봉늬우스 코멘트:</b> - comment 끝.</p>'),
   );
+
+  const rawHtml = [
+    '<h2 data-ke-size="size26">들어가며</h2>',
+    '<p data-ke-size="size16">intro</p>',
+    '<h2 data-ke-size="size26">① title</h2>',
+    '<p data-ke-size="size16">body</p>',
+  ].join('\n');
+  const normalizedHtml = ensureIntroArticleSeparator(rawHtml);
+  assert.ok(
+    normalizedHtml.includes(`<p data-ke-size="size16">intro</p>\n${separator}\n<h2 data-ke-size="size26">① title</h2>`),
+  );
+  assert.strictEqual(ensureIntroArticleSeparator(normalizedHtml), normalizedHtml);
 }
 
 console.log('tistory-editor-helpers tests passed');

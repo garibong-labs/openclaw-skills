@@ -23,6 +23,25 @@
 // 1. HTML 생성 헬퍼
 // ============================================================
 
+const TISTORY_HORIZONTAL_RULE = '<hr contenteditable="false" data-ke-type="horizontalRule" data-ke-style="style1">';
+
+function ensureIntroArticleSeparator(html) {
+  if (typeof html !== 'string') return html;
+
+  const introMatch = html.match(/<h2\b[^>]*>\s*들어가며\s*<\/h2>/i);
+  if (!introMatch || typeof introMatch.index !== 'number') return html;
+
+  const introEnd = introMatch.index + introMatch[0].length;
+  const afterIntro = html.slice(introEnd);
+  const firstArticleHeadingIndex = afterIntro.search(/<h2\b/i);
+  if (firstArticleHeadingIndex < 0) return html;
+
+  const introBody = afterIntro.slice(0, firstArticleHeadingIndex);
+  if (/<hr\b/i.test(introBody)) return html;
+
+  return html.slice(0, introEnd) + introBody + TISTORY_HORIZONTAL_RULE + '\n' + afterIntro.slice(firstArticleHeadingIndex);
+}
+
 /**
  * 기사 배열로부터 전체 블로그 HTML을 생성
  *
@@ -37,7 +56,7 @@
  * @returns {string} 완성된 HTML
  */
 function buildBlogHTML({ intro, articles }) {
-  const HR = '<hr contenteditable="false" data-ke-type="horizontalRule" data-ke-style="style1">';
+  const HR = TISTORY_HORIZONTAL_RULE;
   const COMMENT_SPACER = '<p data-ke-size="size16">&nbsp;</p>';
 
   let html = '';
@@ -139,12 +158,13 @@ function registerSchema() {
 function insertContent(html) {
   // 1. schema 등록 (data-ke 속성 보존)
   const schemaStatus = registerSchema();
+  const normalizedHtml = ensureIntroArticleSeparator(html);
 
   // 2. TinyMCE에 설정 (비주얼 에디터), 가능할 때만
   const editor = getSafeTinyEditor();
-  let content = html;
+  let content = normalizedHtml;
   if (editor) {
-    editor.setContent(html);
+    editor.setContent(normalizedHtml);
     editor.setDirty(true);
     editor.fire('change');
     editor.save(); // → hidden textarea에 동기화
@@ -172,6 +192,7 @@ function insertContent(html) {
     tinymceReady: !!editor,
     style1Count,
     hrCount,
+    introSeparatorInserted: normalizedHtml !== html,
     contentLength: content.length
   };
 }
