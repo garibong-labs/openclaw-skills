@@ -529,6 +529,72 @@ function prepareOGPlaceholder(url) {
   };
 }
 
+function normalizeOGUrl(url) {
+  if (!url || typeof url !== 'string') return '';
+  try {
+    const base = window.location && window.location.href;
+    const parsed = new URL(url, base);
+    parsed.hash = '';
+    return parsed.href.replace(/\/$/, '');
+  } catch (e) {
+    return url.trim().replace(/\/$/, '');
+  }
+}
+
+function getOGCardElements(body) {
+  const candidates = Array.from(body.querySelectorAll(
+    'figure[data-ke-type="opengraph"], .og-container, [data-og-host]'
+  ));
+  const cards = [];
+  candidates.forEach(candidate => {
+    const card = candidate.closest && candidate.closest('figure[data-ke-type="opengraph"]')
+      ? candidate.closest('figure[data-ke-type="opengraph"]')
+      : candidate;
+    if (!cards.includes(card)) cards.push(card);
+  });
+  return cards;
+}
+
+function getOGCardSourceUrl(card) {
+  const sourceNode = card.querySelector && card.querySelector(
+    '[data-og-source-url], [data-og-url], [data-source-url], a[href]'
+  );
+  const sourceUrl = card.getAttribute('data-og-source-url')
+    || card.getAttribute('data-og-url')
+    || card.getAttribute('data-source-url')
+    || (sourceNode && (
+      sourceNode.getAttribute('data-og-source-url')
+      || sourceNode.getAttribute('data-og-url')
+      || sourceNode.getAttribute('data-source-url')
+      || sourceNode.getAttribute('href')
+    ))
+    || '';
+  return sourceUrl;
+}
+
+function getOGCardStatus(url) {
+  if (typeof tinymce === 'undefined' || !tinymce || !tinymce.activeEditor || !tinymce.activeEditor.getBody) {
+    return { found: false, ogCardCount: 0, cards: [], note: 'tinymce unavailable' };
+  }
+  const editor = tinymce.activeEditor;
+  const expectedUrl = normalizeOGUrl(url);
+  const cards = getOGCardElements(editor.getBody()).map((card, index) => {
+    const sourceUrl = getOGCardSourceUrl(card);
+    return {
+      index: index + 1,
+      sourceUrl,
+      title: card.getAttribute('data-og-title') || '',
+      matched: normalizeOGUrl(sourceUrl) === expectedUrl,
+    };
+  });
+
+  return {
+    found: cards.some(card => card.matched),
+    ogCardCount: cards.length,
+    cards,
+  };
+}
+
 /**
  * verifyOGCard(url) — OG 카드가 렌더됐는지 확인 + URL 텍스트 잔여물 정리
  * prepareOGPlaceholder() + Playwright Enter 후 2~3초 대기 뒤 호출
@@ -540,15 +606,13 @@ function verifyOGCard(url) {
   const editor = tinymce.activeEditor;
   const body = editor.getBody();
 
-  // OG 카드 확인
-  const ogCards = body.querySelectorAll(
-    'figure[data-ke-type="opengraph"], .og-container, [data-og-host]'
-  );
+  // OG 카드 확인. 반드시 현재 URL과 매칭되는 카드가 있어야 성공이다.
+  const status = getOGCardStatus(url);
 
   // URL 텍스트 잔여물 정리
   let cleaned = false;
   const pending = body.querySelector(`[data-og-url-pending="${url}"]`);
-  if (pending) {
+  if (pending && status.found) {
     const text = pending.textContent.trim();
     if (text === url || text.startsWith('http')) {
       pending.remove();
@@ -561,10 +625,11 @@ function verifyOGCard(url) {
   }
 
   return {
-    found: ogCards.length > 0,
-    ogCardCount: ogCards.length,
+    found: status.found,
+    ogCardCount: status.ogCardCount,
+    cards: status.cards,
     cleaned,
-    note: ogCards.length > 0 ? 'OG card rendered successfully' : 'OG card NOT found — Enter may not have triggered'
+    note: status.found ? 'OG card rendered successfully' : 'OG card NOT found for this URL — Enter may not have triggered'
   };
 }
 
@@ -627,9 +692,7 @@ function cleanupOGResiduals() {
   });
 
   // 3. OG 카드 수 확인
-  const ogCards = body.querySelectorAll(
-    'figure[data-ke-type="opengraph"], .og-container, [data-og-host]'
-  ).length;
+  const ogCards = getOGCardElements(body).length;
 
   editor.setDirty(true);
   editor.save();
