@@ -9,6 +9,10 @@ const source = fs.readFileSync(helperPath, 'utf8');
 function loadHelpers() {
   const sandbox = {
     console,
+    URL,
+    window: {
+      location: { href: 'https://example.tistory.com/manage/newpost' },
+    },
     document: {
       createElement(tagName) {
         assert.strictEqual(tagName, 'figcaption');
@@ -25,10 +29,11 @@ function loadHelpers() {
   };
   vm.createContext(sandbox);
   vm.runInContext(
-    `${source}\nthis.__helpers = { applyImageCaption, buildBlogHTML, ensureIntroArticleSeparator, imagePresentationOptions };`,
+    `${source}\nthis.__helpers = { applyImageCaption, buildBlogHTML, ensureIntroArticleSeparator, getOGCardStatus, imagePresentationOptions };`,
     sandbox,
     { filename: helperPath },
   );
+  sandbox.__helpers.__sandbox = sandbox;
   return sandbox.__helpers;
 }
 
@@ -74,6 +79,88 @@ function makeFigure() {
     })),
     JSON.stringify({ width: 0, align: '', caption: 'GPT Images 생성' }),
   );
+}
+
+{
+  const { __sandbox, getOGCardStatus } = loadHelpers();
+  const makeCard = (sourceUrl, title = '', anchorHref = '') => ({
+    getAttribute(name) {
+      return {
+        'data-og-source-url': sourceUrl,
+        'data-og-title': title,
+      }[name] || '';
+    },
+    querySelector() {
+      if (!anchorHref) return null;
+      return {
+        getAttribute(name) {
+          return name === 'href' ? anchorHref : '';
+        },
+      };
+    },
+  });
+  const cards = [
+    makeCard('https://www.mk.co.kr/news/society/12106891', 'society'),
+    makeCard('https://www.mk.co.kr/news/economy/12106887', 'economy'),
+    makeCard('', 'world', 'https://www.mk.co.kr/news/world/12106889'),
+  ];
+  const setCards = nextCards => {
+    __sandbox.tinymce = {
+      activeEditor: {
+        getBody() {
+          return {
+            querySelectorAll() {
+              return nextCards;
+            },
+          };
+        },
+      },
+    };
+  };
+  setCards(cards.slice(0, 2));
+
+  const missingStatus = getOGCardStatus('https://www.mk.co.kr/news/world/12106889');
+  assert.strictEqual(missingStatus.found, false);
+  assert.strictEqual(missingStatus.ogCardCount, 2);
+  assert.strictEqual(missingStatus.cards[0].matched, false);
+  assert.strictEqual(missingStatus.cards[1].matched, false);
+
+  setCards(cards);
+  const matchedStatus = getOGCardStatus('https://www.mk.co.kr/news/economy/12106887/');
+  assert.strictEqual(matchedStatus.found, true);
+  assert.strictEqual(matchedStatus.cards[0].matched, false);
+  assert.strictEqual(matchedStatus.cards[1].matched, true);
+
+  const anchorMatchedStatus = getOGCardStatus('https://www.mk.co.kr/news/world/12106889/');
+  assert.strictEqual(anchorMatchedStatus.found, true);
+  assert.strictEqual(anchorMatchedStatus.cards[2].matched, true);
+
+  const child = {
+    getAttribute(name) {
+      return name === 'href' ? 'https://www.mk.co.kr/news/economy/12106887' : '';
+    },
+    querySelector() {
+      return null;
+    },
+    closest() {
+      return figure;
+    },
+  };
+  const figure = {
+    getAttribute() {
+      return '';
+    },
+    querySelector() {
+      return child;
+    },
+    closest() {
+      return figure;
+    },
+  };
+  setCards([figure, child]);
+  const nestedStatus = getOGCardStatus('https://www.mk.co.kr/news/economy/12106887');
+  assert.strictEqual(nestedStatus.found, true);
+  assert.strictEqual(nestedStatus.ogCardCount, 1);
 }
 
 {

@@ -1334,16 +1334,29 @@ with sync_playwright() as p:
     log("Step 5: OG 카드")
     og_urls = page.evaluate("typeof getOGPlaceholders === 'function' ? getOGPlaceholders() : []")
     log(f"  - OG URLs: {len(og_urls)}")
-    for url in og_urls:
-        page.evaluate(f"prepareOGPlaceholder('{url}')")
+    for index, url in enumerate(og_urls, start=1):
+        prep_result = page.evaluate("(url) => prepareOGPlaceholder(url)", url)
+        if isinstance(prep_result, dict) and not prep_result.get("success", False):
+            fail(f"OG placeholder preparation failed before publish: {json.dumps(prep_result, ensure_ascii=False)}")
         time.sleep(0.5)
         page.keyboard.press("Enter")
-        time.sleep(3)
-        og_ok = page.evaluate("tinymce.activeEditor.getDoc().querySelector('figure[data-ke-type=\"opengraph\"]') ? 'yes' : 'no'")
-        log(f"  - OG [{url[:40]}...]: {og_ok}")
+        og_status = {}
+        for _ in range(8):
+            time.sleep(1.5)
+            og_status = page.evaluate(
+                "(url) => typeof getOGCardStatus === 'function' ? getOGCardStatus(url) : {found: false, error: 'getOGCardStatus unavailable'}",
+                url,
+            )
+            if og_status.get("found") and og_status.get("ogCardCount", 0) >= index:
+                break
+        log(f"  - OG [{url[:40]}...]: {json.dumps(og_status, ensure_ascii=False)}")
+        if not og_status.get("found"):
+            fail(f"OG card render failed before publish: {json.dumps(og_status, ensure_ascii=False)}")
     if og_urls:
         cleanup_result = page.evaluate("typeof cleanupOGResiduals === 'function' ? cleanupOGResiduals() : null")
         log(f"  - OG cleanup result: {cleanup_result}")
+        if isinstance(cleanup_result, dict) and cleanup_result.get("ogCards") != len(og_urls):
+            fail(f"OG card count mismatch before publish: expected {len(og_urls)}, got {cleanup_result.get('ogCards')}")
     log("Step 5: 완료")
 
     # ── Step 6: 대표이미지 ──
@@ -1422,13 +1435,28 @@ with sync_playwright() as p:
         }}""", body_html)
         time.sleep(1)
         if og_urls:
-            for url in og_urls:
-                page.evaluate(f"prepareOGPlaceholder('{url}')")
+            for index, url in enumerate(og_urls, start=1):
+                prep_result = page.evaluate("(url) => prepareOGPlaceholder(url)", url)
+                if isinstance(prep_result, dict) and not prep_result.get("success", False):
+                    fail(f"recovery OG placeholder preparation failed before publish: {json.dumps(prep_result, ensure_ascii=False)}")
                 time.sleep(0.5)
                 page.keyboard.press("Enter")
-                time.sleep(3)
+                og_status = {}
+                for _ in range(8):
+                    time.sleep(1.5)
+                    og_status = page.evaluate(
+                        "(url) => typeof getOGCardStatus === 'function' ? getOGCardStatus(url) : {found: false, error: 'getOGCardStatus unavailable'}",
+                        url,
+                    )
+                    if og_status.get("found") and og_status.get("ogCardCount", 0) >= index:
+                        break
+                log(f"  - recovery OG [{url[:40]}...]: {json.dumps(og_status, ensure_ascii=False)}")
+                if not og_status.get("found"):
+                    fail(f"recovery OG card render failed before publish: {json.dumps(og_status, ensure_ascii=False)}")
             cleanup_result = page.evaluate("typeof cleanupOGResiduals === 'function' ? cleanupOGResiduals() : null")
             log(f"  - recovery OG cleanup result: {cleanup_result}")
+            if isinstance(cleanup_result, dict) and cleanup_result.get("ogCards") != len(og_urls):
+                fail(f"recovery OG card count mismatch before publish: expected {len(og_urls)}, got {cleanup_result.get('ogCards')}")
 
     log("Step 7.5: 중복 제목 preflight")
     assert_no_duplicate_title_before_publish(ctx0, final_title)
