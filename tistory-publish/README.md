@@ -132,7 +132,7 @@ ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
 
 ## 이미지 업로드 복구
 
-inline 이미지와 배너는 같은 업로드 helper를 사용합니다. helper는 `첨부 → 사진` 메뉴를 연 뒤 `#openFile` 또는 image accept 속성을 가진 file input이 DOM에 붙을 때까지 기다립니다. Tistory가 input id를 바꾼 경우에도 file input이 하나뿐이면 그 input을 사용합니다.
+inline 이미지와 배너는 같은 업로드 helper를 사용합니다. helper는 `첨부 → 사진` 메뉴 클릭 전에 Playwright file chooser 이벤트를 포착해 transient input이 바로 제거되는 편집기에서도 파일을 전달합니다. chooser 이벤트가 없는 이전 편집기에서는 `#openFile` 또는 image accept 속성을 가진 file input이 DOM에 붙을 때까지 기다리며, input id가 바뀌어도 file input이 하나뿐이면 그 input을 사용합니다.
 
 input 생성이나 파일 주입이 실패하면 메뉴를 다시 열며 2초, 4초 간격으로 최대 3회 시도합니다. 최종 실패 시 `PUBLISH_TRACE_FILE` 경로를 기준으로 현재 DOM HTML과 전체 페이지 스크린샷을 기록한 뒤 발행을 중단합니다.
 

@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- Tistory 사진 메뉴가 transient input을 바로 제거하는 경우를 위해 Playwright file chooser 이벤트를 클릭 전에 포착하고 직접 파일을 전달하도록 이미지 업로드 경로 보강
+- 업로드 실패 DOM 상태 수집기의 JavaScript 닫는 괄호 오류 수정 및 실제 식 문법 회귀 테스트 추가
 - inline 이미지와 배너 업로드를 공용 helper로 통합하고, Tistory의 동적 file input 생성 지연에 대해 3회 지수 백오프 재시도를 추가
 - `#openFile`이 없어도 image accept input 또는 단일 file input을 안전하게 탐색하며, 최종 실패 시 DOM HTML과 스크린샷 기록
 - **SEO 지원 추가**
