@@ -1,0 +1,81 @@
+name: Tistory Publish CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tistory-publish/**"
+      - ".github/workflows/tistory-publish-ci.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "tistory-publish/**"
+      - ".github/workflows/tistory-publish-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tistory-publish-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.9"
+          - "3.13"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run Python unit tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tistory-publish/tests -p "test_*.py" -v
+
+      - name: Compile Python scripts
+        run: python -m py_compile tistory-publish/scripts/*.py
+
+  node-and-shell:
+    name: Node and shell
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Run JavaScript unit tests
+        run: node tistory-publish/tests/test_tistory_editor_helpers.js
+
+      - name: Check JavaScript syntax
+        run: |
+          node --check tistory-publish/scripts/tistory-editor-helpers.js
+          node --check tistory-publish/scripts/tistory-publish.js
+
+      - name: Check shell syntax
+        run: |
+          bash -n tistory-publish/scripts/login.sh
+          bash -n tistory-publish/scripts/publish-post.sh
+          bash -n tistory-publish/scripts/publish.sh
