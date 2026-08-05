@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- inline 이미지와 배너 업로드를 공용 helper로 통합하고, Tistory의 동적 file input 생성 지연에 대해 3회 지수 백오프 재시도를 추가
+- `#openFile`이 없어도 image accept input 또는 단일 file input을 안전하게 탐색하며, 최종 실패 시 DOM HTML과 스크린샷 기록
 - **SEO 지원 추가**
   - `scripts/seo_check.py` 신규: 발행 전 SEO 정적 검사 (제목 길이/키워드 위치, 도입부(메타 디스크립션) 존재·분량, h2/h3 구조, 이미지 alt, 내부/외부 링크, 본문 분량, 태그 중복·개수)
   - `publish-post.sh`/`publish.sh`에 `--seo-check off|warn|strict`, `--seo-keyword`, `--seo-min-body-chars` 옵션 추가 (`TISTORY_SEO_CHECK` 환경변수로 기본값 지정 가능)
