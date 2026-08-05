@@ -434,6 +434,91 @@ def open_attach_image_menu(page):
     if not clicked:
         raise RuntimeError(f"attach image menu item not clickable: {last_error}")
 
+
+def get_image_upload_dom_state(page):
+    try:
+        return page.evaluate("""() => ({
+            fileInputs: Array.from(document.querySelectorAll('input[type="file"]')).map((input, index) => ({
+                index,
+                id: input.id || '',
+                name: input.name || '',
+                accept: input.accept || '',
+                multiple: !!input.multiple,
+                connected: !!input.isConnected,
+            })),
+            attachButtons: Array.from(document.querySelectorAll('[aria-label="첨부"]')).map((button, index) => ({
+                index,
+                visible: button.offsetParent !== null,
+                disabled: !!button.disabled,
+            })),
+            photoMenuItems: Array.from(document.querySelectorAll('[role="menuitem"]'))
+                .filter((item) => (item.textContent || '').includes('사진'))
+                .map((item, index) => ({index, id: item.id || '', visible: item.offsetParent !== null})),
+        }))""")
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def find_image_file_input(page, timeout_ms=3500):
+    preferred_selector = '#openFile, input[type="file"][accept*="image" i]'
+    preferred = page.locator(preferred_selector).first
+    last_error = None
+    try:
+        preferred.wait_for(state='attached', timeout=timeout_ms)
+        return preferred, preferred_selector
+    except Exception as e:
+        last_error = e
+
+    # Tistory has changed the generated input id before. If the photo menu created
+    # exactly one file input, use that input instead of depending on #openFile.
+    try:
+        file_inputs = page.locator('input[type="file"]')
+        if file_inputs.count() == 1:
+            only_input = file_inputs.first
+            only_input.wait_for(state='attached', timeout=500)
+            return only_input, 'single-file-input'
+    except Exception as e:
+        last_error = e
+
+    raise RuntimeError(f"image file input not attached: {last_error}")
+
+
+def upload_editor_image(page, image_path, context, attempts=3):
+    last_error = None
+    last_state = None
+    for attempt in range(1, attempts + 1):
+        menu_error = None
+        try:
+            open_attach_image_menu(page)
+        except Exception as e:
+            menu_error = e
+
+        try:
+            file_input, selector = find_image_file_input(page)
+            file_input.set_input_files(image_path)
+            log(f"  - {context} file input ready (attempt {attempt}/{attempts}, selector={selector})")
+            return
+        except Exception as e:
+            last_error = e
+            last_state = get_image_upload_dom_state(page)
+            menu_detail = f", menu_error={type(menu_error).__name__}: {menu_error}" if menu_error else ''
+            log(
+                f"  ⚠️ {context} upload input unavailable "
+                f"(attempt {attempt}/{attempts}, error={type(e).__name__}: {e}{menu_detail}, state={last_state})"
+            )
+
+        if attempt < attempts:
+            delay_s = 2 ** attempt
+            log(f"  - {context} upload retry in {delay_s}s")
+            time.sleep(delay_s)
+
+    artifact_context = re.sub(r'[^a-z0-9]+', '-', context.lower()).strip('-') or 'image'
+    write_debug_artifacts(page, f'{artifact_context}-upload-input-failed')
+    raise RuntimeError(
+        f"{context} image upload unavailable after {attempts} attempts; "
+        f"last_error={type(last_error).__name__}: {last_error}; state={last_state}"
+    )
+
 def focus_tag_input(page, tag_input):
     last_error = None
     try:
@@ -1186,12 +1271,7 @@ with sync_playwright() as p:
             page.evaluate("typeof uploadInlineImages === 'function' && typeof moveImagesToMarkers === 'function'")
             mapping = []
             for idx, img_path in enumerate(image_files):
-                open_attach_image_menu(page)
-                time.sleep(0.5)
-                fi = page.query_selector('#openFile')
-                if not fi:
-                    fail('inline image file input not found')
-                fi.set_input_files(img_path)
+                upload_editor_image(page, img_path, f'inline image {idx+1}/{len(image_files)}')
                 time.sleep(4)
                 debug_blocks = page.evaluate("typeof debugImageBlocks === 'function' ? debugImageBlocks() : []")
                 log(f"  - inline image {idx+1}/{len(image_files)} blocks: {debug_blocks}")
@@ -1299,18 +1379,11 @@ with sync_playwright() as p:
         # visible한 첨부 버튼 찾기 — aria-label="첨부" 중 visible인 것
         uploaded = False
         try:
-            # 메뉴 열기 (첨부 → 사진)
-            open_attach_image_menu(page)
-            time.sleep(0.5)
-            fi = page.query_selector('#openFile')
-            if fi:
-                before_banner_image_count = page.evaluate("() => typeof tinymce !== 'undefined' && tinymce.activeEditor ? tinymce.activeEditor.getBody().querySelectorAll('img').length : 0")
-                fi.set_input_files(BANNER)
-                time.sleep(4)
-                uploaded = True
-                log("  - 배너 파일 전송 완료")
-            else:
-                log("  ⚠️ #openFile not found after menu open")
+            before_banner_image_count = page.evaluate("() => typeof tinymce !== 'undefined' && tinymce.activeEditor ? tinymce.activeEditor.getBody().querySelectorAll('img').length : 0")
+            upload_editor_image(page, BANNER, 'banner')
+            time.sleep(4)
+            uploaded = True
+            log("  - 배너 파일 전송 완료")
         except Exception as e:
             log(f"  ⚠️ 배너 업로드 실패: {e}")
 

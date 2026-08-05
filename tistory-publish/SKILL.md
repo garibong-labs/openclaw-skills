@@ -138,7 +138,7 @@ bash scripts/login.sh \
 3. 카테고리 선택 (ARIA combobox → Playwright click)
 4. 제목 입력 (base64 디코딩으로 한글 처리)
 5. 본문 HTML 삽입
-6. 배너 이미지 업로드 (첨부→사진 메뉴 → file input) + alt 텍스트 설정
+6. inline/배너 이미지 업로드 (첨부→사진 메뉴 → 동적 file input 대기·제한 재시도) + alt 텍스트 설정
 7. OG 카드 생성 (placeholder URL → Enter 키 → 카드 렌더링)
 8. 대표이미지 설정
 9. 태그 등록
@@ -207,6 +207,7 @@ templates/my-template/
 ## 알려진 제약
 
 - `isTrusted=false` 이벤트 무시 → OG/태그에 우회 로직 필요
+- 사진 file input은 동적으로 생성되므로 3회 지수 백오프 재시도 후에도 없으면 DOM/스크린샷을 기록하고 중단
 - 카테고리가 ARIA combobox → Playwright click 필요
 - 대표이미지 셀렉터가 Tistory 업데이트마다 변경 가능
 

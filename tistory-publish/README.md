@@ -130,6 +130,12 @@ ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
 
 `TargetClosedError`가 발생하면 `publish/target-closed` 오류 코드와 함께 동시 발행 또는 외부 브라우저 종료 가능성을 안내합니다.
 
+## 이미지 업로드 복구
+
+inline 이미지와 배너는 같은 업로드 helper를 사용합니다. helper는 `첨부 → 사진` 메뉴를 연 뒤 `#openFile` 또는 image accept 속성을 가진 file input이 DOM에 붙을 때까지 기다립니다. Tistory가 input id를 바꾼 경우에도 file input이 하나뿐이면 그 input을 사용합니다.
+
+input 생성이나 파일 주입이 실패하면 메뉴를 다시 열며 2초, 4초 간격으로 최대 3회 시도합니다. 최종 실패 시 `PUBLISH_TRACE_FILE` 경로를 기준으로 현재 DOM HTML과 전체 페이지 스크린샷을 기록한 뒤 발행을 중단합니다.
+
 ## 이미지 검증 규칙
 
 `publish-post.sh`는 두 단계에서 이미지를 확인합니다.
