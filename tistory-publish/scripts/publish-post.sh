@@ -454,7 +454,7 @@ def get_image_upload_dom_state(page):
             photoMenuItems: Array.from(document.querySelectorAll('[role="menuitem"]'))
                 .filter((item) => (item.textContent || '').includes('사진'))
                 .map((item, index) => ({index, id: item.id || '', visible: item.offsetParent !== null})),
-        }))""")
+        })""")
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -487,11 +487,19 @@ def upload_editor_image(page, image_path, context, attempts=3):
     last_error = None
     last_state = None
     for attempt in range(1, attempts + 1):
-        menu_error = None
+        chooser_error = None
         try:
-            open_attach_image_menu(page)
+            # Current Tistory emits a native file chooser from the photo-menu
+            # click and may remove the transient input immediately when nobody
+            # is listening for that event. Capture the chooser first; keep the
+            # DOM-input path below for older editor builds.
+            with page.expect_file_chooser(timeout=5000) as chooser_info:
+                open_attach_image_menu(page)
+            chooser_info.value.set_files(image_path)
+            log(f"  - {context} file input ready (attempt {attempt}/{attempts}, selector=file-chooser)")
+            return
         except Exception as e:
-            menu_error = e
+            chooser_error = e
 
         try:
             file_input, selector = find_image_file_input(page)
@@ -501,10 +509,14 @@ def upload_editor_image(page, image_path, context, attempts=3):
         except Exception as e:
             last_error = e
             last_state = get_image_upload_dom_state(page)
-            menu_detail = f", menu_error={type(menu_error).__name__}: {menu_error}" if menu_error else ''
+            chooser_detail = (
+                f", chooser_error={type(chooser_error).__name__}: {chooser_error}"
+                if chooser_error else ''
+            )
             log(
                 f"  ⚠️ {context} upload input unavailable "
-                f"(attempt {attempt}/{attempts}, error={type(e).__name__}: {e}{menu_detail}, state={last_state})"
+                f"(attempt {attempt}/{attempts}, error={type(e).__name__}: {e}"
+                f"{chooser_detail}, state={last_state})"
             )
 
         if attempt < attempts:
