@@ -986,26 +986,48 @@ async function uploadBannerFromWindow(mimeType = 'image/jpeg') {
 }
 
 /**
- * 에디터의 첫 번째 이미지를 대표이미지로 설정 (업로드 후 호출)
- * 
- * 전략 (v2 — 2026-02-25):
- *   1. 에디터 iframe 내 첫 번째 img 클릭 → 인라인 툴바 활성화
- *   2. 여러 셀렉터로 대표이미지 버튼 탐색 (main doc + iframe 모두)
- *   3. 못 찾으면 버튼 목록 디버그 반환 (silent fail 방지)
+ * 에디터 이미지를 대표이미지로 설정 (업로드 후 호출)
+ *
+ * 전략 (v3 — 2026-08-06):
+ *   1. options.targetFilename이 있으면 data-filename/src 매칭으로 대상 이미지를 결정적으로 선택
+ *      — 대상이 없으면 클릭 없이 실패 반환 (첫 이미지 fallback 금지)
+ *   2. 없으면 기존과 동일하게 첫 번째 img 선택
+ *   3. 대상 img 클릭 → 인라인 툴바 활성화
+ *   4. 여러 셀렉터로 대표이미지 버튼 탐색 (main doc + iframe 모두)
+ *   5. 못 찾으면 버튼 목록 디버그 반환 (silent fail 방지)
+ *
+ * @param {{targetFilename?: string}} [options]
  */
-async function setRepresentImageFromEditor() {
+async function setRepresentImageFromEditor(options = {}) {
+  const targetFilename = options && options.targetFilename ? String(options.targetFilename) : '';
   const editor = tinymce.activeEditor;
   const body = editor.getBody();
-  const firstImg = body.querySelector('img');
-  if (!firstImg) return { success: false, error: 'no image in editor' };
+  const images = Array.from(body.querySelectorAll('img'));
+  if (!images.length) return { success: false, error: 'no image in editor' };
 
-  const imgUrl = firstImg.src;
+  let targetImg = images[0];
+  if (targetFilename) {
+    targetImg = images.find(img => {
+      const name = img.getAttribute('data-filename') || img.getAttribute('src') || '';
+      return name.includes(targetFilename);
+    }) || null;
+    if (!targetImg) {
+      return {
+        success: false,
+        error: `representative target image not found: ${targetFilename}`,
+        targetFilename,
+        editorImages: images.map(img => img.getAttribute('data-filename') || img.getAttribute('src') || '').slice(0, 20),
+      };
+    }
+  }
+
+  const imgUrl = targetImg.src;
   if (imgUrl.startsWith('data:')) {
-    return { success: false, error: 'image not uploaded yet (still data URL)' };
+    return { success: false, error: 'image not uploaded yet (still data URL)', targetFilename };
   }
 
   // 이미지 클릭 (에디터 내부)
-  firstImg.click();
+  targetImg.click();
   await new Promise(r => setTimeout(r, 1000));
 
   // 대표이미지 버튼 셀렉터 목록 (가능한 모든 패턴)
@@ -1027,7 +1049,7 @@ async function setRepresentImageFromEditor() {
     const btn = document.querySelector(sel);
     if (btn) {
       btn.click();
-      return { success: true, method: 'main-doc', selector: sel, imageUrl: imgUrl };
+      return { success: true, method: 'main-doc', selector: sel, imageUrl: imgUrl, targetFilename };
     }
   }
 
@@ -1039,7 +1061,7 @@ async function setRepresentImageFromEditor() {
         const btn = iframe.contentDocument.querySelector(sel);
         if (btn) {
           btn.click();
-          return { success: true, method: 'iframe', selector: sel, imageUrl: imgUrl };
+          return { success: true, method: 'iframe', selector: sel, imageUrl: imgUrl, targetFilename };
         }
       }
     }
@@ -1059,6 +1081,7 @@ async function setRepresentImageFromEditor() {
     success: false,
     error: 'represent button not found',
     imageUrl: imgUrl,
+    targetFilename,
     hint: '아래 버튼 중 대표이미지 버튼 찾아서 셀렉터 확인 필요',
     visibleButtons: visibleBtns.slice(0, 20),
   };
