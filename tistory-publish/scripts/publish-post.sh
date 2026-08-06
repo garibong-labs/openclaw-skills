@@ -531,6 +531,22 @@ def upload_editor_image(page, image_path, context, attempts=3):
         f"last_error={type(last_error).__name__}: {last_error}; state={last_state}"
     )
 
+def resolve_represent_image_target(template, image_filenames):
+    """daum-trends 대표이미지 대상(첫 non-comic 본문 첨부 파일명)을 결정한다.
+
+    다른 템플릿은 None을 반환해 기존 첫 이미지 동작을 유지한다.
+    daum-trends에서 non-comic 첨부를 찾지 못하면 ValueError —
+    만화(00-comic.*)가 대표이미지로 조용히 선택되는 것을 금지한다.
+    """
+    if template != 'daum-trends':
+        return None
+    comic_re = re.compile(r'^00-comic\.(jpe?g|png|webp)$', re.IGNORECASE)
+    for name in image_filenames or []:
+        base = os.path.basename(str(name).strip())
+        if base and not comic_re.match(base):
+            return base
+    raise ValueError('no non-comic inline image available for daum-trends representative image')
+
 def focus_tag_input(page, tag_input):
     last_error = None
     try:
@@ -1449,7 +1465,20 @@ with sync_playwright() as p:
         log("Step 6: 대표이미지 생략")
     else:
         log("Step 6: 대표이미지")
-        page.evaluate("typeof setRepresentImageFromEditor === 'function' && setRepresentImageFromEditor()")
+        try:
+            represent_target = resolve_represent_image_target(TEMPLATE, [os.path.basename(p) for p in image_files])
+        except ValueError as e:
+            fail(f"representative image target unresolved (template={TEMPLATE}): {e}")
+        if represent_target:
+            represent_result = page.evaluate(
+                "(target) => typeof setRepresentImageFromEditor === 'function' ? setRepresentImageFromEditor({targetFilename: target}) : {success: false, error: 'setRepresentImageFromEditor unavailable'}",
+                represent_target,
+            )
+            log(f"  - 대표이미지 대상 {represent_target} 결과: {json.dumps(represent_result, ensure_ascii=False)}")
+            if not (isinstance(represent_result, dict) and represent_result.get('success')):
+                fail(f"representative image selection failed (target={represent_target}): {json.dumps(represent_result, ensure_ascii=False)}")
+        else:
+            page.evaluate("typeof setRepresentImageFromEditor === 'function' && setRepresentImageFromEditor()")
         time.sleep(1)
         log("Step 6: 완료")
 

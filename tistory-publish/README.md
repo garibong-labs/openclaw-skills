@@ -156,7 +156,7 @@ Daum Trends처럼 이미지 3장이 글의 핵심 산출물인 파이프라인�
 7. inline 이미지 marker 처리
 8. 배너 업로드
 9. OG 카드 생성과 cleanup
-10. 대표이미지 설정
+10. 대표이미지 설정 (`daum-trends` 템플릿은 첫 non-comic inline 첨부를 결정적으로 선택하고, 대상을 못 찾으면 발행 중단 — 만화 fallback 금지)
 11. 태그 등록
 12. 중복 제목 preflight(RSS/관리글)
 13. 공개/비공개 발행

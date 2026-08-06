@@ -198,3 +198,119 @@ function makeFigure() {
 }
 
 console.log('tistory-editor-helpers tests passed');
+
+// ── setRepresentImageFromEditor — 대표이미지 결정적 선택 (양쪽 helper 파일 동기화 검증) ──
+
+const REPRESENT_HELPER_SCRIPTS = ['tistory-editor-helpers.js', 'tistory-publish.js'];
+
+function loadRepresentImageHelper(scriptFile) {
+  const scriptPath = path.join(__dirname, '..', 'scripts', scriptFile);
+  const scriptSource = fs.readFileSync(scriptPath, 'utf8');
+  const clicks = [];
+  const button = {
+    clicked: 0,
+    click() {
+      this.clicked += 1;
+    },
+  };
+  const makeImg = (dataFilename, src) => ({
+    src,
+    getAttribute(name) {
+      if (name === 'data-filename') return dataFilename;
+      if (name === 'src') return src;
+      return null;
+    },
+    click() {
+      clicks.push(dataFilename || src);
+    },
+  });
+  const images = [
+    makeImg('00-comic.jpg', 'https://blog.kakaocdn.net/comic-upload'),
+    makeImg('01-trend.jpg', 'https://blog.kakaocdn.net/primary-upload'),
+    makeImg(null, 'https://blog.kakaocdn.net/02-trend.jpg'),
+  ];
+  const sandbox = {
+    console,
+    URL,
+    setTimeout: fn => fn(),
+    window: {
+      location: { href: 'https://example.tistory.com/manage/newpost' },
+    },
+    document: {
+      querySelector: sel => (sel === '.mce-represent-image-btn' ? button : null),
+      querySelectorAll: () => [],
+    },
+    tinymce: {
+      activeEditor: {
+        getBody: () => ({
+          querySelectorAll: sel => (sel === 'img' ? images : []),
+          querySelector: () => null,
+        }),
+      },
+    },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(
+    `${scriptSource}\nthis.__setRepresentImageFromEditor = setRepresentImageFromEditor;`,
+    sandbox,
+    { filename: scriptPath },
+  );
+  return { setRepresentImageFromEditor: sandbox.__setRepresentImageFromEditor, clicks, button };
+}
+
+(async () => {
+  for (const scriptFile of REPRESENT_HELPER_SCRIPTS) {
+    // 기본 동작: 옵션 없이 첫 번째 이미지 선택 (non-daum 템플릿 유지)
+    {
+      const { setRepresentImageFromEditor, clicks, button } = loadRepresentImageHelper(scriptFile);
+      const result = await setRepresentImageFromEditor();
+      assert.strictEqual(result.success, true, `${scriptFile}: default selection should succeed`);
+      assert.deepStrictEqual(clicks, ['00-comic.jpg'], `${scriptFile}: default should click first image`);
+      assert.strictEqual(button.clicked, 1);
+      assert.strictEqual(result.imageUrl, 'https://blog.kakaocdn.net/comic-upload');
+    }
+
+    // daum-trends 대상 지정: comic을 건너뛰고 primary keyword 이미지 선택
+    {
+      const { setRepresentImageFromEditor, clicks, button } = loadRepresentImageHelper(scriptFile);
+      const result = await setRepresentImageFromEditor({ targetFilename: '01-trend.jpg' });
+      assert.strictEqual(result.success, true, `${scriptFile}: targeted selection should succeed`);
+      assert.deepStrictEqual(clicks, ['01-trend.jpg'], `${scriptFile}: only the target image may be clicked`);
+      assert.strictEqual(button.clicked, 1);
+      assert.strictEqual(result.imageUrl, 'https://blog.kakaocdn.net/primary-upload');
+      assert.strictEqual(result.targetFilename, '01-trend.jpg');
+    }
+
+    // data-filename이 없으면 src로도 매칭
+    {
+      const { setRepresentImageFromEditor, clicks } = loadRepresentImageHelper(scriptFile);
+      const result = await setRepresentImageFromEditor({ targetFilename: '02-trend.jpg' });
+      assert.strictEqual(result.success, true, `${scriptFile}: src matching should succeed`);
+      assert.deepStrictEqual(clicks, ['https://blog.kakaocdn.net/02-trend.jpg']);
+    }
+
+    // 대상 미발견: 클릭 없이 실패 반환 (comic으로 silent fallback 금지)
+    {
+      const { setRepresentImageFromEditor, clicks, button } = loadRepresentImageHelper(scriptFile);
+      const result = await setRepresentImageFromEditor({ targetFilename: '09-missing.jpg' });
+      assert.strictEqual(result.success, false, `${scriptFile}: missing target must fail`);
+      assert.ok(
+        result.error.includes('representative target image not found'),
+        `${scriptFile}: unexpected error: ${result.error}`,
+      );
+      assert.strictEqual(result.targetFilename, '09-missing.jpg');
+      assert.deepStrictEqual(clicks, [], `${scriptFile}: missing target must not click any image`);
+      assert.strictEqual(button.clicked, 0, `${scriptFile}: missing target must not touch represent button`);
+      // editorImages는 vm realm의 Array라 spread로 host realm 배열로 정규화 후 비교
+      assert.deepStrictEqual([...result.editorImages], [
+        '00-comic.jpg',
+        '01-trend.jpg',
+        'https://blog.kakaocdn.net/02-trend.jpg',
+      ]);
+    }
+  }
+  console.log('setRepresentImageFromEditor tests passed');
+})().catch(err => {
+  console.error(err);
+  process.exitCode = 1;
+});

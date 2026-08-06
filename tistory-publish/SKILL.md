@@ -140,7 +140,7 @@ bash scripts/login.sh \
 5. 본문 HTML 삽입
 6. inline/배너 이미지 업로드 (첨부→사진 메뉴 → file chooser 포착, 동적 file input fallback·제한 재시도) + alt 텍스트 설정
 7. OG 카드 생성 (placeholder URL → Enter 키 → 카드 렌더링)
-8. 대표이미지 설정
+8. 대표이미지 설정 (`daum-trends`는 첫 non-comic 본문 첨부를 결정적으로 선택 — 대상 미발견 시 발행 중단, 다른 템플릿은 첫 이미지)
 9. 태그 등록
 10. 발행 (공개/비공개)
 
@@ -197,7 +197,7 @@ templates/my-template/
 
 ### 메타데이터
 - `setTags(tags[])` — 태그 등록
-- `setRepresentImageFromEditor()` — 대표이미지 설정
+- `setRepresentImageFromEditor(options?)` — 대표이미지 설정. `{targetFilename}` 지정 시 `data-filename`/`src` 매칭으로 해당 이미지만 선택하고, 없으면 클릭 없이 실패 반환 (기본: 첫 이미지)
 - `setImageAlt(alt, index)` — 에디터 내 이미지 alt 텍스트 설정 (SEO)
 - `setImageAltForUploadedImage(alt, filename, previousCount)` — 업로드 직후 새 이미지 alt 텍스트 설정 (기존 이미지 덮어쓰기 방지)
 
