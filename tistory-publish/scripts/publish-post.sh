@@ -155,7 +155,7 @@ PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_POR
 import sys, json, time, os, re, subprocess, urllib.request, urllib.error
 import html as htmlmod
 from pathlib import Path
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 
 HARD_FAIL = None
 ALLOW_MISSING_IMAGES = os.environ.get('ALLOW_MISSING_IMAGES', '').lower() in ('1','true','yes')  # legacy: downgrade opt-in image policy failures to warnings
@@ -281,6 +281,252 @@ def run_og_gate(mode, *args):
         return json.loads(proc.stdout.strip().splitlines()[-1])
     except Exception:
         return {"success": True, "raw": proc.stdout.strip()}
+
+
+# ── OG 카드 렌더: 제한된 재시도 + 확정 40002 DCInside 짝 폴백 ─────────────────
+# 2026-08-13 발행 abort 대응. Tistory /manage/scrap 결과는 URL 변형별로
+# transient하므로 (같은 URL이 500/40002 후 200/0으로 성공), 원본 URL을 짧게
+# 1회 재시도하고, 두 시도 모두 payload code=40002로 확정된 경우에만 엄격한
+# DCInside 모바일/데스크톱 짝 URL을 정확히 1회 시도한다. scrap 응답을 안전하게
+# 연관/파싱하지 못하면 기존 fail-closed 동작을 유지한다.
+
+def dcinside_paired_og_url(url):
+    """Strict DCInside mobile<->desktop post-URL pair; None for anything else.
+
+    Mobile:  https://m.dcinside.com/board/<gallery>/<post-number>
+    Desktop: https://gall.dcinside.com/board/view/?id=<gallery>&no=<post-number>
+    Query/fragment variants, search/list/mini routes, malformed ids, and other
+    hosts never pair, so the fallback can never touch unrelated URLs.
+    """
+    try:
+        parts = urlsplit(str(url or '').strip())
+    except ValueError:
+        return None
+    if parts.scheme not in ('http', 'https'):
+        return None
+    host = parts.netloc.lower()
+    if host == 'm.dcinside.com':
+        if parts.query or parts.fragment:
+            return None
+        match = re.match(r'^/board/([A-Za-z0-9_-]+)/([0-9]+)/?$', parts.path)
+        if not match:
+            return None
+        gallery_id, post_no = match.groups()
+        return f'https://gall.dcinside.com/board/view/?id={gallery_id}&no={post_no}'
+    if host == 'gall.dcinside.com':
+        if parts.fragment or parts.path.rstrip('/') != '/board/view':
+            return None
+        params = parse_qs(parts.query, keep_blank_values=True)
+        if sorted(params.keys()) != ['id', 'no']:
+            return None
+        if len(params['id']) != 1 or len(params['no']) != 1:
+            return None
+        gallery_id = params['id'][0]
+        post_no = params['no'][0]
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', gallery_id) or not re.fullmatch(r'[0-9]+', post_no):
+            return None
+        return f'https://m.dcinside.com/board/{gallery_id}/{post_no}'
+    return None
+
+
+def scrap_response_matches(target_url, response_url):
+    """True only for a /manage/scrap request whose query carries exactly the
+    attempted URL — the safe association between an Enter attempt and its
+    scrap result. Anything else stays unassociated (→ fail-closed)."""
+    try:
+        parts = urlsplit(response_url or '')
+    except ValueError:
+        return False
+    if not parts.path.rstrip('/').endswith('/manage/scrap'):
+        return False
+    params = parse_qs(parts.query, keep_blank_values=True)
+    target = str(target_url or '').strip()
+    if not target:
+        return False
+    return any(value.strip() == target for values in params.values() for value in values)
+
+
+def classify_scrap_code(body_text):
+    """Parse the scrap payload's `code`. Returns the code as a string, or
+    None when the payload cannot be parsed (never guessed)."""
+    text = (body_text or '').strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict) and payload.get('code') is not None:
+        return str(payload.get('code')).strip()
+    # NOTE: keep this regex free of single-quote characters — the embedded
+    # script lives in a bash $( << heredoc ) and unbalanced quotes break
+    # bash's substitution parser. Unparsable payloads stay None (fail-closed).
+    match = re.search(r'["]?\bcode\b["]?\s*[:=]\s*["]?(-?[0-9]+)', text)
+    return match.group(1) if match else None
+
+
+def summarize_scrap_responses(responses):
+    summary = {'observed': False, 'status': None, 'code': None}
+    if not responses:
+        return summary
+    response = responses[-1]
+    summary['observed'] = True
+    try:
+        summary['status'] = response.status
+    except Exception:
+        summary['status'] = None
+    body = ''
+    try:
+        body = response.text()
+    except Exception as e:
+        summary['bodyError'] = f'{type(e).__name__}: {e}'
+    summary['code'] = classify_scrap_code(body)
+    return summary
+
+
+def og_backoff_delay_s(attempt):
+    base = float(os.environ.get('TISTORY_OG_RETRY_BACKOFF_BASE_S', '2'))
+    cap = float(os.environ.get('TISTORY_OG_RETRY_BACKOFF_MAX_S', '8'))
+    return max(0.0, min(base * (2 ** max(0, attempt - 1)), cap))
+
+
+def ensure_og_helpers(page):
+    check = (
+        "typeof prepareOGPlaceholder === 'function'"
+        " && typeof prepareOGRetry === 'function'"
+        " && typeof getOGCardStatus === 'function'"
+        " && typeof cleanupOGResiduals === 'function'"
+    )
+    try:
+        ready = page.evaluate(check)
+    except Exception:
+        ready = False
+    if not ready:
+        page.add_script_tag(path=HELPER_JS)
+        time.sleep(0.5)
+        try:
+            ready = page.evaluate(check)
+        except Exception:
+            ready = False
+    if not ready:
+        fail('OG helper functions unavailable after helper injection')
+
+
+def attempt_og_render(page, target_url, min_card_count):
+    """One prepared attempt: press Enter, poll for a matching card, and
+    passively collect the /manage/scrap response tied to this exact URL.
+    Bodies are read only after polling, never inside the event handler."""
+    responses = []
+
+    def on_response(response):
+        try:
+            if scrap_response_matches(target_url, response.url):
+                responses.append(response)
+        except Exception:
+            pass
+
+    page.on('response', on_response)
+    og_status = {}
+    try:
+        time.sleep(0.5)
+        page.keyboard.press('Enter')
+        for _ in range(8):
+            time.sleep(1.5)
+            og_status = page.evaluate(
+                "(url) => typeof getOGCardStatus === 'function' ? getOGCardStatus(url) : {found: false, error: 'getOGCardStatus unavailable'}",
+                target_url,
+            )
+            if og_status.get('found') and og_status.get('ogCardCount', 0) >= min_card_count:
+                break
+    finally:
+        try:
+            page.remove_listener('response', on_response)
+        except Exception:
+            pass
+    return {
+        'found': bool(og_status.get('found')),
+        'ogStatus': og_status,
+        'scrap': summarize_scrap_responses(responses),
+    }
+
+
+def render_og_card_with_fallback(page, url, index, phase):
+    prefix = '' if phase == 'step5' else f'{phase} '
+    attempts = []
+
+    def describe(attempt_url, kind, outcome):
+        scrap = outcome.get('scrap') or {}
+        return {
+            'url': attempt_url,
+            'kind': kind,
+            'found': outcome.get('found', False),
+            'ogCardCount': (outcome.get('ogStatus') or {}).get('ogCardCount', 0),
+            'scrapObserved': scrap.get('observed', False),
+            'scrapStatus': scrap.get('status'),
+            'scrapCode': scrap.get('code'),
+        }
+
+    prep_result = page.evaluate("(url) => prepareOGPlaceholder(url)", url)
+    if isinstance(prep_result, dict) and not prep_result.get('success', False):
+        fail(f"{prefix}OG placeholder preparation failed before publish: {json.dumps(prep_result, ensure_ascii=False)}")
+    outcome = attempt_og_render(page, url, index)
+    attempts.append(describe(url, 'original', outcome))
+    log(f"  - {prefix}OG [{url[:40]}...] attempt 1: {json.dumps(attempts[-1], ensure_ascii=False)}")
+    if outcome['found']:
+        return url
+
+    # 원본 URL 재시도: 정확히 1회, 제한된 지수 백오프 지연 후
+    time.sleep(og_backoff_delay_s(1))
+    prep_result = page.evaluate(
+        "({fromUrl, toUrl}) => typeof prepareOGRetry === 'function' ? prepareOGRetry(fromUrl, toUrl) : {success: false, error: 'prepareOGRetry unavailable'}",
+        {'fromUrl': url, 'toUrl': url},
+    )
+    if isinstance(prep_result, dict) and not prep_result.get('success', False):
+        fail(f"{prefix}OG retry preparation failed before publish: {json.dumps(prep_result, ensure_ascii=False)}")
+    outcome = attempt_og_render(page, url, index)
+    attempts.append(describe(url, 'original-retry', outcome))
+    log(f"  - {prefix}OG [{url[:40]}...] attempt 2: {json.dumps(attempts[-1], ensure_ascii=False)}")
+    if outcome['found']:
+        return url
+
+    # 짝 URL 폴백: 두 시도 모두 scrap payload code=40002로 확정된 경우에만.
+    # generic found=false, HTTP 오류, timeout, 미관측/미파싱 응답은 폴백 금지.
+    paired_url = dcinside_paired_og_url(url)
+    both_confirmed_40002 = len(attempts) == 2 and all(
+        attempt.get('scrapObserved') and attempt.get('scrapCode') == '40002'
+        for attempt in attempts
+    )
+    if paired_url and both_confirmed_40002:
+        log(f"  - {prefix}OG [{url[:40]}...] scrap code=40002 confirmed twice; trying paired DCInside URL once: {paired_url}")
+        time.sleep(og_backoff_delay_s(2))
+        prep_result = page.evaluate(
+            "({fromUrl, toUrl}) => typeof prepareOGRetry === 'function' ? prepareOGRetry(fromUrl, toUrl) : {success: false, error: 'prepareOGRetry unavailable'}",
+            {'fromUrl': url, 'toUrl': paired_url},
+        )
+        if isinstance(prep_result, dict) and not prep_result.get('success', False):
+            fail(f"{prefix}OG paired-fallback preparation failed before publish: {json.dumps(prep_result, ensure_ascii=False)}")
+        outcome = attempt_og_render(page, paired_url, index)
+        attempts.append(describe(paired_url, 'dcinside-paired-fallback', outcome))
+        log(f"  - {prefix}OG [{url[:40]}...] paired fallback: {json.dumps(attempts[-1], ensure_ascii=False)}")
+        if outcome['found']:
+            return paired_url
+
+    fail(f"{prefix}OG card render failed before publish: {json.dumps({'url': url, 'attempts': attempts}, ensure_ascii=False)}")
+
+
+def render_og_cards(page, og_urls, phase):
+    """Shared OG-card flow for Step 5 and the unexpected-navigation recovery
+    path so the two cannot drift."""
+    if not og_urls:
+        return
+    prefix = '' if phase == 'step5' else f'{phase} '
+    ensure_og_helpers(page)
+    for index, url in enumerate(og_urls, start=1):
+        render_og_card_with_fallback(page, url, index, phase)
+    cleanup_result = page.evaluate("typeof cleanupOGResiduals === 'function' ? cleanupOGResiduals() : null")
+    log(f"  - {prefix}OG cleanup result: {cleanup_result}")
+    if isinstance(cleanup_result, dict) and cleanup_result.get('ogCards') != len(og_urls):
+        fail(f"{prefix}OG card count mismatch before publish: expected {len(og_urls)}, got {cleanup_result.get('ogCards')}")
 
 
 def write_debug_artifacts(page, prefix):
@@ -1435,29 +1681,7 @@ with sync_playwright() as p:
     log("Step 5: OG 카드")
     og_urls = page.evaluate("typeof getOGPlaceholders === 'function' ? getOGPlaceholders() : []")
     log(f"  - OG URLs: {len(og_urls)}")
-    for index, url in enumerate(og_urls, start=1):
-        prep_result = page.evaluate("(url) => prepareOGPlaceholder(url)", url)
-        if isinstance(prep_result, dict) and not prep_result.get("success", False):
-            fail(f"OG placeholder preparation failed before publish: {json.dumps(prep_result, ensure_ascii=False)}")
-        time.sleep(0.5)
-        page.keyboard.press("Enter")
-        og_status = {}
-        for _ in range(8):
-            time.sleep(1.5)
-            og_status = page.evaluate(
-                "(url) => typeof getOGCardStatus === 'function' ? getOGCardStatus(url) : {found: false, error: 'getOGCardStatus unavailable'}",
-                url,
-            )
-            if og_status.get("found") and og_status.get("ogCardCount", 0) >= index:
-                break
-        log(f"  - OG [{url[:40]}...]: {json.dumps(og_status, ensure_ascii=False)}")
-        if not og_status.get("found"):
-            fail(f"OG card render failed before publish: {json.dumps(og_status, ensure_ascii=False)}")
-    if og_urls:
-        cleanup_result = page.evaluate("typeof cleanupOGResiduals === 'function' ? cleanupOGResiduals() : null")
-        log(f"  - OG cleanup result: {cleanup_result}")
-        if isinstance(cleanup_result, dict) and cleanup_result.get("ogCards") != len(og_urls):
-            fail(f"OG card count mismatch before publish: expected {len(og_urls)}, got {cleanup_result.get('ogCards')}")
+    render_og_cards(page, og_urls, 'step5')
     log("Step 5: 완료")
 
     # ── Step 6: 대표이미지 ──
@@ -1548,29 +1772,9 @@ with sync_playwright() as p:
             tinymce.activeEditor.save();
         }}""", body_html)
         time.sleep(1)
-        if og_urls:
-            for index, url in enumerate(og_urls, start=1):
-                prep_result = page.evaluate("(url) => prepareOGPlaceholder(url)", url)
-                if isinstance(prep_result, dict) and not prep_result.get("success", False):
-                    fail(f"recovery OG placeholder preparation failed before publish: {json.dumps(prep_result, ensure_ascii=False)}")
-                time.sleep(0.5)
-                page.keyboard.press("Enter")
-                og_status = {}
-                for _ in range(8):
-                    time.sleep(1.5)
-                    og_status = page.evaluate(
-                        "(url) => typeof getOGCardStatus === 'function' ? getOGCardStatus(url) : {found: false, error: 'getOGCardStatus unavailable'}",
-                        url,
-                    )
-                    if og_status.get("found") and og_status.get("ogCardCount", 0) >= index:
-                        break
-                log(f"  - recovery OG [{url[:40]}...]: {json.dumps(og_status, ensure_ascii=False)}")
-                if not og_status.get("found"):
-                    fail(f"recovery OG card render failed before publish: {json.dumps(og_status, ensure_ascii=False)}")
-            cleanup_result = page.evaluate("typeof cleanupOGResiduals === 'function' ? cleanupOGResiduals() : null")
-            log(f"  - recovery OG cleanup result: {cleanup_result}")
-            if isinstance(cleanup_result, dict) and cleanup_result.get("ogCards") != len(og_urls):
-                fail(f"recovery OG card count mismatch before publish: expected {len(og_urls)}, got {cleanup_result.get('ogCards')}")
+        # 복구 경로도 Step 5와 동일한 render_og_cards 헬퍼를 사용한다 (드리프트 금지).
+        # goto로 helper JS가 사라졌을 수 있으므로 헬퍼가 재주입을 보장한다.
+        render_og_cards(page, og_urls, 'recovery')
 
     log("Step 7.5: 중복 제목 preflight")
     assert_no_duplicate_title_before_publish(ctx0, final_title)

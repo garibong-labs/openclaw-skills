@@ -5,6 +5,13 @@
   - `setRepresentImageFromEditor(options)`에 `targetFilename` 지원 추가 — `data-filename`/`src` 매칭으로 대상 이미지를 선택하고, 대상이 없으면 클릭 없이 실패 반환 (첫 이미지 fallback 금지). `tistory-editor-helpers.js`/`tistory-publish.js` 양쪽 동기화
   - `publish-post.sh` Step 6: `--template daum-trends`는 inline 이미지 중 첫 non-comic(`00-comic.*` 제외) 파일을 대표이미지 대상으로 결정하고, 대상 미해결·선택 실패 시 발행을 중단 (만화가 대표이미지로 silent 선택되는 것 방지). 다른 템플릿은 기존 첫 이미지 동작 유지
   - regression 테스트 추가: JS 대상 선택/기본 동작/대상 미발견, Python `resolve_represent_image_target` (comic 변형·경로·실패 케이스)
+- **OG 카드 제한 재시도 + 확정 40002 DCInside 짝 폴백** (2026-08-13 발행 abort 대응)
+  - Step 5와 unexpected-navigation 복구 경로를 공용 `render_og_cards()`로 통합 (드리프트 방지, 복구 경로 helper JS 재주입 보장)
+  - 카드 미생성 시 원본 placeholder URL을 제한된 지수 백오프로 정확히 1회 재시도 (`TISTORY_OG_RETRY_BACKOFF_BASE_S`/`_MAX_S`)
+  - 각 Enter 시도에 연관된 인증 Tistory `/manage/scrap` 응답을 Playwright로 포착·분류하고, 두 원본 시도 모두 payload `code=40002`로 확정된 경우에만 엄격한 DCInside 모바일/데스크톱 짝 URL(`m.dcinside.com/board/<g>/<no>` ↔ `gall.dcinside.com/board/view/?id=<g>&no=<no>`)을 정확히 1회 시도. 미관측/미파싱 응답, HTTP 오류, generic `found=false`는 기존 fail-closed 유지
+  - `getOGCardStatus()`가 엄격한 DCInside 짝을 같은 글로 인정 (모바일 scrap 성공 시 카드가 데스크톱 canonical URL을 담는 케이스) — 그 외 URL은 기존 정규화-일치 유지
+  - JS helper에 `prepareOGRetry(fromUrl, toUrl)`, `dcinsidePairedOGUrl(url)` 추가 (`tistory-editor-helpers.js`, `tistory-publish.js`)
+  - 모든 변형 실패 시 시도·분류 진단(payload 본문 제외)과 함께 발행 중단
 - Tistory 사진 메뉴가 transient input을 바로 제거하는 경우를 위해 Playwright file chooser 이벤트를 클릭 전에 포착하고 직접 파일을 전달하도록 이미지 업로드 경로 보강
 - 업로드 실패 DOM 상태 수집기의 JavaScript 닫는 괄호 오류 수정 및 실제 식 문법 회귀 테스트 추가
 - inline 이미지와 배너 업로드를 공용 helper로 통합하고, Tistory의 동적 file input 생성 지연에 대해 3회 지수 백오프 재시도를 추가

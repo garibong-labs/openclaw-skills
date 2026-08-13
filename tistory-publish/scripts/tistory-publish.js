@@ -529,6 +529,38 @@ function prepareOGPlaceholder(url) {
   };
 }
 
+/**
+ * prepareOGRetry(fromUrl, toUrl) — 실패한 OG 시도의 pending 문단을 재사용해
+ * 같은 URL 재시도(fromUrl === toUrl) 또는 확정된 DCInside 짝 URL 폴백을 준비.
+ * prepareOGPlaceholder()처럼 커서 배치까지만 하고 Enter는 Playwright가 입력한다.
+ *
+ * Enter가 pending 문단을 분할해 같은 속성의 빈 복제 문단을 남길 수 있으므로,
+ * 텍스트가 남아 있는 문단을 대상으로 삼고 빈 복제는 제거한다.
+ */
+function prepareOGRetry(fromUrl, toUrl) {
+  const editor = tinymce.activeEditor;
+  if (!editor || !editor.getBody) return { success: false, error: 'tinymce unavailable' };
+  const body = editor.getBody();
+  const pendings = Array.from(body.querySelectorAll(`[data-og-url-pending="${fromUrl}"]`));
+  const pending = pendings.find(p => (p.textContent || '').trim()) || pendings[0];
+  if (!pending) return { success: false, error: `pending paragraph not found for ${fromUrl}` };
+  pendings.forEach(p => { if (p !== pending) p.remove(); });
+
+  pending.textContent = toUrl;
+  pending.setAttribute('data-og-url-pending', toUrl);
+
+  const range = editor.dom.createRng();
+  const textNode = pending.firstChild;
+  if (textNode) {
+    range.setStart(textNode, textNode.length);
+    range.setEnd(textNode, textNode.length);
+    editor.selection.setRng(range);
+  }
+  editor.focus();
+
+  return { success: true, fromUrl, toUrl, editorFocused: true };
+}
+
 function normalizeOGUrl(url) {
   if (!url || typeof url !== 'string') return '';
   try {
@@ -539,6 +571,45 @@ function normalizeOGUrl(url) {
   } catch (e) {
     return url.trim().replace(/\/$/, '');
   }
+}
+
+/**
+ * dcinsidePairedOGUrl(url) — DCInside 모바일/데스크톱 게시글 URL의 엄격한 짝을 계산
+ *
+ * 티스토리 scrap은 모바일 URL을 성공적으로 처리하면서 카드에는 데스크톱
+ * canonical URL을 넣을 수 있으므로, 정확한 게시글 짝만 같은 글로 인정한다.
+ *   - https://m.dcinside.com/board/<gallery>/<post-number>
+ *   - https://gall.dcinside.com/board/view/?id=<gallery>&no=<post-number>
+ * 그 외(검색/목록/mini 라우트, query/fragment 변형, 다른 호스트)는 null.
+ */
+function dcinsidePairedOGUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  let parsed;
+  try {
+    parsed = new URL(url.trim());
+  } catch (e) {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  const host = parsed.hostname.toLowerCase();
+  if (host === 'm.dcinside.com') {
+    if (parsed.search || parsed.hash) return null;
+    const match = parsed.pathname.match(/^\/board\/([A-Za-z0-9_-]+)\/([0-9]+)\/?$/);
+    if (!match) return null;
+    return `https://gall.dcinside.com/board/view/?id=${match[1]}&no=${match[2]}`;
+  }
+  if (host === 'gall.dcinside.com') {
+    if (parsed.hash) return null;
+    if (parsed.pathname.replace(/\/$/, '') !== '/board/view') return null;
+    const keys = Array.from(new Set(Array.from(parsed.searchParams.keys()))).sort();
+    if (keys.join(',') !== 'id,no') return null;
+    const ids = parsed.searchParams.getAll('id');
+    const nos = parsed.searchParams.getAll('no');
+    if (ids.length !== 1 || nos.length !== 1) return null;
+    if (!/^[A-Za-z0-9_-]+$/.test(ids[0]) || !/^[0-9]+$/.test(nos[0])) return null;
+    return `https://m.dcinside.com/board/${ids[0]}/${nos[0]}`;
+  }
+  return null;
 }
 
 function getOGCardElements(body) {
@@ -578,13 +649,19 @@ function getOGCardStatus(url) {
   }
   const editor = tinymce.activeEditor;
   const expectedUrl = normalizeOGUrl(url);
+  // 모바일 URL scrap 성공 시 카드가 데스크톱 canonical URL을 담을 수 있어
+  // 엄격한 DCInside 짝은 같은 글로 인정한다. 그 외 URL은 기존 정규화-일치 그대로.
+  const pairedDCUrl = dcinsidePairedOGUrl(url);
+  const expectedPairedUrl = pairedDCUrl ? normalizeOGUrl(pairedDCUrl) : '';
   const cards = getOGCardElements(editor.getBody()).map((card, index) => {
     const sourceUrl = getOGCardSourceUrl(card);
+    const normalizedSource = normalizeOGUrl(sourceUrl);
     return {
       index: index + 1,
       sourceUrl,
       title: card.getAttribute('data-og-title') || '',
-      matched: normalizeOGUrl(sourceUrl) === expectedUrl,
+      matched: normalizedSource === expectedUrl
+        || (!!expectedPairedUrl && normalizedSource === expectedPairedUrl),
     };
   });
 
