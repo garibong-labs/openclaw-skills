@@ -29,7 +29,7 @@ function loadHelpers() {
   };
   vm.createContext(sandbox);
   vm.runInContext(
-    `${source}\nthis.__helpers = { applyImageCaption, buildBlogHTML, ensureIntroArticleSeparator, getOGCardStatus, imagePresentationOptions };`,
+    `${source}\nthis.__helpers = { applyImageCaption, buildBlogHTML, dcinsidePairedOGUrl, ensureIntroArticleSeparator, getOGCardStatus, imagePresentationOptions, prepareOGRetry };`,
     sandbox,
     { filename: helperPath },
   );
@@ -161,6 +161,168 @@ function makeFigure() {
   const nestedStatus = getOGCardStatus('https://www.mk.co.kr/news/economy/12106887');
   assert.strictEqual(nestedStatus.found, true);
   assert.strictEqual(nestedStatus.ogCardCount, 1);
+}
+
+{
+  // Strict DCInside mobile/desktop pair — exact post routes only.
+  const { dcinsidePairedOGUrl } = loadHelpers();
+  assert.strictEqual(
+    dcinsidePairedOGUrl('https://m.dcinside.com/board/ngm/270135'),
+    'https://gall.dcinside.com/board/view/?id=ngm&no=270135',
+  );
+  assert.strictEqual(
+    dcinsidePairedOGUrl('https://m.dcinside.com/board/comic_new6/5734260'),
+    'https://gall.dcinside.com/board/view/?id=comic_new6&no=5734260',
+  );
+  assert.strictEqual(
+    dcinsidePairedOGUrl('https://gall.dcinside.com/board/view/?id=comic_new6&no=5734260'),
+    'https://m.dcinside.com/board/comic_new6/5734260',
+  );
+  for (const url of [
+    'https://m.dcinside.com/board/ngm',
+    'https://m.dcinside.com/board/ngm/270135?page=2',
+    'https://m.dcinside.com/board/ngm/270135#comment',
+    'https://m.dcinside.com/mini/ngm/270135',
+    'https://m.dcinside.com/board/ngm/notanumber',
+    'https://m.dcinside.com/search/gall_content?keyword=x',
+    'https://gall.dcinside.com/board/view/?id=ngm&no=270135&page=2',
+    'https://gall.dcinside.com/board/view/?id=ngm',
+    'https://gall.dcinside.com/board/lists/?id=ngm',
+    'https://theqoo.net/square/456',
+    'not a url',
+    '',
+    null,
+  ]) {
+    assert.strictEqual(dcinsidePairedOGUrl(url), null, `expected null for ${url}`);
+  }
+}
+
+{
+  // Paired-identity matching: a successful mobile scrap may render a card
+  // carrying the desktop canonical URL (and vice versa). Non-DCInside URLs
+  // keep the normalized-exact matching.
+  const { __sandbox, getOGCardStatus } = loadHelpers();
+  const makeCard = sourceUrl => ({
+    getAttribute(name) {
+      return name === 'data-og-source-url' ? sourceUrl : '';
+    },
+    querySelector() {
+      return null;
+    },
+  });
+  const setCards = nextCards => {
+    __sandbox.tinymce = {
+      activeEditor: {
+        initialized: true,
+        getBody() {
+          return {
+            querySelectorAll() {
+              return nextCards;
+            },
+          };
+        },
+      },
+    };
+  };
+
+  setCards([makeCard('https://gall.dcinside.com/board/view/?id=comic_new6&no=5734260')]);
+  const mobileExpected = getOGCardStatus('https://m.dcinside.com/board/comic_new6/5734260');
+  assert.strictEqual(mobileExpected.found, true);
+
+  setCards([makeCard('https://m.dcinside.com/board/comic_new6/5734260')]);
+  const desktopExpected = getOGCardStatus('https://gall.dcinside.com/board/view/?id=comic_new6&no=5734260');
+  assert.strictEqual(desktopExpected.found, true);
+
+  // Query-bearing desktop variant is NOT the strict pair of the mobile post.
+  setCards([makeCard('https://gall.dcinside.com/board/view/?id=comic_new6&no=5734260&page=2')]);
+  const variantCard = getOGCardStatus('https://m.dcinside.com/board/comic_new6/5734260');
+  assert.strictEqual(variantCard.found, false);
+
+  // A different DCInside post never matches.
+  setCards([makeCard('https://gall.dcinside.com/board/view/?id=comic_new6&no=9999999')]);
+  const otherPost = getOGCardStatus('https://m.dcinside.com/board/comic_new6/5734260');
+  assert.strictEqual(otherPost.found, false);
+
+  // Non-DCInside URLs retain normalized-exact behavior.
+  setCards([makeCard('https://theqoo.net/square/456')]);
+  assert.strictEqual(getOGCardStatus('https://theqoo.net/square/456/').found, true);
+  assert.strictEqual(getOGCardStatus('https://theqoo.net/square/457').found, false);
+}
+
+{
+  // prepareOGRetry reuses the pending paragraph for a same-URL retry or a
+  // confirmed paired-URL fallback, and drops empty Enter-split clones.
+  const fromUrl = 'https://m.dcinside.com/board/comic_new6/5734260';
+  const toUrl = 'https://gall.dcinside.com/board/view/?id=comic_new6&no=5734260';
+  const makePending = text => ({
+    text,
+    attrs: { 'data-og-url-pending': fromUrl },
+    removedCount: 0,
+    get textContent() { return this.text; },
+    set textContent(value) { this.text = value; },
+    get firstChild() {
+      return this.text ? { length: this.text.length } : null;
+    },
+    setAttribute(name, value) { this.attrs[name] = value; },
+    remove() { this.removedCount += 1; },
+  });
+  const pendingWithText = makePending(fromUrl);
+  const emptyClone = makePending('');
+  const rangeCalls = [];
+  const range = {
+    setStart(node, offset) { rangeCalls.push(['start', node.length, offset]); },
+    setEnd(node, offset) { rangeCalls.push(['end', node.length, offset]); },
+  };
+  let focused = false;
+  let selectedRange = null;
+  const helpers = loadHelpers();
+  helpers.__sandbox.tinymce = {
+    activeEditor: {
+      initialized: true,
+      getBody() {
+        return {
+          querySelectorAll(selector) {
+            assert.ok(selector.includes(fromUrl));
+            return [emptyClone, pendingWithText];
+          },
+        };
+      },
+      dom: { createRng: () => range },
+      selection: { setRng(r) { selectedRange = r; } },
+      focus() { focused = true; },
+    },
+  };
+  const result = helpers.prepareOGRetry(fromUrl, toUrl);
+  assert.strictEqual(result.success, true, JSON.stringify(result));
+  assert.strictEqual(result.fromUrl, fromUrl);
+  assert.strictEqual(result.toUrl, toUrl);
+  assert.strictEqual(pendingWithText.text, toUrl);
+  assert.strictEqual(pendingWithText.attrs['data-og-url-pending'], toUrl);
+  assert.strictEqual(emptyClone.removedCount, 1);
+  assert.strictEqual(pendingWithText.removedCount, 0);
+  assert.strictEqual(focused, true);
+  assert.strictEqual(selectedRange, range);
+  assert.deepStrictEqual(rangeCalls, [
+    ['start', toUrl.length, toUrl.length],
+    ['end', toUrl.length, toUrl.length],
+  ]);
+
+  // Missing pending paragraph fails closed.
+  const emptyHelpers = loadHelpers();
+  emptyHelpers.__sandbox.tinymce = {
+    activeEditor: {
+      initialized: true,
+      getBody() {
+        return { querySelectorAll: () => [] };
+      },
+      dom: { createRng: () => range },
+      selection: { setRng() {} },
+      focus() {},
+    },
+  };
+  const missing = emptyHelpers.prepareOGRetry(fromUrl, toUrl);
+  assert.strictEqual(missing.success, false);
+  assert.ok(missing.error.includes('pending paragraph not found'));
 }
 
 {

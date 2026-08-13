@@ -193,7 +193,9 @@ templates/my-template/
 ### OG 카드
 - `getOGPlaceholders()` — placeholder URL 목록
 - `prepareOGPlaceholder(url)` — placeholder → URL 텍스트 교체
-- `verifyOGCard(url)` — 카드 렌더링 확인
+- `prepareOGRetry(fromUrl, toUrl)` — 실패한 시도의 pending 문단 재사용 (같은 URL 재시도 / 확정 40002 시 DCInside 짝 폴백)
+- `dcinsidePairedOGUrl(url)` — 엄격한 DCInside 모바일↔데스크톱 게시글 짝 계산 (그 외 URL은 null)
+- `verifyOGCard(url)` — 카드 렌더링 확인 (엄격한 DCInside 짝은 같은 글로 인정)
 
 ### 메타데이터
 - `setTags(tags[])` — 태그 등록
