@@ -120,6 +120,8 @@ Only the matching turn `result` determines terminal state. A successfully emitte
 When the ACP result is exact but response storage, event draining, cleanup, or response completeness is degraded, preserve the exact ACP status in the terminal event, set `supervisorStatus: "degraded"`, and exit 22.
 - `64`: invalid CLI or config
 
+After `main()` resolves, the CLI bounds stdout/stderr flushing and then exits with the mapped code. A leaked adapter handle must not keep the foreground caller waiting after terminal evidence has been delivered.
+
 Do not collapse cancellation or failure into success.
 
 ## Process liveness

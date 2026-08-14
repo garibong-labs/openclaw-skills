@@ -1111,6 +1111,50 @@ export async function main(argv = process.argv.slice(2)) {
   return runSupervisor(config);
 }
 
+const PROCESS_EXIT_FLUSH_TIMEOUT_MS = 1000;
+
+function flushWritable(stream, timeoutMs = PROCESS_EXIT_FLUSH_TIMEOUT_MS) {
+  if (!stream || typeof stream.write !== "function") {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      if (typeof stream.off === "function") {
+        stream.off("error", finish);
+      }
+      resolve();
+    };
+    timer = setTimeout(finish, timeoutMs);
+    timer.unref();
+    if (typeof stream.once === "function") {
+      stream.once("error", finish);
+    }
+    try {
+      stream.write("", finish);
+    } catch {
+      finish();
+    }
+  });
+}
+
+async function exitCli(exitCode) {
+  process.exitCode = exitCode;
+  await Promise.allSettled([
+    flushWritable(process.stdout),
+    flushWritable(process.stderr)
+  ]);
+  process.exit(exitCode);
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  process.exitCode = await main();
+  await exitCli(await main());
 }

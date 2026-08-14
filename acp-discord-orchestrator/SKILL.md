@@ -1,6 +1,6 @@
 ---
 name: "acp-discord-orchestrator"
-description: "Track foreground ACPX turns with fail-closed permissions and exact completion."
+description: "Track foreground ACPX turns with bounded CLI exit and exact completion."
 ---
 
 # ACP Discord Orchestrator
@@ -45,7 +45,7 @@ Read the private response file locally after the process reaches a terminal even
 
 Treat only the matching `terminal` event as terminal evidence. Preserve `completed`, `cancelled`, and `failed` as distinct states.
 
-Map supervisor exits as documented in the runtime contract. Never turn a failed or cancelled run into a success report.
+Map supervisor exits as documented in the runtime contract. Never turn a failed or cancelled run into a success report. Treat process exit as the final delivery of that mapping; the CLI bounds output flushing before forcing termination so leaked runtime handles cannot hold the caller open.
 
 ## Foreground policy
 
