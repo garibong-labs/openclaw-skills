@@ -1,6 +1,6 @@
 ---
 name: "acp-discord-orchestrator"
-description: "Track agent-started Discord ACP tasks through foreground-only direct ACPX with normalized progress and exact turn completion; use instead of ACP child threads."
+description: "Track foreground ACPX turns with fail-closed permissions and exact completion."
 ---
 
 # ACP Discord Orchestrator
@@ -23,7 +23,7 @@ This policy does not globally disable human-operated OpenClaw ACP commands.
 ## Prepare the run
 
 1. Confirm Node.js 22.13 or newer, then read [references/runtime-contract.md](references/runtime-contract.md).
-2. Read `openclaw plugins info acpx --json` and copy the `acpx` dependency's `resolvedPath` into `runtimeModule`.
+2. Read `openclaw plugins info acpx --json`, require the ACPX 0.11.2-or-newer capability contract, and copy the `acpx` dependency's `resolvedPath` into `runtimeModule`.
 3. Copy [templates/supervisor-config.json](templates/supervisor-config.json) to a private temporary file.
 4. Create a private prompt file and choose a new response-file path.
 5. Set the config file and prompt file to owner-only permissions.
@@ -49,11 +49,11 @@ Map supervisor exits as documented in the runtime contract. Never turn a failed 
 
 ## Foreground policy
 
-The supervisor rejects known detached execution forms, explicit background flags, permission bypass modes, uninspectable permission input, and tool kinds outside the configured allowlist.
+The supervisor rejects detached execution forms, explicit background flags, permission bypass modes, nested agent routes, uninspectable or over-limit permission input, unclassified tool kinds, and tool kinds outside the configured allowlist.
 
 Foreground parallel runners are allowed when their parent process blocks until all children finish. Use test-runner concurrency, `xargs -P`, or an equivalent joining primitive. Shell `&` is rejected because the permission request does not prove that every child will be joined.
 
-The guard is a permission-layer contract, not an operating-system sandbox. Arbitrary foreground code may daemonize internally. Do not claim stronger containment.
+The guard is a permission-layer contract, not an operating-system sandbox. It rejects only the inspected request shape; approved foreground code may still daemonize internally. Do not claim stronger containment.
 
 ## Report to Discord
 

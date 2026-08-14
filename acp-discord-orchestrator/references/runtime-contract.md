@@ -33,7 +33,7 @@ Use capability detection. Do not select behavior from a version string alone.
 
 ## Compatibility targets
 
-The initial matrix covers the OpenClaw operating pin ACPX 0.11.2 and the standalone forward target ACPX 0.13.0.
+Require the ACPX 0.11.2-or-newer turn capability contract. Older releases such as ACPX 0.5.3 do not expose `startTurn`, `turn.result`, `closeStream`, or `onPermissionRequest` and must fail closed. OpenClaw releases pin different ACPX versions, so inspect the active plugin instead of assuming compatibility from the OpenClaw version. The initial tested matrix covers ACPX 0.11.2 and the standalone forward target ACPX 0.13.0.
 
 A target passes only when the same behavior tests confirm runtime discovery, permission inspection, foreground rejection, normalized event consumption, response capture, exact result mapping, cancellation, cleanup, and process exit.
 
@@ -58,12 +58,12 @@ Required:
 - `responseFile`: absolute new private file
 - `stateDir`: absolute private runtime state directory
 - `runtimeModule`: absolute ACPX package root or runtime module file
-- `allowKinds`: non-empty tool-kind allowlist
+- `allowKinds`: non-empty tool-kind allowlist that excludes the unclassified `other` kind
+- `timeoutMs`: positive turn deadline independent of watchdog cadence
 
 Optional:
 
 - `model`: explicit ACP model
-- `timeoutMs`: turn timeout independent of watchdog cadence
 - `progressMs`: progress snapshot interval; zero disables snapshots
 - `maxResponseBytes`: bounded response capture size
 
@@ -75,9 +75,11 @@ Reject:
 
 - missing or unknown tool kind;
 - tool kind outside `allowKinds`;
-- missing structured raw input;
-- explicit background flags;
-- permission bypass settings;
+- missing, non-object, over-depth, over-width, oversized, or otherwise uninspectable structured raw input;
+- the unclassified `other` tool kind;
+- explicit background or daemon flags;
+- permission bypass settings or command-line flags;
+- nested ACP or background-agent routes;
 - `nohup`, `disown`, `setsid`, or standalone shell `&`.
 
 The shell rule is intentionally conservative. Use foreground parallel runners whose own process blocks until every child finishes.
@@ -106,14 +108,14 @@ Normalize event payloads. Allow only bounded protocol-token forms for tags, tool
 
 A timer-driven progress event is a snapshot. `evidenceAgeMs` exposes the age of the last actual ACP event so consumers do not mislabel an old snapshot as fresh activity.
 
-Only the matching turn `result` determines terminal state.
+Only the matching turn `result` determines terminal state. A successfully emitted `terminal` or `supervisor_error` event closes normalized output; no later ACP activity is delivered. Terminal events omit the working-directory name and response fingerprint.
 
 ## Stable exits
 
 - `0`: completed
 - `20`: cancelled
 - `21`: failed
-- `22`: supervisor policy, compatibility, runtime, storage, stream, cleanup, or delivery error
+- `22`: supervisor policy, compatibility, deadline, runtime, storage, stream, cleanup, or delivery error
 
 When the ACP result is exact but response storage, event draining, cleanup, or response completeness is degraded, preserve the exact ACP status in the terminal event, set `supervisorStatus: "degraded"`, and exit 22.
 - `64`: invalid CLI or config
@@ -128,7 +130,7 @@ Their disappearance also does not replace the exact turn result.
 
 ## Cancellation
 
-SIGINT or SIGTERM requests cancellation on the exact turn. Continue waiting for its terminal result. Do not report `cancelled` merely because a signal handler ran.
+Bind SIGINT and SIGTERM before runtime probing, carry a pending request into the exact turn once it exists, and release handlers only after normalized terminal output and cleanup. Continue waiting for the exact result until the required deadline and bounded cancellation grace expire. Do not report `cancelled` merely because a signal handler ran.
 
 ## Non-goals
 

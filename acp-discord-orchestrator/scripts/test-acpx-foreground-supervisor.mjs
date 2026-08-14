@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -63,7 +64,8 @@ function makeRuntimeModule(options = {}) {
     cancelCalls: 0,
     closeStreamCalls: 0,
     streamClosed: false,
-    closeAttempts: 0
+    closeAttempts: 0,
+    permissionOutcome: undefined
   };
   const result = options.result || Promise.resolve({ status: "completed", stopReason: "end_turn" });
   const events = options.events || [];
@@ -80,9 +82,19 @@ function makeRuntimeModule(options = {}) {
     createAcpRuntime(runtimeOptions) {
       state.runtimeOptions = runtimeOptions;
       return {
-        async probeAvailability() {},
+        async probeAvailability() {
+          if (options.onProbe) {
+            await options.onProbe(state);
+          }
+        },
         async ensureSession(input) {
           state.ensureInput = input;
+          if (options.permissionRequest) {
+            state.permissionOutcome = await state.runtimeOptions.onPermissionRequest(
+              options.permissionRequest,
+              { signal: { aborted: false } }
+            );
+          }
           return {
             sessionKey: input.sessionKey,
             backend: "acpx",
@@ -98,6 +110,9 @@ function makeRuntimeModule(options = {}) {
             result,
             async cancel() {
               state.cancelCalls += 1;
+              if (options.onCancel) {
+                await options.onCancel(state);
+              }
             },
             async closeStream() {
               state.closeStreamCalls += 1;
@@ -258,7 +273,9 @@ test("completed run emits normalized events and stores response privately", asyn
   assert.equal(emitted.at(-1).status, "completed");
   assert.equal(emitted.at(-1).supervisorStatus, "ok");
   assert.equal(emitted.at(-1).responseStored, true);
-  assert.equal(emitted.at(-1).responseBytes, Buffer.byteLength("TOP_SECRET_RESPONSE"));
+  assert.equal("responseBytes" in emitted.at(-1), false);
+  assert.equal("responseSha256" in emitted.at(-1), false);
+  assert.equal("workspace" in emitted[0], false);
   assert.equal(state.ensureInput.mode, "oneshot");
   assert.match(state.ensureInput.sessionOptions.systemPrompt.append, /foreground/i);
   assert.match(state.turnInput.text, /foreground/i);
@@ -492,5 +509,227 @@ test("runtime export capability checks fail closed", () => {
   assert.throws(
     () => validateRuntimeModuleExports({}),
     /acpx_runtime_capability_missing_createAcpRuntime/
+  );
+});
+
+test("permission guard fails closed for uninspectable and bounded input shapes", () => {
+  const allowed = new Set(["execute"]);
+  let deep = { run_in_background: true };
+  for (let index = 0; index < 14; index += 1) {
+    deep = { nested: deep };
+  }
+  const wide = {};
+  for (let index = 0; index < 256; index += 1) {
+    wide["safe" + String(index)] = false;
+  }
+  wide.run_in_background = true;
+
+  const rejected = [
+    [null, "uninspectable_input"],
+    ["nohup evil.sh &", "uninspectable_input"],
+    [42, "uninspectable_input"],
+    [{ command: ["bash", "-c", "sleep 1 &"] }, "detached_shell"],
+    [{ command: ["nohup", "node", "server.js"] }, "detached_shell"],
+    [{ argv: "nohup node server.js &" }, "detached_shell"],
+    [{ args: "setsid node server.js" }, "detached_shell"],
+    [{ command: "claude --dangerously-skip-permissions -p go" }, "permission_bypass"],
+    [deep, "uninspectable_input"],
+    [wide, "uninspectable_input"],
+    [{ detached: true }, "background_flag"],
+    [{ daemon: true }, "background_flag"],
+    [{ run_in_background: "yes" }, "background_flag"],
+    [{ command: "npx acpx@0.13.0 prompt --agent claude" }, "nested_agent_route"],
+    [{ command: "openclaw acp spawn --agent claude" }, "nested_agent_route"],
+    [{ command: "claude --background" }, "nested_agent_route"]
+  ];
+  for (const [input, reason] of rejected) {
+    assert.equal(
+      classifyPermissionRequest(permissionRequest(input), allowed).reason,
+      reason
+    );
+  }
+
+  assert.equal(
+    classifyPermissionRequest(
+      permissionRequest({ opaque: true }, "other"),
+      new Set(["other"])
+    ).reason,
+    "unclassified_tool_kind"
+  );
+});
+
+test("runtime permission callback is wired and rejects opaque input", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-permission-wire-"));
+  const { module, state } = makeRuntimeModule({
+    permissionRequest: permissionRequest(null)
+  });
+  const emitted = [];
+  assert.equal(await runSupervisor(makeConfig(root), {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  }), EXIT_CODES.completed);
+  assert.deepEqual(state.permissionOutcome, { outcome: "reject_once" });
+  assert.equal(emitted.at(-1).counters.permissionsRejected, 1);
+});
+
+test("config requires a timeout and rejects the unclassified other kind", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-config-required-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const base = {
+    agent: "claude",
+    model: "test-model",
+    cwd: root,
+    sessionKey: "test-session",
+    promptFile: prompt,
+    responseFile: path.join(root, "response.txt"),
+    stateDir: path.join(root, "state"),
+    runtimeModule: root,
+    allowKinds: ["read"]
+  };
+
+  const missingTimeout = path.join(root, "missing-timeout.json");
+  fs.writeFileSync(missingTimeout, JSON.stringify(base), { mode: 0o600 });
+  assert.throws(
+    () => loadSupervisorConfig(missingTimeout),
+    /invalid_timeout_ms/
+  );
+
+  const otherKind = path.join(root, "other-kind.json");
+  fs.writeFileSync(otherKind, JSON.stringify({
+    ...base,
+    timeoutMs: 30000,
+    allowKinds: ["other"]
+  }), { mode: 0o600 });
+  assert.throws(
+    () => loadSupervisorConfig(otherKind),
+    /invalid_allow_kind/
+  );
+});
+
+test("runtime location rejects a symlinked package root", {
+  skip: process.platform === "win32"
+}, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-runtime-link-"));
+  const realRoot = path.join(root, "real");
+  const linkedRoot = path.join(root, "linked");
+  fs.mkdirSync(realRoot);
+  fs.symlinkSync(realRoot, linkedRoot);
+  assert.throws(
+    () => discoverRuntimeLocation({ runtimeModule: linkedRoot }),
+    /invalid_runtime_module_symlink/
+  );
+});
+
+test("independent deadline cancels and fails closed without an exact result", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-deadline-"));
+  const never = deferred();
+  const { module, state } = makeRuntimeModule({ result: never.promise });
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(root, { timeoutMs: 10 }), {
+    runtimeModule: module,
+    bindSignals: false,
+    deadlineGraceMs: 10,
+    eventDrainTimeoutMs: 5,
+    eventCloseGraceMs: 5,
+    cleanupTimeoutMs: 20,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  assert.equal(state.cancelCalls, 1);
+  assert.equal(emitted.at(-1).type, "supervisor_error");
+  assert.equal(emitted.at(-1).code, "supervisor_timeout");
+});
+
+test("progress snapshots expose evidence age before the exact result", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-progress-"));
+  const terminal = deferred();
+  const { module } = makeRuntimeModule({ result: terminal.promise });
+  const emitted = [];
+  const run = runSupervisor(makeConfig(root, {
+    timeoutMs: 1000,
+    progressMs: 5
+  }), {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 18));
+  terminal.resolve({ status: "completed", stopReason: "end_turn" });
+  assert.equal(await run, EXIT_CODES.completed);
+  const snapshots = emitted.filter((event) => event.type === "progress");
+  assert.ok(snapshots.length >= 1);
+  assert.ok(snapshots.every((event) => Number.isFinite(event.evidenceAgeMs)));
+});
+
+test("pending signal cancels the exact turn and stays bound through terminal", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-signal-"));
+  const terminal = deferred();
+  const signalSource = new EventEmitter();
+  let listenersAtTerminal = 0;
+  const { module, state } = makeRuntimeModule({
+    result: terminal.promise,
+    onProbe() {
+      signalSource.emit("SIGTERM");
+    },
+    onCancel() {
+      terminal.resolve({ status: "cancelled", stopReason: "cancelled" });
+    }
+  });
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(root), {
+    runtimeModule: module,
+    signalSource,
+    writeEvent(event) {
+      emitted.push(event);
+      if (event.type === "terminal") {
+        listenersAtTerminal = signalSource.listenerCount("SIGTERM");
+      }
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.cancelled);
+  assert.equal(state.cancelCalls, 1);
+  assert.equal(listenersAtTerminal, 1);
+  assert.equal(signalSource.listenerCount("SIGINT"), 0);
+  assert.equal(signalSource.listenerCount("SIGTERM"), 0);
+  assert.equal(emitted.at(-1).type, "terminal");
+});
+
+test("terminal is structurally the final event after a late stream", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-terminal-last-"));
+  const { module } = makeRuntimeModule({
+    eventFactory() {
+      return {
+        async *[Symbol.asyncIterator]() {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          yield { type: "status", tag: "usage_update", used: 1, size: 2 };
+        }
+      };
+    }
+  });
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(root), {
+    runtimeModule: module,
+    bindSignals: false,
+    eventDrainTimeoutMs: 5,
+    eventCloseGraceMs: 5,
+    cleanupTimeoutMs: 20,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  assert.equal(emitted.at(-1).type, "terminal");
+  assert.equal(
+    emitted.filter((event) => event.type === "terminal").length,
+    1
   );
 });

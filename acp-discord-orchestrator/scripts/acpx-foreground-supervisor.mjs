@@ -25,6 +25,43 @@ const VALID_TOOL_KINDS = new Set([
   "other"
 ]);
 
+const CONFIGURABLE_TOOL_KINDS = new Set(
+  [...VALID_TOOL_KINDS].filter((kind) => kind !== "other")
+);
+const COMMAND_KEYS = new Set([
+  "command",
+  "cmd",
+  "shell",
+  "script",
+  "args",
+  "argv",
+  "commandline",
+  "run",
+  "exec"
+]);
+const BACKGROUND_KEYS = new Set([
+  "runinbackground",
+  "background",
+  "detached",
+  "detach",
+  "daemon",
+  "daemonize"
+]);
+const ENABLED_FLAG_VALUES = new Set([
+  "1",
+  "true",
+  "yes",
+  "on",
+  "background",
+  "detached",
+  "daemon",
+  "daemonized"
+]);
+const MAX_INSPECTION_DEPTH = 12;
+const MAX_COLLECTION_ITEMS = 256;
+const MAX_INSPECTION_NODES = 4096;
+const MAX_INSPECTED_STRING_BYTES = 65536;
+
 const EXECUTION_CONTRACT = [
   "",
   "Execution boundary for this ACP turn:",
@@ -133,9 +170,7 @@ export function loadSupervisorConfig(configPath) {
   }
 
   const stateDir = resolveAbsolute(raw.stateDir, "invalid_state_dir");
-  const timeoutMs = raw.timeoutMs === undefined
-    ? undefined
-    : assertPositiveInteger(raw.timeoutMs, "invalid_timeout_ms");
+  const timeoutMs = assertPositiveInteger(raw.timeoutMs, "invalid_timeout_ms");
   const progressMs = raw.progressMs === undefined
     ? 0
     : assertPositiveInteger(raw.progressMs, "invalid_progress_ms", { allowZero: true });
@@ -148,7 +183,7 @@ export function loadSupervisorConfig(configPath) {
   }
   const allowKinds = new Set();
   for (const value of raw.allowKinds) {
-    if (typeof value !== "string" || !VALID_TOOL_KINDS.has(value)) {
+    if (typeof value !== "string" || !CONFIGURABLE_TOOL_KINDS.has(value)) {
       fail("invalid_allow_kind");
     }
     allowKinds.add(value);
@@ -176,75 +211,149 @@ function normalizedKey(value) {
   return String(value).replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 }
 
-function walkObject(value, visitor, depth = 0) {
-  if (depth > 12 || value === null || value === undefined) {
-    return;
+function isPlainObject(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
   }
-  if (Array.isArray(value)) {
-    for (const item of value.slice(0, 256)) {
-      walkObject(item, visitor, depth + 1);
-    }
-    return;
-  }
-  if (typeof value !== "object") {
-    return;
-  }
-  let count = 0;
-  for (const [key, child] of Object.entries(value)) {
-    if (count >= 256) {
-      break;
-    }
-    count += 1;
-    visitor(key, child);
-    walkObject(child, visitor, depth + 1);
-  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
-function hasBackgroundFlag(value) {
-  let found = false;
-  walkObject(value, (key, child) => {
-    const keyName = normalizedKey(key);
-    const enabled = child === true ||
-      child === 1 ||
-      (typeof child === "string" && normalizedKey(child) === "true");
-    if ((keyName === "runinbackground" || keyName === "background") && enabled) {
-      found = true;
-    }
-  });
-  return found;
+function isEnabledFlag(value) {
+  if (value === true || value === 1) {
+    return true;
+  }
+  return typeof value === "string" &&
+    ENABLED_FLAG_VALUES.has(normalizedKey(value));
 }
 
-function hasPermissionBypass(value) {
-  let found = false;
-  walkObject(value, (key, child) => {
-    const keyName = normalizedKey(key);
-    if (typeof child === "string" && normalizedKey(child) === "bypasspermissions") {
-      found = true;
+function containsPermissionBypass(command) {
+  return /(?:^|\s)--dangerously-skip-permissions(?:\s|=|$)/i.test(command) ||
+    /(?:^|\s)--permission-mode(?:=|\s+)(?:bypasspermissions|bypass-permissions)(?=\s|$)/i.test(command);
+}
+
+function containsNestedAgentRoute(command) {
+  return /(?:^|[;&|]\s*|\b(?:npx|pnpm\s+dlx|yarn\s+dlx)\s+)acpx(?:@[a-zA-Z0-9_.-]+)?(?:\s|$)/i.test(command) ||
+    /\bopenclaw\s+(?:acp\s+spawn\b|sessions?\s+spawn\b[^\n]*--runtime(?:=|\s+)acp\b)/i.test(command) ||
+    /(?:^|\s)claude(?:\s|$)[^\n]*(?:--bg|--background)(?:\s|=|$)/i.test(command);
+}
+
+function inspectPermissionInput(rawInput) {
+  if (!isPlainObject(rawInput)) {
+    return { complete: false, background: false, bypass: false, commands: [] };
+  }
+
+  const state = {
+    complete: true,
+    nodes: 0,
+    background: false,
+    bypass: false,
+    commands: []
+  };
+
+  const recordCommand = (value) => {
+    if (typeof value === "string") {
+      state.commands.push(value);
+      return;
     }
-    if (keyName === "dangerouslyskippermissions" && child === true) {
-      found = true;
-    }
-    if (keyName.includes("permission") && typeof child === "string") {
-      if (normalizedKey(child).includes("bypasspermissions")) {
-        found = true;
+    if (Array.isArray(value)) {
+      if (value.length > MAX_COLLECTION_ITEMS) {
+        state.complete = false;
+        return;
       }
+      for (const item of value) {
+        if (typeof item === "string") {
+          state.commands.push(item);
+        } else if (typeof item !== "number") {
+          state.complete = false;
+        }
+      }
+      return;
     }
-  });
-  return found;
-}
+    state.complete = false;
+  };
 
-function collectCommandStrings(value) {
-  const commands = [];
-  walkObject(value, (key, child) => {
-    const keyName = normalizedKey(key);
-    if (
-      typeof child === "string" &&
-      (keyName === "command" || keyName === "cmd" || keyName === "shell" || keyName === "script")
-    ) {
-      commands.push(child);
+  const walk = (value, depth) => {
+    if (!state.complete) {
+      return;
     }
-  });
-  return commands;
+    if (depth > MAX_INSPECTION_DEPTH) {
+      state.complete = false;
+      return;
+    }
+    state.nodes += 1;
+    if (state.nodes > MAX_INSPECTION_NODES) {
+      state.complete = false;
+      return;
+    }
+
+    if (typeof value === "string") {
+      if (Buffer.byteLength(value, "utf8") > MAX_INSPECTED_STRING_BYTES) {
+        state.complete = false;
+      }
+      return;
+    }
+    if (value === null || typeof value !== "object") {
+      return;
+    }
+    if (Array.isArray(value)) {
+      if (value.length > MAX_COLLECTION_ITEMS) {
+        state.complete = false;
+        return;
+      }
+      for (const item of value) {
+        walk(item, depth + 1);
+      }
+      return;
+    }
+    if (!isPlainObject(value)) {
+      state.complete = false;
+      return;
+    }
+
+    const entries = Object.entries(value);
+    if (entries.length > MAX_COLLECTION_ITEMS) {
+      state.complete = false;
+      return;
+    }
+    for (const [key, child] of entries) {
+      const keyName = normalizedKey(key);
+      if (BACKGROUND_KEYS.has(keyName) && isEnabledFlag(child)) {
+        state.background = true;
+      }
+      if (
+        keyName === "dangerouslyskippermissions" &&
+        isEnabledFlag(child)
+      ) {
+        state.bypass = true;
+      }
+      if (
+        typeof child === "string" &&
+        (
+          normalizedKey(child) === "bypasspermissions" ||
+          normalizedKey(child) === "dangerouslyskippermissions" ||
+          (
+            keyName.includes("permission") &&
+            normalizedKey(child).includes("bypasspermissions")
+          )
+        )
+      ) {
+        state.bypass = true;
+      }
+      if (COMMAND_KEYS.has(keyName)) {
+        recordCommand(child);
+      }
+      walk(child, depth + 1);
+    }
+  };
+
+  walk(rawInput, 0);
+  for (const command of state.commands) {
+    if (containsPermissionBypass(command)) {
+      state.bypass = true;
+    }
+  }
+  return state;
 }
 
 export function containsDetachedShell(command) {
@@ -300,21 +409,27 @@ export function classifyPermissionRequest(request, allowKinds) {
   if (typeof kind !== "string" || !VALID_TOOL_KINDS.has(kind)) {
     return { allowed: false, reason: "unknown_tool_kind", kind: "unknown" };
   }
+  if (kind === "other") {
+    return { allowed: false, reason: "unclassified_tool_kind", kind };
+  }
   if (!allowKinds.has(kind)) {
     return { allowed: false, reason: "tool_kind_not_allowed", kind };
   }
 
-  const rawInput = toolCall && toolCall.rawInput;
-  if (rawInput === undefined) {
+  const inspection = inspectPermissionInput(toolCall && toolCall.rawInput);
+  if (!inspection.complete) {
     return { allowed: false, reason: "uninspectable_input", kind };
   }
-  if (hasPermissionBypass(rawInput)) {
+  if (inspection.bypass) {
     return { allowed: false, reason: "permission_bypass", kind };
   }
-  if (hasBackgroundFlag(rawInput)) {
+  if (inspection.background) {
     return { allowed: false, reason: "background_flag", kind };
   }
-  for (const command of collectCommandStrings(rawInput)) {
+  for (const command of inspection.commands) {
+    if (containsNestedAgentRoute(command)) {
+      return { allowed: false, reason: "nested_agent_route", kind };
+    }
     if (containsDetachedShell(command)) {
       return { allowed: false, reason: "detached_shell", kind };
     }
@@ -402,7 +517,10 @@ export function normalizeRuntimeEvent(event, counters) {
 }
 function runtimeLocationFromOverride(value) {
   const absolute = path.resolve(value);
-  const stat = fs.statSync(absolute);
+  const stat = fs.lstatSync(absolute);
+  if (stat.isSymbolicLink()) {
+    fail("invalid_runtime_module_symlink");
+  }
   if (stat.isDirectory()) {
     return {
       modulePath: path.join(absolute, "dist", "runtime.js"),
@@ -456,6 +574,13 @@ async function loadRuntimeModule(config, dependencies) {
   if (!fs.existsSync(location.modulePath)) {
     fail("acpx_runtime_module_missing");
   }
+  const moduleStat = fs.lstatSync(location.modulePath);
+  if (moduleStat.isSymbolicLink()) {
+    fail("acpx_runtime_module_symlink");
+  }
+  if (!moduleStat.isFile()) {
+    fail("acpx_runtime_module_missing");
+  }
   const imported = await import(pathToFileURL(location.modulePath).href);
   validateRuntimeModuleExports(imported);
   return {
@@ -480,10 +605,6 @@ function createCounters() {
 
 function publicCounters(counters) {
   return { ...counters };
-}
-
-function safeWorkspaceName(cwd) {
-  return path.basename(path.resolve(cwd));
 }
 
 function safeSessionReference(sessionKey) {
@@ -552,30 +673,104 @@ function writePrivateResponse(responseFile, content) {
   });
 }
 
-function bindCancellationSignals(turn, emit) {
-  let requested = false;
+function bindCancellationSignals(getTurn, emit, signalSource) {
+  let requestedSignal;
+  let cancellationStarted = false;
   const handlers = new Map();
+
+  const requestCancellation = () => {
+    if (!requestedSignal || cancellationStarted) {
+      return;
+    }
+    const currentTurn = getTurn();
+    if (!currentTurn) {
+      return;
+    }
+    cancellationStarted = true;
+    try {
+      Promise.resolve(currentTurn.cancel({
+        reason: "signal:" + requestedSignal
+      })).catch(() => {
+        emit("activity", {
+          activity: "cancellation_request_failed",
+          signal: requestedSignal
+        });
+      });
+    } catch {
+      emit("activity", {
+        activity: "cancellation_request_failed",
+        signal: requestedSignal
+      });
+    }
+  };
 
   for (const signalName of ["SIGINT", "SIGTERM"]) {
     const handler = () => {
-      if (requested) {
+      if (requestedSignal) {
         return;
       }
-      requested = true;
-      emit("activity", { activity: "cancellation_requested", signal: signalName });
-      Promise.resolve(turn.cancel({ reason: "signal:" + signalName })).catch(() => {
-        emit("activity", { activity: "cancellation_request_failed", signal: signalName });
+      requestedSignal = signalName;
+      emit("activity", {
+        activity: "cancellation_requested",
+        signal: signalName
       });
+      requestCancellation();
     };
     handlers.set(signalName, handler);
-    process.on(signalName, handler);
+    signalSource.on(signalName, handler);
   }
 
-  return () => {
-    for (const [signalName, handler] of handlers) {
-      process.off(signalName, handler);
+  return {
+    attachTurn: requestCancellation,
+    stop() {
+      for (const [signalName, handler] of handlers) {
+        signalSource.off(signalName, handler);
+      }
     }
   };
+}
+
+async function waitForTurnResult(turn, timeoutMs, emit, graceMs) {
+  let deadlineTimer;
+  const settled = Promise.resolve(turn.result).then(
+    (value) => ({ type: "result", value }),
+    (error) => ({ type: "error", error })
+  );
+  const deadline = new Promise((resolve) => {
+    deadlineTimer = setTimeout(() => resolve({ type: "timeout" }), timeoutMs);
+  });
+  let outcome = await Promise.race([settled, deadline]);
+  clearTimeout(deadlineTimer);
+
+  if (outcome.type === "result") {
+    return outcome.value;
+  }
+  if (outcome.type === "error") {
+    throw outcome.error;
+  }
+
+  emit("activity", { activity: "timeout_cancellation_requested" });
+  try {
+    Promise.resolve(turn.cancel({ reason: "supervisor_timeout" })).catch(() => {
+      emit("activity", { activity: "timeout_cancellation_failed" });
+    });
+  } catch {
+    emit("activity", { activity: "timeout_cancellation_failed" });
+  }
+
+  let graceTimer;
+  const grace = new Promise((resolve) => {
+    graceTimer = setTimeout(() => resolve({ type: "grace_timeout" }), graceMs);
+  });
+  outcome = await Promise.race([settled, grace]);
+  clearTimeout(graceTimer);
+  if (outcome.type === "result") {
+    return outcome.value;
+  }
+  if (outcome.type === "error") {
+    throw outcome.error;
+  }
+  fail("supervisor_timeout");
 }
 
 async function settleEventPump(eventPump, timeoutMs) {
@@ -607,12 +802,25 @@ export async function runSupervisor(config, dependencies = {}) {
   let runtime;
   let handle;
   let turn;
-  let stopSignals = () => {};
   let progressTimer;
+  let eventIterator;
+  let eventPumpStopped = false;
+  let outputClosed = false;
   let response = "";
   let responseTruncated = false;
+  const deadlineGraceMs = dependencies.deadlineGraceMs ?? 5000;
+  const eventDrainTimeoutMs = dependencies.eventDrainTimeoutMs ?? 2000;
+  const eventCloseGraceMs = dependencies.eventCloseGraceMs ?? 500;
+  const cleanupTimeoutMs = dependencies.cleanupTimeoutMs ?? 5000;
 
   const emit = (type, payload = {}) => {
+    if (outputClosed) {
+      return false;
+    }
+    const closesOutput = type === "terminal" || type === "supervisor_error";
+    if (closesOutput) {
+      outputClosed = true;
+    }
     const timestampMs = now();
     sequence += 1;
     writeEvent({
@@ -625,7 +833,16 @@ export async function runSupervisor(config, dependencies = {}) {
       type,
       ...payload
     });
+    return true;
   };
+
+  const signalBinding = dependencies.bindSignals === false
+    ? { attachTurn() {}, stop() {} }
+    : bindCancellationSignals(
+        () => turn,
+        emit,
+        dependencies.signalSource || process
+      );
 
   try {
     preparePrivateStateDirectory(config.stateDir);
@@ -692,17 +909,24 @@ export async function runSupervisor(config, dependencies = {}) {
       fail("acpx_turn_contract_invalid");
     }
 
+    signalBinding.attachTurn();
+
     emit("started", {
       agent: config.agent,
       model: config.model || "runtime-default",
-      workspace: safeWorkspaceName(config.cwd),
       sessionRef: safeSessionReference(config.sessionKey),
       runtimeVersion: safeRuntimeVersion(loaded.version),
       allowedToolKinds: [...config.allowKinds].sort()
     });
 
+    eventIterator = turn.events[Symbol.asyncIterator]();
     const eventPump = (async () => {
-      for await (const event of turn.events) {
+      while (!eventPumpStopped) {
+        const next = await eventIterator.next();
+        if (next.done || eventPumpStopped) {
+          break;
+        }
+        const event = next.value;
         lastActivityAt = now();
         if (
           event &&
@@ -732,11 +956,12 @@ export async function runSupervisor(config, dependencies = {}) {
       progressTimer.unref();
     }
 
-    stopSignals = dependencies.bindSignals === false
-      ? () => {}
-      : bindCancellationSignals(turn, emit);
-
-    const result = await turn.result;
+    const result = await waitForTurnResult(
+      turn,
+      config.timeoutMs,
+      emit,
+      deadlineGraceMs
+    );
     if (!result || !["completed", "cancelled", "failed"].includes(result.status)) {
       fail("acpx_turn_result_invalid");
     }
@@ -745,28 +970,48 @@ export async function runSupervisor(config, dependencies = {}) {
       clearInterval(progressTimer);
       progressTimer = undefined;
     }
-    stopSignals();
-    stopSignals = () => {};
 
-    const streamState = await settleEventPump(eventPump, 2000);
+    const streamState = await settleEventPump(eventPump, eventDrainTimeoutMs);
     if (!streamState.ok) {
+      eventPumpStopped = true;
+      const stopTasks = [];
       try {
-        await turn.closeStream({ reason: "terminal_result" });
+        stopTasks.push(Promise.resolve(
+          turn.closeStream({ reason: "terminal_result" })
+        ));
       } catch {
         // The result remains authoritative even when stream cleanup fails.
       }
-      await settleEventPump(eventPump, 500);
+      if (eventIterator && typeof eventIterator.return === "function") {
+        try {
+          stopTasks.push(Promise.resolve(eventIterator.return()));
+        } catch {
+          // The output latch still prevents post-terminal delivery.
+        }
+      }
+      if (stopTasks.length > 0) {
+        await settleEventPump(
+          Promise.allSettled(stopTasks),
+          eventCloseGraceMs
+        );
+      }
+      await settleEventPump(eventPump, eventCloseGraceMs);
+    } else {
+      eventPumpStopped = true;
     }
 
     let cleanupOk = true;
-    try {
-      await runtime.close({
+    const cleanupState = await settleEventPump(
+      Promise.resolve().then(() => runtime.close({
         handle,
         reason: "supervisor_terminal",
         discardPersistentState: true
-      });
+      })),
+      cleanupTimeoutMs
+    );
+    if (cleanupState.ok) {
       runtime = undefined;
-    } catch {
+    } else {
       cleanupOk = false;
     }
 
@@ -786,8 +1031,6 @@ export async function runSupervisor(config, dependencies = {}) {
       status: result.status,
       supervisorStatus,
       stopReason: safeStopReason(result.stopReason),
-      responseBytes: Buffer.byteLength(response, "utf8"),
-      responseSha256: crypto.createHash("sha256").update(response).digest("hex"),
       responseTruncated,
       responseStored,
       eventStreamOk: streamState.ok,
@@ -807,7 +1050,6 @@ export async function runSupervisor(config, dependencies = {}) {
     if (progressTimer) {
       clearInterval(progressTimer);
     }
-    stopSignals();
     const code = safeDiagnosticCode(
       error && error.code,
       "supervisor_failure"
@@ -819,24 +1061,26 @@ export async function runSupervisor(config, dependencies = {}) {
     }
     return EXIT_CODES.supervisorError;
   } finally {
+    eventPumpStopped = true;
     if (runtime && turn) {
-      try {
-        await turn.closeStream({ reason: "supervisor_cleanup" });
-      } catch {
-        // Best-effort cleanup only.
-      }
+      await settleEventPump(
+        Promise.resolve().then(() => turn.closeStream({
+          reason: "supervisor_cleanup"
+        })),
+        eventCloseGraceMs
+      );
     }
     if (runtime && handle) {
-      try {
-        await runtime.close({
+      await settleEventPump(
+        Promise.resolve().then(() => runtime.close({
           handle,
           reason: "supervisor_cleanup",
           discardPersistentState: true
-        });
-      } catch {
-        // Best-effort cleanup only.
-      }
+        })),
+        cleanupTimeoutMs
+      );
     }
+    signalBinding.stop();
   }
 }
 
