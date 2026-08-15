@@ -610,6 +610,14 @@ test("config requires a timeout and rejects the unclassified other kind", () => 
   );
 });
 
+test("template ships the two-hour emergency timeout ceiling", () => {
+  const template = JSON.parse(fs.readFileSync(
+    new URL("../templates/supervisor-config.json", import.meta.url),
+    "utf8"
+  ));
+  assert.equal(template.timeoutMs, 7200000);
+});
+
 test("runtime location rejects a symlinked package root", {
   skip: process.platform === "win32"
 }, () => {

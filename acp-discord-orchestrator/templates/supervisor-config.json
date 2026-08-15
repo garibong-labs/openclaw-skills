@@ -7,7 +7,7 @@
   "responseFile": "/absolute/private/path/response.txt",
   "stateDir": "/absolute/private/path/acpx-state",
   "runtimeModule": "/absolute/path/to/plugin-local/acpx",
-  "timeoutMs": 1800000,
+  "timeoutMs": 7200000,
   "progressMs": 600000,
   "maxResponseBytes": 1048576,
   "allowKinds": [

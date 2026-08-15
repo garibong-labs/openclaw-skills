@@ -27,7 +27,7 @@ This policy does not globally disable human-operated OpenClaw ACP commands.
 3. Copy [templates/supervisor-config.json](templates/supervisor-config.json) to a private temporary file.
 4. Create a private prompt file and choose a new response-file path.
 5. Set the config file and prompt file to owner-only permissions.
-6. Set an explicit working directory, ACP agent, model, unique session key, timeout, progress interval, and allowed tool kinds.
+6. Set an explicit working directory, ACP agent, model, unique session key, timeout, progress interval, and allowed tool kinds. The template's two-hour `timeoutMs` is an emergency ceiling independent of reporting cadence; set it per run.
 7. Define terminal acceptance checks in the prompt.
 8. Resolve this skill's directory and run the supervisor by absolute path in the foreground:
 
