@@ -59,7 +59,7 @@ Required:
 - `stateDir`: absolute private runtime state directory
 - `runtimeModule`: absolute ACPX package root or runtime module file
 - `allowKinds`: non-empty tool-kind allowlist that excludes the unclassified `other` kind
-- `timeoutMs`: positive turn deadline independent of watchdog cadence
+- `timeoutMs`: positive turn deadline independent of watchdog cadence; the template ships a two-hour emergency ceiling, configurable per run
 
 Optional:
 
