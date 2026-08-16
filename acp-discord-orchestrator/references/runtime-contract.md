@@ -13,6 +13,7 @@ This reference defines the compatibility and evidence boundary for the direct AC
 - [Evidence boundary](#evidence-boundary)
 - [Stable exits](#stable-exits)
 - [Process liveness](#process-liveness)
+- [Host wait boundaries](#host-wait-boundaries)
 - [Cancellation](#cancellation)
 - [Non-goals](#non-goals)
 
@@ -130,6 +131,23 @@ Session existence, adapter process existence, supervisor process existence, chil
 
 Their disappearance also does not replace the exact turn result.
 
+## Host wait boundaries
+
+Foreground ownership is a property of the supervisor process tree, not of the caller's host tool call. A caller may return from a host tool while the supervisor keeps running, provided the same tracked process stays owned until it exits.
+
+The caller contract is:
+
+- start the supervisor through one tracked foreground host exec;
+- bound the initial host wait to five seconds unless the process is already terminal;
+- retain the exact non-empty process handle the host reports for that run;
+- poll only that handle, waiting 1, 2, 4, and then 5 seconds, capped at five seconds;
+- service steered control-surface input at each returned poll boundary and continue the same turn unless the message explicitly cancels or replaces it;
+- report completion only after both the matching normalized terminal event and the mapped process exit.
+
+One run has one handle. Do not open a second handle, PID search, transcript poll, broad process monitor, long shell sleep, long blocking exec or write wait, or nested wrapper for the same run.
+
+A returned poll is evidence about the host boundary only. It is not activity evidence, and it is never terminal evidence. Bounded host waits change when the caller regains control; they do not change the evidence boundary, the stable exits, or cancellation.
+
 ## Cancellation
 
 Bind SIGINT and SIGTERM before runtime probing, carry a pending request into the exact turn once it exists, and release handlers only after normalized terminal output and cleanup. Continue waiting for the exact result until the required deadline and bounded cancellation grace expire. Do not report `cancelled` merely because a signal handler ran.
@@ -142,4 +160,5 @@ This contract does not:
 - provide an operating-system sandbox;
 - guarantee containment of arbitrary foreground code that daemonizes internally;
 - define a personal watchdog interval, language, destination, or message template;
+- define host-specific stale-session detection or recovery;
 - make an official ACP child thread observable by the direct supervisor.
