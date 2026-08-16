@@ -618,6 +618,31 @@ test("template ships the two-hour emergency timeout ceiling", () => {
   assert.equal(template.timeoutMs, 7200000);
 });
 
+test("public docs separate foreground ownership from host caller blocking", () => {
+  const skill = fs.readFileSync(new URL("../SKILL.md", import.meta.url), "utf8");
+  const contract = fs.readFileSync(
+    new URL("../references/runtime-contract.md", import.meta.url),
+    "utf8"
+  );
+
+  assert.match(contract, /^## Host wait boundaries$/m);
+  for (const doc of [skill, contract]) {
+    assert.match(doc, /1, 2, 4, and then 5 seconds/);
+    assert.match(doc, /exact non-empty process handle/);
+    assert.match(doc, /unless the message explicitly cancels or replaces it/);
+    assert.match(
+      doc,
+      /both the matching normalized terminal event and the mapped/
+    );
+  }
+
+  assert.doesNotMatch(skill + contract, /ten-minute|10-minute/i);
+  assert.match(
+    contract,
+    /define host-specific stale-session detection or recovery/
+  );
+});
+
 test("runtime location rejects a symlinked package root", {
   skip: process.platform === "win32"
 }, () => {

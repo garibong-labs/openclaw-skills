@@ -37,6 +37,36 @@ node /absolute/path/to/acp-discord-orchestrator/scripts/acpx-foreground-supervis
 
 Do not background the supervisor. Consume its newline-delimited JSON events while its process remains attached.
 
+## Own the process without blocking the conversation
+
+Process foreground ownership and host conversation blocking are separate properties. Keep the first without assuming it requires the second.
+
+Foreground ownership belongs to the supervisor process. It runs as exactly one tracked host exec process tree, stays attached, is never detached, daemonized, or backgrounded, and stays owned until it exits.
+
+Conversation blocking belongs to the caller. One host tool call does not have to stay open for the whole ACP turn. Return control at short, bounded host-tool boundaries while the same supervisor process keeps running under host process tracking.
+
+Bound the initial host wait to five seconds unless the process is already terminal. Once the host reports a running process, retain its exact non-empty process handle and use only that handle for the rest of the turn.
+
+Poll the retained handle with bounded waits of 1, 2, 4, and then 5 seconds for every later poll. Five seconds is the cap.
+
+Do not substitute:
+
+- a PID search or broad process monitoring
+- transcript or log-file polling
+- a long shell sleep
+- a long blocking exec or write wait
+- a second launch, wrapper, or nested runner around the same run
+
+A returned poll is a host-tool boundary. It is not activity evidence and never terminal evidence.
+
+## Stay responsive at each poll boundary
+
+Treat every returned poll as a servicing point. Before the next poll, read newly steered input from the current conversation and answer it there.
+
+Continue the same ACP round with the retained handle unless the message explicitly cancels or replaces it. Steered input that asks a question, adds context, or requests a status update does not end the turn.
+
+When the message does explicitly cancel or replace the turn, follow the documented cancellation path for the retained handle instead of abandoning it.
+
 ## Interpret events
 
 Treat `activity` and `progress` as observational evidence only. The progress snapshot includes evidence age; it does not independently prove that ACP is still doing useful work.
@@ -46,6 +76,8 @@ Read the private response file locally after the process reaches a terminal even
 Treat only the matching `terminal` event as terminal evidence. Preserve `completed`, `cancelled`, and `failed` as distinct states.
 
 Map supervisor exits as documented in the runtime contract. Never turn a failed or cancelled run into a success report. Treat process exit as the final delivery of that mapping; the CLI bounds output flushing before forcing termination so leaked runtime handles cannot hold the caller open.
+
+Report completion only after both the matching normalized terminal event and the mapped supervisor process exit. A returned poll, a quiet event stream, or a serviced conversation reply replaces neither.
 
 ## Foreground policy
 
