@@ -539,7 +539,7 @@ class DaumNextSourceFallbackTests(OGRetryFallbackTests):
         self.assertIsNone(select(DAUM_PRIMARY, [DAUM_PRIMARY]))
         self.assertIsNone(select(DAUM_PRIMARY, [NAVER_URL, MOBILE_URL_2026_08_13]))
 
-    def test_normalize_og_entries_is_fail_closed(self):
+    def test_og_entry_normalization(self):
         ns, _, _ = self.make_namespace()
         normalize = ns["normalize_og_entries"]
         self.assertEqual(normalize(None), [])
