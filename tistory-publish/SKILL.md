@@ -149,6 +149,7 @@ bash scripts/login.sh \
 - `<p data-ke-size="size16">` 태그 사용
 - 단락 = 여러 문장 묶음 (`<p>` 하나에 2~4문장)
 - OG 카드 위치: `<p data-og-placeholder="URL">&#8203;</p>`
+- 뉴스 OG 카드 폴백 후보(선택): `<p data-og-placeholder="URL" data-og-fallback-urls="URL1 URL2">&#8203;</p>` — 같은 항목의 v.daum.net 기사 후보를 공백 구분으로 나열. scrap이 두 시도 모두 HTTP 500 + `code=40009`로 확정될 때만 첫 적격 후보를 정확히 1회 시도. 커뮤니티 카드에는 사용 금지
 - 구분선: `<hr contenteditable="false" data-ke-type="horizontalRule" data-ke-style="style1">`
 
 ### SEO 규칙 (검색 노출용 — `--seo-check`가 검사하는 항목)
@@ -192,8 +193,9 @@ templates/my-template/
 
 ### OG 카드
 - `getOGPlaceholders()` — placeholder URL 목록
+- `getOGPlaceholderEntries()` — placeholder별 URL + ordered Daum 다음 기사 폴백 후보 목록 (`data-og-fallback-urls`, 없거나 파싱 불가 시 빈 후보로 fail-closed)
 - `prepareOGPlaceholder(url)` — placeholder → URL 텍스트 교체
-- `prepareOGRetry(fromUrl, toUrl)` — 실패한 시도의 pending 문단 재사용 (같은 URL 재시도 / 확정 40002 시 DCInside 짝 폴백)
+- `prepareOGRetry(fromUrl, toUrl)` — 실패한 시도의 pending 문단 재사용 (같은 URL 재시도 / 확정 40002 시 DCInside 짝 폴백 / 확정 500·40009 시 Daum 다음 기사 폴백)
 - `dcinsidePairedOGUrl(url)` — 엄격한 DCInside 모바일↔데스크톱 게시글 짝 계산 (그 외 URL은 null)
 - `verifyOGCard(url)` — 카드 렌더링 확인 (엄격한 DCInside 짝은 같은 글로 인정)
 

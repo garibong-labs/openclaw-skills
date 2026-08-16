@@ -1,5 +1,6 @@
-"""Behavior tests for the publish-post.sh OG bounded retry and the
-confirmed-40002 DCInside mobile/desktop paired fallback (2026-08-13 abort).
+"""Behavior tests for the publish-post.sh OG bounded retry, the
+confirmed-40002 DCInside mobile/desktop paired fallback (2026-08-13 abort),
+and the confirmed HTTP 500 / code 40009 Daum next-source fallback.
 
 The publish engine is embedded Python inside a bash heredoc; like
 test_publish_post_upload.py these tests extract the relevant functions via
@@ -20,6 +21,10 @@ FUNCTION_NAMES = {
     "scrap_response_matches",
     "classify_scrap_code",
     "summarize_scrap_responses",
+    "daum_article_og_url",
+    "daum_article_dedup_key",
+    "select_daum_fallback_url",
+    "normalize_og_entries",
     "og_backoff_delay_s",
     "ensure_og_helpers",
     "attempt_og_render",
@@ -31,6 +36,10 @@ MOBILE_URL_2026_08_10 = "https://m.dcinside.com/board/ngm/270135"
 DESKTOP_URL_2026_08_10 = "https://gall.dcinside.com/board/view/?id=ngm&no=270135"
 MOBILE_URL_2026_08_13 = "https://m.dcinside.com/board/comic_new6/5734260"
 DESKTOP_URL_2026_08_13 = "https://gall.dcinside.com/board/view/?id=comic_new6&no=5734260"
+DAUM_PRIMARY = "https://v.daum.net/v/20260816090000001"
+DAUM_NEXT = "https://v.daum.net/v/20260816090000002"
+DAUM_THIRD = "https://v.daum.net/v/20260816090000003"
+NAVER_URL = "https://n.news.naver.com/article/001/0015000000"
 
 
 class PublishAbort(RuntimeError):
@@ -258,8 +267,8 @@ class OGRetryFallbackTests(unittest.TestCase):
 
     # ── bounded retry / fallback flow ───────────────────────────────────────
 
-    def render(self, ns, page, url, phase="step5"):
-        return ns["render_og_card_with_fallback"](page, url, 1, phase)
+    def render(self, ns, page, url, phase="step5", fallback_urls=None):
+        return ns["render_og_card_with_fallback"](page, url, 1, phase, fallback_urls)
 
     def test_first_attempt_success_keeps_single_enter_and_original_latency(self):
         ns, fake_time, _ = self.make_namespace()
@@ -420,8 +429,8 @@ class OGRetryFallbackTests(unittest.TestCase):
 
     def test_step5_and_recovery_use_the_same_render_helper(self):
         source = SCRIPT_PATH.read_text(encoding="utf-8")
-        self.assertIn("render_og_cards(page, og_urls, 'step5')", source)
-        self.assertIn("render_og_cards(page, og_urls, 'recovery')", source)
+        self.assertIn("render_og_cards(page, og_entries, 'step5')", source)
+        self.assertIn("render_og_cards(page, og_entries, 'recovery')", source)
         embedded = re.search(r"<< 'PYTHON_SCRIPT'\n(.*?)\nPYTHON_SCRIPT\n", source, re.DOTALL).group(1)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", SyntaxWarning)
@@ -465,6 +474,288 @@ class OGRetryFallbackTests(unittest.TestCase):
             functions_with_press, {"attempt_og_render", "enter_tag"},
             "OG Enter presses must stay inside attempt_og_render",
         )
+
+
+class DaumNextSourceFallbackTests(OGRetryFallbackTests):
+    """Confirmed HTTP 500 / payload code 40009 → next Daum detail-source
+    fallback. Inherits the base-class fixtures (make_namespace/render), and by
+    subclassing also re-runs every pre-existing retry/40002 test to prove the
+    DCInside paired behavior is unchanged."""
+
+    def scrap_40009(self, url):
+        return scrap_response(url, 500, '{"code": 40009}')
+
+    # ── URL contract and candidate selection ────────────────────────────────
+
+    def test_daum_article_og_url_accepts_only_conservative_article_urls(self):
+        ns, _, _ = self.make_namespace()
+        article = ns["daum_article_og_url"]
+        self.assertEqual(article(DAUM_PRIMARY), DAUM_PRIMARY)
+        self.assertEqual(article(f"  {DAUM_NEXT}  "), DAUM_NEXT)
+        self.assertEqual(article(DAUM_NEXT + "/"), DAUM_NEXT + "/")
+        self.assertEqual(article("http://v.daum.net/v/20260816090000001"), "http://v.daum.net/v/20260816090000001")
+        for url in [
+            "https://search.daum.net/search?w=news&q=keyword",
+            "https://news.daum.net/ranking/popular",
+            "https://www.daum.net/",
+            "https://v.daum.net/",
+            "https://v.daum.net/series/12345",
+            "https://v.daum.net/v/20260816090000001?ref=news",
+            "https://v.daum.net/v/20260816090000001#comment",
+            "https://v.daum.net/v/",
+            "https://v.daum.net/v/2026/extra",
+            "https://cafe.daum.net/some/board/1",
+            MOBILE_URL_2026_08_13,
+            DESKTOP_URL_2026_08_13,
+            "https://theqoo.net/square/456",
+            NAVER_URL,
+            "ftp://v.daum.net/v/20260816090000001",
+            "not a url",
+            "",
+            None,
+            12345,
+        ]:
+            with self.subTest(url=url):
+                self.assertIsNone(article(url))
+
+    def test_select_daum_fallback_skips_current_dupes_malformed_and_non_daum(self):
+        ns, _, _ = self.make_namespace()
+        select = ns["select_daum_fallback_url"]
+        candidates = [
+            DAUM_PRIMARY,            # current URL
+            DAUM_PRIMARY + "/",      # normalized duplicate of current
+            NAVER_URL,               # non-Daum
+            12345,                   # malformed (non-string)
+            "",                      # malformed (empty)
+            "https://search.daum.net/search?w=news&q=k",
+            DAUM_NEXT,
+            DAUM_THIRD,
+        ]
+        self.assertEqual(select(DAUM_PRIMARY, candidates), DAUM_NEXT)
+        self.assertEqual(select(DAUM_PRIMARY, [DAUM_THIRD, DAUM_NEXT]), DAUM_THIRD)
+        self.assertIsNone(select(DAUM_PRIMARY, None))
+        self.assertIsNone(select(DAUM_PRIMARY, "not-a-list"))
+        self.assertIsNone(select(DAUM_PRIMARY, []))
+        self.assertIsNone(select(DAUM_PRIMARY, [DAUM_PRIMARY]))
+        self.assertIsNone(select(DAUM_PRIMARY, [NAVER_URL, MOBILE_URL_2026_08_13]))
+
+    def test_normalize_og_entries_is_fail_closed(self):
+        ns, _, _ = self.make_namespace()
+        normalize = ns["normalize_og_entries"]
+        self.assertEqual(normalize(None), [])
+        self.assertEqual(normalize("nope"), [])
+        self.assertEqual(
+            normalize([DAUM_PRIMARY]),
+            [{"url": DAUM_PRIMARY, "fallbackUrls": []}],
+        )
+        self.assertEqual(
+            normalize([
+                {"url": DAUM_PRIMARY, "fallbackUrls": [DAUM_NEXT, 42, None, DAUM_THIRD]},
+                {"url": MOBILE_URL_2026_08_13, "fallbackUrls": "not-a-list"},
+                {"url": None},
+                {"fallbackUrls": [DAUM_NEXT]},
+                7,
+            ]),
+            [
+                {"url": DAUM_PRIMARY, "fallbackUrls": [DAUM_NEXT, DAUM_THIRD]},
+                {"url": MOBILE_URL_2026_08_13, "fallbackUrls": []},
+                {"url": "", "fallbackUrls": []},
+                # url-less entry keeps its candidates but still fails closed:
+                # prepareOGPlaceholder('') aborts before any fallback runs.
+                {"url": "", "fallbackUrls": [DAUM_NEXT]},
+                {"url": "", "fallbackUrls": []},
+            ],
+        )
+
+    # ── primary attempt behavior is unchanged when candidates exist ─────────
+
+    def test_primary_daum_success_on_first_attempt_ignores_candidates(self):
+        ns, _, _ = self.make_namespace()
+        page = FakePage([
+            {"responses": [scrap_response(DAUM_PRIMARY, 200, '{"code": 0}')], "status": found_status()},
+        ])
+        result = self.render(ns, page, DAUM_PRIMARY, fallback_urls=[DAUM_NEXT])
+        self.assertEqual(result, DAUM_PRIMARY)
+        self.assertEqual(page.enter_presses, 1)
+
+    def test_primary_failure_then_same_url_retry_success_ignores_candidates(self):
+        ns, _, _ = self.make_namespace()
+        page = FakePage([
+            {"responses": [self.scrap_40009(DAUM_PRIMARY)], "status": not_found_status()},
+            {"responses": [], "status": found_status()},
+        ])
+        result = self.render(ns, page, DAUM_PRIMARY, fallback_urls=[DAUM_NEXT])
+        self.assertEqual(result, DAUM_PRIMARY)
+        self.assertEqual(page.enter_presses, 2)
+        self.assertEqual(
+            page.prepare_calls,
+            [("placeholder", DAUM_PRIMARY), ("retry", {"fromUrl": DAUM_PRIMARY, "toUrl": DAUM_PRIMARY})],
+        )
+
+    # ── confirmed 500/40009 → exactly one next-source attempt ───────────────
+
+    def test_two_confirmed_500_40009_selects_first_eligible_and_succeeds(self):
+        ns, _, logs = self.make_namespace()
+        page = FakePage([
+            {"responses": [self.scrap_40009(DAUM_PRIMARY)], "status": not_found_status()},
+            {"responses": [self.scrap_40009(DAUM_PRIMARY)], "status": not_found_status()},
+            {"responses": [scrap_response(DAUM_NEXT, 200, '{"code": 0}')], "status": found_status()},
+        ])
+        result = self.render(
+            ns, page, DAUM_PRIMARY,
+            fallback_urls=[NAVER_URL, DAUM_PRIMARY, DAUM_NEXT, DAUM_THIRD],
+        )
+        self.assertEqual(result, DAUM_NEXT)
+        self.assertEqual(page.enter_presses, 3)
+        self.assertEqual(
+            page.prepare_calls[-1],
+            ("retry", {"fromUrl": DAUM_PRIMARY, "toUrl": DAUM_NEXT}),
+        )
+        self.assertTrue(any("500/code=40009 confirmed twice" in line for line in logs))
+
+    def test_fallback_failure_aborts_without_trying_another_candidate(self):
+        ns, _, _ = self.make_namespace()
+        page = FakePage([
+            {"responses": [self.scrap_40009(DAUM_PRIMARY)], "status": not_found_status()},
+            {"responses": [self.scrap_40009(DAUM_PRIMARY)], "status": not_found_status()},
+            {"responses": [self.scrap_40009(DAUM_NEXT)], "status": not_found_status()},
+        ])
+        with self.assertRaises(PublishAbort) as ctx:
+            self.render(ns, page, DAUM_PRIMARY, fallback_urls=[DAUM_NEXT, DAUM_THIRD])
+        self.assertEqual(page.enter_presses, 3)
+        detail = json.loads(str(ctx.exception).split("before publish: ", 1)[1])
+        kinds = [attempt["kind"] for attempt in detail["attempts"]]
+        self.assertEqual(kinds, ["original", "original-retry", "daum-next-source-fallback"])
+        urls = [attempt["url"] for attempt in detail["attempts"]]
+        self.assertNotIn(DAUM_THIRD, urls)
+        for attempt in detail["attempts"]:
+            self.assertNotIn("body", attempt)
+
+    def test_no_eligible_candidate_aborts_without_fallback_attempt(self):
+        ns_cases = {
+            "no candidates": None,
+            "empty candidates": [],
+            "only current url": [DAUM_PRIMARY],
+            "second source non-daum, no later daum": [NAVER_URL],
+            "only community urls": [MOBILE_URL_2026_08_13, "https://theqoo.net/square/456"],
+        }
+        for label, fallback_urls in ns_cases.items():
+            with self.subTest(case=label):
+                ns, _, logs = self.make_namespace()
+                page = FakePage([
+                    {"responses": [self.scrap_40009(DAUM_PRIMARY)], "status": not_found_status()},
+                    {"responses": [self.scrap_40009(DAUM_PRIMARY)], "status": not_found_status()},
+                ])
+                with self.assertRaisesRegex(PublishAbort, "OG card render failed before publish"):
+                    self.render(ns, page, DAUM_PRIMARY, fallback_urls=fallback_urls)
+                self.assertEqual(page.enter_presses, 2, label)
+                self.assertTrue(any("no eligible next Daum candidate" in line for line in logs), label)
+
+    def test_unconfirmed_results_never_trigger_daum_fallback(self):
+        cases = {
+            "status 500 without parsable code": [scrap_response(DAUM_PRIMARY, 500, "<html>error</html>")],
+            "code 40009 without status 500": [scrap_response(DAUM_PRIMARY, 200, '{"code": 40009}')],
+            "code 40002 payload": [scrap_response(DAUM_PRIMARY, 500, '{"code": 40002}')],
+            "unrelated failure code": [scrap_response(DAUM_PRIMARY, 500, '{"code": 40008}')],
+            "no scrap response observed": [],
+        }
+        for label, responses in cases.items():
+            with self.subTest(case=label):
+                ns, _, _ = self.make_namespace()
+                page = FakePage([
+                    {"responses": list(responses), "status": not_found_status()},
+                    {"responses": list(responses), "status": not_found_status()},
+                ])
+                with self.assertRaisesRegex(PublishAbort, "OG card render failed before publish"):
+                    self.render(ns, page, DAUM_PRIMARY, fallback_urls=[DAUM_NEXT])
+                self.assertEqual(page.enter_presses, 2, label)
+
+    def test_one_confirmed_plus_one_unknown_never_triggers_daum_fallback(self):
+        second_cases = {
+            "second unobserved": [],
+            "second unparsable": [scrap_response(DAUM_PRIMARY, 500, "<html>error</html>")],
+            "second wrong status": [scrap_response(DAUM_PRIMARY, 200, '{"code": 40009}')],
+        }
+        for label, second in second_cases.items():
+            with self.subTest(case=label):
+                ns, _, _ = self.make_namespace()
+                page = FakePage([
+                    {"responses": [self.scrap_40009(DAUM_PRIMARY)], "status": not_found_status()},
+                    {"responses": list(second), "status": not_found_status()},
+                ])
+                with self.assertRaisesRegex(PublishAbort, "OG card render failed before publish"):
+                    self.render(ns, page, DAUM_PRIMARY, fallback_urls=[DAUM_NEXT])
+                self.assertEqual(page.enter_presses, 2, label)
+
+    def test_confirmed_40002_on_dcinside_still_pairs_and_never_uses_daum_candidates(self):
+        # Belt-and-braces: even if a community placeholder somehow carried
+        # candidates, confirmed-40002 keeps the strict DCInside pair.
+        ns, _, _ = self.make_namespace()
+        page = FakePage([
+            {"responses": [scrap_response(MOBILE_URL_2026_08_13)], "status": not_found_status()},
+            {"responses": [scrap_response(MOBILE_URL_2026_08_13)], "status": not_found_status()},
+            {"responses": [], "status": found_status()},
+        ])
+        result = self.render(ns, page, MOBILE_URL_2026_08_13, fallback_urls=[DAUM_NEXT])
+        self.assertEqual(result, DESKTOP_URL_2026_08_13)
+        self.assertEqual(
+            page.prepare_calls[-1],
+            ("retry", {"fromUrl": MOBILE_URL_2026_08_13, "toUrl": DESKTOP_URL_2026_08_13}),
+        )
+
+    def test_community_entry_without_candidates_keeps_current_behavior(self):
+        # Community OG placeholders never carry fallback candidates, so a
+        # confirmed 500/40009 on them stays a fail-closed abort.
+        ns, _, _ = self.make_namespace()
+        page = FakePage([
+            {"responses": [self.scrap_40009(MOBILE_URL_2026_08_13)], "status": not_found_status()},
+            {"responses": [self.scrap_40009(MOBILE_URL_2026_08_13)], "status": not_found_status()},
+        ])
+        with self.assertRaisesRegex(PublishAbort, "OG card render failed before publish"):
+            self.render(ns, page, MOBILE_URL_2026_08_13, fallback_urls=[])
+        self.assertEqual(page.enter_presses, 2)
+
+    # ── candidate-aware shared flow ─────────────────────────────────────────
+
+    def test_render_og_cards_threads_entry_candidates_and_keeps_count_gate(self):
+        ns, _, _ = self.make_namespace()
+        page = FakePage(
+            [
+                {"responses": [self.scrap_40009(DAUM_PRIMARY)], "status": not_found_status()},
+                {"responses": [self.scrap_40009(DAUM_PRIMARY)], "status": not_found_status()},
+                {"responses": [], "status": found_status()},
+            ],
+            cleanup_og_cards=1,
+        )
+        ns["render_og_cards"](
+            page,
+            [{"url": DAUM_PRIMARY, "fallbackUrls": [DAUM_NEXT]}],
+            "step5",
+        )
+        self.assertEqual(page.enter_presses, 3)
+        self.assertEqual(
+            page.prepare_calls[-1],
+            ("retry", {"fromUrl": DAUM_PRIMARY, "toUrl": DAUM_NEXT}),
+        )
+
+    def test_render_og_cards_count_gate_counts_entries_exactly(self):
+        ns, _, _ = self.make_namespace()
+        page = FakePage(
+            [{"responses": [], "status": found_status()}],
+            cleanup_og_cards=0,
+        )
+        with self.assertRaisesRegex(PublishAbort, "OG card count mismatch before publish: expected 1, got 0"):
+            ns["render_og_cards"](page, [{"url": DAUM_PRIMARY, "fallbackUrls": []}], "step5")
+
+    def test_render_og_cards_still_accepts_plain_url_strings(self):
+        ns, _, _ = self.make_namespace()
+        page = FakePage([
+            {"responses": [self.scrap_40009(DAUM_PRIMARY)], "status": not_found_status()},
+            {"responses": [self.scrap_40009(DAUM_PRIMARY)], "status": not_found_status()},
+        ])
+        with self.assertRaisesRegex(PublishAbort, "OG card render failed before publish"):
+            ns["render_og_cards"](page, [DAUM_PRIMARY], "step5")
+        self.assertEqual(page.enter_presses, 2)
 
 
 class FakeOS:

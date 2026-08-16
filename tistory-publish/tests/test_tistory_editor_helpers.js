@@ -29,7 +29,7 @@ function loadHelpers() {
   };
   vm.createContext(sandbox);
   vm.runInContext(
-    `${source}\nthis.__helpers = { applyImageCaption, buildBlogHTML, dcinsidePairedOGUrl, ensureIntroArticleSeparator, getOGCardStatus, imagePresentationOptions, prepareOGRetry };`,
+    `${source}\nthis.__helpers = { applyImageCaption, buildBlogHTML, dcinsidePairedOGUrl, ensureIntroArticleSeparator, getOGCardStatus, getOGPlaceholderEntries, imagePresentationOptions, prepareOGRetry };`,
     sandbox,
     { filename: helperPath },
   );
@@ -195,6 +195,62 @@ function makeFigure() {
   ]) {
     assert.strictEqual(dcinsidePairedOGUrl(url), null, `expected null for ${url}`);
   }
+}
+
+{
+  // getOGPlaceholderEntries — per-placeholder URL + ordered Daum next-source
+  // fallback candidates (data-og-fallback-urls, whitespace-separated).
+  // Missing/blank attributes fail closed to empty candidate lists, and the
+  // placeholder order/count matches getOGPlaceholders.
+  const { __sandbox, getOGPlaceholderEntries } = loadHelpers();
+
+  // tinymce unavailable → empty list, no crash
+  assert.deepStrictEqual([...getOGPlaceholderEntries()], []);
+
+  const makePlaceholder = (url, fallbackAttr) => ({
+    getAttribute(name) {
+      if (name === 'data-og-placeholder') return url;
+      if (name === 'data-og-fallback-urls') return fallbackAttr;
+      return null;
+    },
+  });
+  __sandbox.tinymce = {
+    activeEditor: {
+      getBody() {
+        return {
+          querySelectorAll(selector) {
+            assert.strictEqual(selector, '[data-og-placeholder]');
+            return [
+              makePlaceholder(
+                'https://v.daum.net/v/20260816090000001',
+                '  https://v.daum.net/v/20260816090000002   https://v.daum.net/v/20260816090000003 ',
+              ),
+              makePlaceholder('https://theqoo.net/square/123', null),
+              makePlaceholder('https://v.daum.net/v/20260816090000004', ''),
+            ];
+          },
+        };
+      },
+    },
+  };
+
+  // vm realm의 Array라 spread로 host realm 배열로 정규화 후 비교
+  const entries = [...getOGPlaceholderEntries()].map(entry => ({
+    url: entry.url,
+    fallbackUrls: [...entry.fallbackUrls],
+  }));
+  assert.deepStrictEqual(entries, [
+    {
+      url: 'https://v.daum.net/v/20260816090000001',
+      fallbackUrls: [
+        'https://v.daum.net/v/20260816090000002',
+        'https://v.daum.net/v/20260816090000003',
+      ],
+    },
+    { url: 'https://theqoo.net/square/123', fallbackUrls: [] },
+    { url: 'https://v.daum.net/v/20260816090000004', fallbackUrls: [] },
+  ]);
+  delete __sandbox.tinymce;
 }
 
 {
