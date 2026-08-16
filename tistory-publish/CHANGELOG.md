@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- **확정 500/40009 Daum 다음 기사 폴백** (뉴스 OG 카드 지속 scrap 실패 대응)
+  - 뉴스 OG placeholder가 같은 트렌드 항목의 ordered 후보를 `data-og-fallback-urls`(공백 구분)로 실어 오면, 원본 1회 + 같은 URL 재시도 1회가 **둘 다 안전 연관된 HTTP 500 + payload `code=40009`로 확정**된 경우에만 첫 적격 v.daum.net 기사 후보를 정확히 1회 시도 (같은 URL 재시도 없음, 2차 후보 없음)
+  - 후보 적격성은 보수적 v.daum.net 기사 계약(`/v/<id>`, query/fragment 금지)으로 재검증 — 검색 페이지·다른 Daum 서비스·커뮤니티 URL·외부 언론사·현재 URL·중복은 제외. 후보가 없으면 기존 fail-closed abort 유지
+  - generic `found=false`, timeout, 미관측/미파싱 응답, 500 아닌 상태, 40009 아닌 코드(40002 포함), 1회 확정+1회 불명은 Daum 폴백 금지. **확정 40002 DCInside 짝 폴백은 그대로이며 Daum이나 다른 호스트로 넓히지 않음**
+  - JS helper에 `getOGPlaceholderEntries()` 추가 — placeholder별 URL + 후보 목록 반환 (속성 없음/파싱 불가 시 빈 후보로 fail-closed). Step 5와 unexpected-navigation 복구 경로는 같은 candidate-aware `render_og_cards()`와 같은 per-placeholder 후보를 공유
+  - regression 테스트 추가: URL 계약/후보 선택/entries 정규화, 확정 500/40009 폴백 성공·실패·후보 없음, 미확정 변형 비폴백, DCInside 40002 불변, count 게이트
 - **daum-trends 대표이미지를 만화가 아닌 primary keyword 본문 첨부로 결정적으로 선택**
   - `setRepresentImageFromEditor(options)`에 `targetFilename` 지원 추가 — `data-filename`/`src` 매칭으로 대상 이미지를 선택하고, 대상이 없으면 클릭 없이 실패 반환 (첫 이미지 fallback 금지). `tistory-editor-helpers.js`/`tistory-publish.js` 양쪽 동기화
   - `publish-post.sh` Step 6: `--template daum-trends`는 inline 이미지 중 첫 non-comic(`00-comic.*` 제외) 파일을 대표이미지 대상으로 결정하고, 대상 미해결·선택 실패 시 발행을 중단 (만화가 대표이미지로 silent 선택되는 것 방지). 다른 템플릿은 기존 첫 이미지 동작 유지

@@ -479,6 +479,27 @@ function getOGPlaceholders() {
 }
 
 /**
+ * getOGPlaceholderEntries() — placeholder별 URL과, 같은 트렌드 항목이 실어 온
+ * Daum 다음 기사 폴백 후보 목록(data-og-fallback-urls, 공백 구분)을 함께 반환.
+ * 속성이 없거나 파싱할 수 없으면 빈 후보로 fail-closed.
+ * (tistory-editor-helpers.js와 동기화 유지)
+ */
+function getOGPlaceholderEntries() {
+  const editor = tinymce.activeEditor;
+  const placeholders = editor.getBody().querySelectorAll('[data-og-placeholder]');
+  return Array.from(placeholders).map(el => {
+    let fallbackUrls = [];
+    try {
+      const raw = el.getAttribute('data-og-fallback-urls') || '';
+      fallbackUrls = raw.split(/\s+/).filter(Boolean);
+    } catch (e) {
+      fallbackUrls = [];
+    }
+    return { url: el.getAttribute('data-og-placeholder'), fallbackUrls };
+  });
+}
+
+/**
  * 특정 placeholder를 찾아서 커서를 거기로 이동시킨 뒤 OG 카드 삽입
  * @param {string} url - 기사 URL (data-og-placeholder 값과 매칭)
  */

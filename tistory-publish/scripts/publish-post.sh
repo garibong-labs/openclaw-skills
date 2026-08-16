@@ -289,6 +289,13 @@ def run_og_gate(mode, *args):
 # 1회 재시도하고, 두 시도 모두 payload code=40002로 확정된 경우에만 엄격한
 # DCInside 모바일/데스크톱 짝 URL을 정확히 1회 시도한다. scrap 응답을 안전하게
 # 연관/파싱하지 못하면 기존 fail-closed 동작을 유지한다.
+#
+# 2026-08-16 추가: Daum 뉴스 카드의 지속 실패(HTTP 500 + payload code=40009)
+# 전용 다음 기사 폴백. placeholder가 실어 온 같은 트렌드 항목의 ordered
+# 후보(data-og-fallback-urls) 중 첫 적격 v.daum.net 기사 URL을, 두 시도 모두
+# 500/40009로 확정된 경우에만 정확히 1회 시도한다. 후보가 없거나 그 1회가
+# 실패하면 기존 fail-closed abort를 유지한다. 확정 40002 DCInside 짝 폴백은
+# 그대로이며 Daum이나 다른 호스트로 넓히지 않는다.
 
 def dcinside_paired_og_url(url):
     """Strict DCInside mobile<->desktop post-URL pair; None for anything else.
@@ -384,6 +391,80 @@ def summarize_scrap_responses(responses):
     return summary
 
 
+def daum_article_og_url(url):
+    """Conservative Daum news-article URL, mirroring the daum-trends research
+    source contract: http/https, host exactly v.daum.net, path /v/<id>, no
+    query/fragment. Search pages, other Daum services, community URLs, and
+    external publishers are never eligible. Returns the stripped verbatim
+    URL, or None (fail-closed)."""
+    text = str(url or '').strip()
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return None
+    if parts.scheme not in ('http', 'https'):
+        return None
+    if parts.netloc.lower() != 'v.daum.net':
+        return None
+    if parts.query or parts.fragment:
+        return None
+    if not re.fullmatch(r'/v/[A-Za-z0-9]+/?', parts.path):
+        return None
+    return text
+
+
+def daum_article_dedup_key(url):
+    try:
+        parts = urlsplit(str(url or '').strip())
+    except ValueError:
+        return ''
+    return parts.netloc.lower() + parts.path.rstrip('/')
+
+
+def select_daum_fallback_url(current_url, candidate_urls):
+    """First eligible distinct Daum article among this placeholder's own
+    ordered candidates. Skips the current URL, exact/normalized duplicates,
+    malformed values, and non-Daum URLs; None when nothing is eligible."""
+    if not isinstance(candidate_urls, (list, tuple)):
+        return None
+    current_key = daum_article_dedup_key(current_url)
+    for candidate in candidate_urls:
+        if not isinstance(candidate, str):
+            continue
+        eligible = daum_article_og_url(candidate)
+        if eligible is None:
+            continue
+        if daum_article_dedup_key(eligible) == current_key:
+            continue
+        return eligible
+    return None
+
+
+def normalize_og_entries(raw_entries):
+    """Fail-closed placeholder entries for render_og_cards: each entry keeps
+    its placeholder URL (even when unusable, so the mandatory-card gate still
+    fails on it) while malformed candidate lists collapse to []."""
+    entries = []
+    for raw in (raw_entries if isinstance(raw_entries, list) else []):
+        if isinstance(raw, dict):
+            url = raw.get('url')
+            fallback_urls = raw.get('fallbackUrls')
+        else:
+            url = raw
+            fallback_urls = []
+        if not isinstance(url, str):
+            url = ''
+        if not isinstance(fallback_urls, list):
+            fallback_urls = []
+        entries.append({
+            'url': url,
+            'fallbackUrls': [c for c in fallback_urls if isinstance(c, str)],
+        })
+    return entries
+
+
 def og_backoff_delay_s(attempt):
     base = float(os.environ.get('TISTORY_OG_RETRY_BACKOFF_BASE_S', '2'))
     cap = float(os.environ.get('TISTORY_OG_RETRY_BACKOFF_MAX_S', '8'))
@@ -450,7 +531,7 @@ def attempt_og_render(page, target_url, min_card_count):
     }
 
 
-def render_og_card_with_fallback(page, url, index, phase):
+def render_og_card_with_fallback(page, url, index, phase, fallback_urls=None):
     prefix = '' if phase == 'step5' else f'{phase} '
     attempts = []
 
@@ -511,22 +592,59 @@ def render_og_card_with_fallback(page, url, index, phase):
         if outcome['found']:
             return paired_url
 
+    # Daum 다음 기사 폴백: 두 시도 모두 HTTP 500 + payload code=40009로 확정된
+    # 경우에만, 이 placeholder에 딸린 같은 트렌드 항목의 ordered 후보에서 첫
+    # 적격 v.daum.net 기사 URL을 정확히 1회 시도한다 (같은 URL 재시도 없음,
+    # 2차 후보 없음). generic found=false, timeout, 미관측/미파싱 응답,
+    # 500 아닌 상태, 40009 아닌 코드, 1회 확정+1회 불명은 폴백 금지.
+    both_confirmed_500_40009 = len(attempts) == 2 and all(
+        attempt.get('scrapObserved')
+        and attempt.get('scrapStatus') == 500
+        and attempt.get('scrapCode') == '40009'
+        for attempt in attempts
+    )
+    if both_confirmed_500_40009:
+        next_daum_url = select_daum_fallback_url(url, fallback_urls)
+        if next_daum_url:
+            log(f"  - {prefix}OG [{url[:40]}...] scrap 500/code=40009 confirmed twice; trying next Daum source once: {next_daum_url}")
+            time.sleep(og_backoff_delay_s(2))
+            prep_result = page.evaluate(
+                "({fromUrl, toUrl}) => typeof prepareOGRetry === 'function' ? prepareOGRetry(fromUrl, toUrl) : {success: false, error: 'prepareOGRetry unavailable'}",
+                {'fromUrl': url, 'toUrl': next_daum_url},
+            )
+            if isinstance(prep_result, dict) and not prep_result.get('success', False):
+                fail(f"{prefix}OG next-source-fallback preparation failed before publish: {json.dumps(prep_result, ensure_ascii=False)}")
+            outcome = attempt_og_render(page, next_daum_url, index)
+            attempts.append(describe(next_daum_url, 'daum-next-source-fallback', outcome))
+            log(f"  - {prefix}OG [{url[:40]}...] next-source fallback: {json.dumps(attempts[-1], ensure_ascii=False)}")
+            if outcome['found']:
+                return next_daum_url
+        else:
+            log(f"  - {prefix}OG [{url[:40]}...] scrap 500/code=40009 confirmed twice but no eligible next Daum candidate; failing closed")
+
     fail(f"{prefix}OG card render failed before publish: {json.dumps({'url': url, 'attempts': attempts}, ensure_ascii=False)}")
 
 
-def render_og_cards(page, og_urls, phase):
+def render_og_cards(page, og_entries, phase):
     """Shared OG-card flow for Step 5 and the unexpected-navigation recovery
-    path so the two cannot drift."""
-    if not og_urls:
+    path so the two cannot drift. Entries carry each placeholder's own ordered
+    Daum fallback candidates; plain URL strings mean no candidates."""
+    if not og_entries:
         return
     prefix = '' if phase == 'step5' else f'{phase} '
     ensure_og_helpers(page)
-    for index, url in enumerate(og_urls, start=1):
-        render_og_card_with_fallback(page, url, index, phase)
+    for index, entry in enumerate(og_entries, start=1):
+        if isinstance(entry, dict):
+            url = entry.get('url') or ''
+            fallback_urls = entry.get('fallbackUrls') or []
+        else:
+            url = entry
+            fallback_urls = []
+        render_og_card_with_fallback(page, url, index, phase, fallback_urls)
     cleanup_result = page.evaluate("typeof cleanupOGResiduals === 'function' ? cleanupOGResiduals() : null")
     log(f"  - {prefix}OG cleanup result: {cleanup_result}")
-    if isinstance(cleanup_result, dict) and cleanup_result.get('ogCards') != len(og_urls):
-        fail(f"{prefix}OG card count mismatch before publish: expected {len(og_urls)}, got {cleanup_result.get('ogCards')}")
+    if isinstance(cleanup_result, dict) and cleanup_result.get('ogCards') != len(og_entries):
+        fail(f"{prefix}OG card count mismatch before publish: expected {len(og_entries)}, got {cleanup_result.get('ogCards')}")
 
 
 def write_debug_artifacts(page, prefix):
@@ -1679,9 +1797,15 @@ with sync_playwright() as p:
 
     # ── Step 5: OG 카드 ──
     log("Step 5: OG 카드")
-    og_urls = page.evaluate("typeof getOGPlaceholders === 'function' ? getOGPlaceholders() : []")
-    log(f"  - OG URLs: {len(og_urls)}")
-    render_og_cards(page, og_urls, 'step5')
+    # placeholder별 Daum 다음 기사 폴백 후보까지 함께 수집한다. 구버전 helper가
+    # entries 함수를 못 주면 후보 없는 기존 동작으로 fail-closed 축소된다.
+    og_entries = normalize_og_entries(page.evaluate(
+        "typeof getOGPlaceholderEntries === 'function'"
+        " ? getOGPlaceholderEntries()"
+        " : (typeof getOGPlaceholders === 'function' ? getOGPlaceholders() : [])"
+    ))
+    log(f"  - OG URLs: {len(og_entries)}")
+    render_og_cards(page, og_entries, 'step5')
     log("Step 5: 완료")
 
     # ── Step 6: 대표이미지 ──
@@ -1772,9 +1896,10 @@ with sync_playwright() as p:
             tinymce.activeEditor.save();
         }}""", body_html)
         time.sleep(1)
-        # 복구 경로도 Step 5와 동일한 render_og_cards 헬퍼를 사용한다 (드리프트 금지).
+        # 복구 경로도 Step 5와 동일한 candidate-aware render_og_cards 헬퍼와
+        # 같은 per-placeholder 후보를 사용한다 (드리프트 금지).
         # goto로 helper JS가 사라졌을 수 있으므로 헬퍼가 재주입을 보장한다.
-        render_og_cards(page, og_urls, 'recovery')
+        render_og_cards(page, og_entries, 'recovery')
 
     log("Step 7.5: 중복 제목 preflight")
     assert_no_duplicate_title_before_publish(ctx0, final_title)
@@ -2050,7 +2175,7 @@ with sync_playwright() as p:
             log(f"  - public post url: {post_info['publicUrl']}")
 
     # ── Step 10: 발행 후 cleanup 재진입 ──
-    if post_info and og_urls:
+    if post_info and og_entries:
         log("Step 10: 발행 후 cleanup 재진입")
         edit_url = f"https://{BLOG}/manage/newpost/{post_info['id']}?type=post&returnURL=/manage/posts/"
         page.goto(edit_url, wait_until="domcontentloaded", timeout=30000)

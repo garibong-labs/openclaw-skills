@@ -493,6 +493,31 @@ function getOGPlaceholders() {
 }
 
 /**
+ * getOGPlaceholderEntries() — placeholder별 URL과, 같은 트렌드 항목이 실어 온
+ * Daum 다음 기사 폴백 후보 목록을 함께 반환.
+ *
+ * data-og-fallback-urls는 공백 구분 URL 목록이며 뉴스 placeholder에만 붙는다
+ * (커뮤니티 placeholder는 항상 빈 후보). 속성이 없거나 파싱할 수 없으면 빈
+ * 후보로 fail-closed — 후보 적격성 판정은 publish 엔진(v.daum.net 기사 계약)
+ * 이 다시 수행한다.
+ */
+function getOGPlaceholderEntries() {
+  const editor = getSafeTinyEditor();
+  if (!editor || !editor.getBody) return [];
+  const placeholders = editor.getBody().querySelectorAll('[data-og-placeholder]');
+  return Array.from(placeholders).map(el => {
+    let fallbackUrls = [];
+    try {
+      const raw = el.getAttribute('data-og-fallback-urls') || '';
+      fallbackUrls = raw.split(/\s+/).filter(Boolean);
+    } catch (e) {
+      fallbackUrls = [];
+    }
+    return { url: el.getAttribute('data-og-placeholder'), fallbackUrls };
+  });
+}
+
+/**
  * 특정 placeholder를 찾아서 커서를 거기로 이동시킨 뒤 OG 카드 삽입
  * @param {string} url - 기사 URL (data-og-placeholder 값과 매칭)
  */
