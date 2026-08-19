@@ -61,6 +61,9 @@ const MAX_INSPECTION_DEPTH = 12;
 const MAX_COLLECTION_ITEMS = 256;
 const MAX_INSPECTION_NODES = 4096;
 const MAX_INSPECTED_STRING_BYTES = 65536;
+const MAX_ENV_CONTRACT_ITEMS = 32;
+const MAX_ENV_NAME_LENGTH = 64;
+const PORTABLE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const EXECUTION_CONTRACT = [
   "",
@@ -137,6 +140,53 @@ function preparePrivateStateDirectory(directory) {
   }
 }
 
+function parseEnvContractList(value, code) {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value) || value.length > MAX_ENV_CONTRACT_ITEMS) {
+    fail(code);
+  }
+  const names = [];
+  const identities = new Set();
+  for (const name of value) {
+    if (
+      typeof name !== "string" ||
+      name.length === 0 ||
+      name.length > MAX_ENV_NAME_LENGTH ||
+      !PORTABLE_ENV_NAME.test(name)
+    ) {
+      fail(code + "_name");
+    }
+    // Windows process.env is case-insensitive, so name identity is
+    // case-insensitive on every platform to keep contracts portable.
+    const identity = name.toUpperCase();
+    if (identities.has(identity)) {
+      fail(code + "_duplicate");
+    }
+    identities.add(identity);
+    names.push(name);
+  }
+  return names;
+}
+
+export function runEnvironmentPreflight(config, env) {
+  for (const name of config.requiredEnv || []) {
+    const value = env[name];
+    if (typeof value !== "string" || value.length === 0) {
+      fail(
+        (typeof value === "string" ? "required_env_empty:" : "required_env_missing:") + name
+      );
+    }
+  }
+  for (const name of config.forbiddenEnv || []) {
+    const value = env[name];
+    if (typeof value === "string" && value.length > 0) {
+      fail("forbidden_env_present:" + name);
+    }
+  }
+}
+
 export function loadSupervisorConfig(configPath) {
   const absoluteConfigPath = resolveAbsolute(configPath, "invalid_config_path");
   assertPrivateFile(absoluteConfigPath, "invalid_config_file");
@@ -178,6 +228,15 @@ export function loadSupervisorConfig(configPath) {
     fail("invalid_progress_ms");
   }
 
+  const requiredEnv = parseEnvContractList(raw.requiredEnv, "invalid_required_env");
+  const forbiddenEnv = parseEnvContractList(raw.forbiddenEnv, "invalid_forbidden_env");
+  const requiredEnvIdentities = new Set(requiredEnv.map((name) => name.toUpperCase()));
+  for (const name of forbiddenEnv) {
+    if (requiredEnvIdentities.has(name.toUpperCase())) {
+      fail("invalid_env_contract_overlap");
+    }
+  }
+
   if (!Array.isArray(raw.allowKinds) || raw.allowKinds.length === 0) {
     fail("invalid_allow_kinds");
   }
@@ -200,6 +259,8 @@ export function loadSupervisorConfig(configPath) {
     timeoutMs,
     progressMs,
     allowKinds,
+    requiredEnv,
+    forbiddenEnv,
     maxResponseBytes: raw.maxResponseBytes === undefined
       ? 1024 * 1024
       : assertPositiveInteger(raw.maxResponseBytes, "invalid_max_response_bytes"),
@@ -845,6 +906,7 @@ export async function runSupervisor(config, dependencies = {}) {
       );
 
   try {
+    runEnvironmentPreflight(config, dependencies.env || process.env);
     preparePrivateStateDirectory(config.stateDir);
     if (fs.existsSync(config.responseFile)) {
       fail("response_file_exists");

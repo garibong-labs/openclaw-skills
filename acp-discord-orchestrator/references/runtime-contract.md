@@ -8,6 +8,7 @@ This reference defines the compatibility and evidence boundary for the direct AC
 - [Compatibility targets](#compatibility-targets)
 - [Private input and output](#private-input-and-output)
 - [Config fields](#config-fields)
+- [Environment preflight](#environment-preflight)
 - [Permission decisions](#permission-decisions)
 - [Event identity](#event-identity)
 - [Evidence boundary](#evidence-boundary)
@@ -67,6 +68,16 @@ Optional:
 - `model`: explicit ACP model
 - `progressMs`: progress snapshot interval; zero disables snapshots
 - `maxResponseBytes`: bounded response capture size
+- `requiredEnv`: environment-variable names that must be present and non-empty in the supervisor's own environment
+- `forbiddenEnv`: environment-variable names that must be absent or empty in the supervisor's own environment
+
+## Environment preflight
+
+`requiredEnv` and `forbiddenEnv` declare a generic caller-side environment contract. Each list is optional and bounded to 32 portable environment-variable names of at most 64 characters each, matching `[A-Za-z_][A-Za-z0-9_]*`. Contract-name identity is case-insensitive on every platform: Windows `process.env` lookups ignore case, so a case-conditional rule would make the same config mean different things per platform. Names that differ only by case are duplicates within a list, and required/forbidden overlap is judged case-insensitively. The caller's original spelling is preserved for environment lookup and for the sanitized failure codes. Shape violations are invalid config and keep the invalid-config exit mapping.
+
+Before dynamic runtime import, runtime probing, `createAcpRuntime`, or any adapter startup, the supervisor fails closed when a required variable is absent or empty, or when a forbidden variable is non-empty. The stable failure codes name only the caller-declared variable — `required_env_missing:NAME`, `required_env_empty:NAME`, `forbidden_env_present:NAME` — and map to the supervisor error exit. Environment values are never emitted, stored, hashed, or otherwise disclosed.
+
+The gate proves presence or absence only. It does not prove how a variable was injected, validate credential files, or select a credential source. Credential-specific policy — secure file validation, precedence, and exact launch construction such as `node --env-file=...` — remains the responsibility of local caller overlays that complement this generic contract.
 
 ## Permission decisions
 
@@ -116,7 +127,7 @@ Only the matching turn `result` determines terminal state. A successfully emitte
 - `0`: completed
 - `20`: cancelled
 - `21`: failed
-- `22`: supervisor policy, compatibility, deadline, runtime, storage, stream, cleanup, or delivery error
+- `22`: supervisor policy, environment preflight, compatibility, deadline, runtime, storage, stream, cleanup, or delivery error
 
 When the ACP result is exact but response storage, event draining, cleanup, or response completeness is degraded, preserve the exact ACP status in the terminal event, set `supervisorStatus: "degraded"`, and exit 22.
 - `64`: invalid CLI or config

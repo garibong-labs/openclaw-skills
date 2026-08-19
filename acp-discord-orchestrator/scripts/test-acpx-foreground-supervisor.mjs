@@ -12,6 +12,7 @@ import {
   containsDetachedShell,
   discoverRuntimeLocation,
   loadSupervisorConfig,
+  main,
   normalizeRuntimeEvent,
   runSupervisor,
   validateRuntimeModuleExports
@@ -608,6 +609,220 @@ test("config requires a timeout and rejects the unclassified other kind", () => 
     () => loadSupervisorConfig(otherKind),
     /invalid_allow_kind/
   );
+});
+
+test("environment contract config shape fails closed with exact codes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-env-config-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const base = {
+    agent: "claude",
+    model: "test-model",
+    cwd: root,
+    sessionKey: "test-session",
+    promptFile: prompt,
+    responseFile: path.join(root, "response.txt"),
+    stateDir: path.join(root, "state"),
+    runtimeModule: root,
+    timeoutMs: 30000,
+    allowKinds: ["read"]
+  };
+  const writeCase = (name, extra) => {
+    const file = path.join(root, name + ".json");
+    fs.writeFileSync(file, JSON.stringify({ ...base, ...extra }), { mode: 0o600 });
+    return file;
+  };
+
+  const invalid = [
+    ["req-string", { requiredEnv: "CLAUDE_CODE_OAUTH_TOKEN" }, "invalid_required_env"],
+    ["req-oversize", { requiredEnv: Array.from({ length: 33 }, (_, i) => "VAR_" + String(i)) }, "invalid_required_env"],
+    ["req-nonstring", { requiredEnv: [42] }, "invalid_required_env_name"],
+    ["req-empty-name", { requiredEnv: [""] }, "invalid_required_env_name"],
+    ["req-digit-start", { requiredEnv: ["1BAD"] }, "invalid_required_env_name"],
+    ["req-dash", { requiredEnv: ["BAD-NAME"] }, "invalid_required_env_name"],
+    ["req-equals", { requiredEnv: ["BAD=VALUE"] }, "invalid_required_env_name"],
+    ["req-long", { requiredEnv: ["A".repeat(65)] }, "invalid_required_env_name"],
+    ["req-duplicate", { requiredEnv: ["DUP_NAME", "DUP_NAME"] }, "invalid_required_env_duplicate"],
+    ["req-case-duplicate", { requiredEnv: ["Dup_Name", "DUP_NAME"] }, "invalid_required_env_duplicate"],
+    ["forb-object", { forbiddenEnv: { NAME: true } }, "invalid_forbidden_env"],
+    ["forb-bad-name", { forbiddenEnv: ["BAD NAME"] }, "invalid_forbidden_env_name"],
+    ["forb-duplicate", { forbiddenEnv: ["DUP_NAME", "DUP_NAME"] }, "invalid_forbidden_env_duplicate"],
+    ["forb-case-duplicate", { forbiddenEnv: ["dup_name", "DUP_NAME"] }, "invalid_forbidden_env_duplicate"],
+    ["overlap", {
+      requiredEnv: ["SHARED_NAME"],
+      forbiddenEnv: ["SHARED_NAME"]
+    }, "invalid_env_contract_overlap"],
+    ["case-overlap", {
+      requiredEnv: ["Shared_Name"],
+      forbiddenEnv: ["SHARED_NAME"]
+    }, "invalid_env_contract_overlap"]
+  ];
+  for (const [name, extra, expected] of invalid) {
+    assert.throws(
+      () => loadSupervisorConfig(writeCase(name, extra)),
+      { message: expected, code: expected },
+      name
+    );
+  }
+
+  const valid = loadSupervisorConfig(writeCase("valid", {
+    requiredEnv: ["A_REQUIRED_TOKEN", "_UNDERSCORE_OK", "Mixed_Case_Kept"],
+    forbiddenEnv: ["A_FORBIDDEN_TOKEN"]
+  }));
+  assert.deepEqual(valid.requiredEnv, ["A_REQUIRED_TOKEN", "_UNDERSCORE_OK", "Mixed_Case_Kept"]);
+  assert.deepEqual(valid.forbiddenEnv, ["A_FORBIDDEN_TOKEN"]);
+
+  const omitted = loadSupervisorConfig(writeCase("omitted", {
+    responseFile: path.join(root, "response-omitted.txt")
+  }));
+  assert.deepEqual(omitted.requiredEnv, []);
+  assert.deepEqual(omitted.forbiddenEnv, []);
+});
+
+test("invalid environment contract retains the invalid-config CLI mapping", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-env-cli-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const configFile = path.join(root, "run.json");
+  fs.writeFileSync(configFile, JSON.stringify({
+    agent: "claude",
+    cwd: root,
+    sessionKey: "test-session",
+    promptFile: prompt,
+    responseFile: path.join(root, "response.txt"),
+    stateDir: path.join(root, "state"),
+    runtimeModule: root,
+    timeoutMs: 30000,
+    allowKinds: ["read"],
+    requiredEnv: "CLAUDE_CODE_OAUTH_TOKEN"
+  }), { mode: 0o600 });
+
+  const writes = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    writes.push(String(chunk));
+    return true;
+  };
+  let exitCode;
+  try {
+    exitCode = await main(["--config", configFile]);
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(exitCode, EXIT_CODES.invalidConfig);
+  const emitted = JSON.parse(writes.join("").trim());
+  assert.equal(emitted.type, "supervisor_error");
+  assert.equal(emitted.code, "invalid_required_env");
+});
+
+test("satisfied environment contract reaches the runtime without value disclosure", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-env-ok-"));
+  const { module, state } = makeRuntimeModule();
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(root, {
+    requiredEnv: ["ACP_TEST_REQUIRED_TOKEN"],
+    forbiddenEnv: ["ACP_TEST_FORBIDDEN_TOKEN"]
+  }), {
+    runtimeModule: module,
+    bindSignals: false,
+    env: {
+      ACP_TEST_REQUIRED_TOKEN: "REQUIRED_SECRET_VALUE",
+      ACP_TEST_FORBIDDEN_TOKEN: ""
+    },
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.completed);
+  assert.ok(state.runtimeOptions);
+  assert.equal(emitted.at(-1).type, "terminal");
+  assert.equal(JSON.stringify(emitted).includes("REQUIRED_SECRET_VALUE"), false);
+});
+
+test("missing and empty required variables fail closed before adapter creation", async () => {
+  for (const [env, code] of [
+    [{}, "required_env_missing:ACP_TEST_REQUIRED_TOKEN"],
+    [{ ACP_TEST_REQUIRED_TOKEN: "" }, "required_env_empty:ACP_TEST_REQUIRED_TOKEN"]
+  ]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-env-required-"));
+    const { module, state } = makeRuntimeModule();
+    const emitted = [];
+    const exitCode = await runSupervisor(makeConfig(root, {
+      requiredEnv: ["ACP_TEST_REQUIRED_TOKEN"]
+    }), {
+      runtimeModule: module,
+      bindSignals: false,
+      env,
+      writeEvent(event) {
+        emitted.push(event);
+      }
+    });
+    assert.equal(exitCode, EXIT_CODES.supervisorError);
+    assert.equal(emitted.at(-1).type, "supervisor_error");
+    assert.equal(emitted.at(-1).code, code);
+    assert.equal(state.runtimeOptions, undefined);
+    assert.equal(state.ensureInput, undefined);
+  }
+});
+
+test("non-empty forbidden variable fails closed without value disclosure", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-env-forbidden-"));
+  const { module, state } = makeRuntimeModule();
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(root, {
+    forbiddenEnv: ["ACP_TEST_FORBIDDEN_TOKEN"]
+  }), {
+    runtimeModule: module,
+    bindSignals: false,
+    env: { ACP_TEST_FORBIDDEN_TOKEN: "FORBIDDEN_SECRET_VALUE" },
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  assert.equal(emitted.at(-1).type, "supervisor_error");
+  assert.equal(emitted.at(-1).code, "forbidden_env_present:ACP_TEST_FORBIDDEN_TOKEN");
+  assert.equal(state.runtimeOptions, undefined);
+  assert.equal(JSON.stringify(emitted).includes("FORBIDDEN_SECRET_VALUE"), false);
+});
+
+test("failed environment preflight precedes dynamic runtime loading and probing", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-env-order-"));
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(root, {
+    requiredEnv: ["ACP_TEST_REQUIRED_TOKEN"],
+    runtimeModule: path.join(root, "missing-runtime")
+  }), {
+    bindSignals: false,
+    env: {},
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  assert.equal(emitted.at(-1).type, "supervisor_error");
+  assert.equal(emitted.at(-1).code, "required_env_missing:ACP_TEST_REQUIRED_TOKEN");
+});
+
+test("public docs and template describe the generic environment preflight", () => {
+  const skill = fs.readFileSync(new URL("../SKILL.md", import.meta.url), "utf8");
+  const contract = fs.readFileSync(
+    new URL("../references/runtime-contract.md", import.meta.url),
+    "utf8"
+  );
+  const template = JSON.parse(fs.readFileSync(
+    new URL("../templates/supervisor-config.json", import.meta.url),
+    "utf8"
+  ));
+
+  assert.match(contract, /^## Environment preflight$/m);
+  for (const doc of [skill, contract]) {
+    assert.match(doc, /requiredEnv/);
+    assert.match(doc, /forbiddenEnv/);
+    assert.match(doc, /does not prove how a variable was injected/);
+  }
+  assert.deepEqual(template.requiredEnv, []);
+  assert.deepEqual(template.forbiddenEnv, []);
 });
 
 test("template ships the two-hour emergency timeout ceiling", () => {
