@@ -10,6 +10,8 @@
   "timeoutMs": 7200000,
   "progressMs": 600000,
   "maxResponseBytes": 1048576,
+  "requiredEnv": [],
+  "forbiddenEnv": [],
   "allowKinds": [
     "read",
     "search",

@@ -28,8 +28,9 @@ This policy does not globally disable human-operated OpenClaw ACP commands.
 4. Create a private prompt file and choose a new response-file path.
 5. Set the config file and prompt file to owner-only permissions.
 6. Set an explicit working directory, ACP agent, model, unique session key, timeout, progress interval, and allowed tool kinds. The template's two-hour `timeoutMs` is an emergency ceiling independent of reporting cadence; set it per run.
-7. Define terminal acceptance checks in the prompt.
-8. Resolve this skill's directory and run the supervisor by absolute path in the foreground:
+7. Optionally declare the run's environment contract with `requiredEnv` and `forbiddenEnv`. The supervisor fails closed before runtime loading, probing, or adapter startup when a required variable is absent or empty or a forbidden variable is non-empty, and it never discloses environment values. This generic gate complements credential-specific caller overlays; it does not prove how a variable was injected or validate credential sources.
+8. Define terminal acceptance checks in the prompt.
+9. Resolve this skill's directory and run the supervisor by absolute path in the foreground:
 
 ```bash
 node /absolute/path/to/acp-discord-orchestrator/scripts/acpx-foreground-supervisor.mjs --config /absolute/private/run.json
@@ -95,4 +96,4 @@ Keep personal channel IDs, operator identity, watchdog language and cadence, mod
 
 ## Fail closed
 
-Stop without fallback when runtime discovery, capability checks, permission inspection, event/result identity, response storage, or terminal mapping is uncertain. Do not recover by creating an official ACP thread or launching untracked ACPX.
+Stop without fallback when environment preflight, runtime discovery, capability checks, permission inspection, event/result identity, response storage, or terminal mapping is uncertain. Do not recover by creating an official ACP thread or launching untracked ACPX.
