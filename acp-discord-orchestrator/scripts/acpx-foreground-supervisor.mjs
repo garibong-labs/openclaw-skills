@@ -64,6 +64,20 @@ const MAX_INSPECTED_STRING_BYTES = 65536;
 const MAX_ENV_CONTRACT_ITEMS = 32;
 const MAX_ENV_NAME_LENGTH = 64;
 const PORTABLE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const DISCORD_ID = /^[0-9]{1,32}$/;
+const MAX_DELIVERED_AT_LENGTH = 40;
+// Discord serializes message timestamps with microsecond precision and a
+// numeric offset, for example 2026-08-22T07:47:48.530000+00:00, so the
+// fractional part is bounded at six digits rather than three. The explicit
+// zone suffix stays mandatory: a local time without one is ambiguous.
+const ISO_INSTANT =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/;
+const DEFAULT_MAX_START_RECEIPT_AGE_MS = 300000;
+const MIN_MAX_START_RECEIPT_AGE_MS = 1000;
+const MAX_MAX_START_RECEIPT_AGE_MS = 3600000;
+// Delivery timestamps come from a remote chat clock, so a bounded forward
+// skew keeps an honest receipt usable without widening the freshness window.
+const START_RECEIPT_FUTURE_SKEW_MS = 1000;
 
 const EXECUTION_CONTRACT = [
   "",
@@ -170,6 +184,118 @@ function parseEnvContractList(value, code) {
   return names;
 }
 
+function isDiscordId(value) {
+  return typeof value === "string" && DISCORD_ID.test(value);
+}
+
+function isBoundedStartReceiptAge(value) {
+  return (
+    Number.isSafeInteger(value) &&
+    value >= MIN_MAX_START_RECEIPT_AGE_MS &&
+    value <= MAX_MAX_START_RECEIPT_AGE_MS
+  );
+}
+
+function assertDiscordId(value, code) {
+  if (!isDiscordId(value)) {
+    fail(code);
+  }
+  return value;
+}
+
+function parseDeliveredAt(value, code) {
+  if (
+    typeof value !== "string" ||
+    value.length > MAX_DELIVERED_AT_LENGTH ||
+    !ISO_INSTANT.test(value)
+  ) {
+    fail(code);
+  }
+  const deliveredAtMs = Date.parse(value);
+  if (!Number.isSafeInteger(deliveredAtMs)) {
+    fail(code);
+  }
+  return deliveredAtMs;
+}
+
+function parseLifecycleContract(value) {
+  if (!isPlainObject(value)) {
+    fail("invalid_lifecycle");
+  }
+  if (!isPlainObject(value.startReceipt)) {
+    fail("invalid_start_receipt");
+  }
+
+  const controlConversationId = assertDiscordId(
+    value.controlConversationId,
+    "invalid_control_conversation_id"
+  );
+  const conversationId = assertDiscordId(
+    value.startReceipt.conversationId,
+    "invalid_start_receipt_conversation_id"
+  );
+  const messageId = assertDiscordId(
+    value.startReceipt.messageId,
+    "invalid_start_receipt_message_id"
+  );
+  if (conversationId !== controlConversationId) {
+    fail("invalid_start_receipt_conversation_mismatch");
+  }
+
+  const maxStartReceiptAgeMs = value.maxStartReceiptAgeMs === undefined
+    ? DEFAULT_MAX_START_RECEIPT_AGE_MS
+    : value.maxStartReceiptAgeMs;
+  if (!isBoundedStartReceiptAge(maxStartReceiptAgeMs)) {
+    fail("invalid_max_start_receipt_age_ms");
+  }
+
+  return {
+    controlConversationId,
+    maxStartReceiptAgeMs,
+    startReceipt: {
+      conversationId,
+      messageId,
+      deliveredAtMs: parseDeliveredAt(
+        value.startReceipt.deliveredAt,
+        "invalid_start_receipt_delivered_at"
+      )
+    }
+  };
+}
+
+// Caller-attested metadata only: the supervisor holds no Discord credentials
+// and makes no network call, so it cannot read the announced message itself.
+// This is the backstop for configs built in memory rather than loaded from
+// disk, so it re-asserts the parsed shape instead of trusting or coercing it:
+// a numeric identifier is not the same value as its decimal spelling, and an
+// out-of-range freshness window would silently reopen the documented bound.
+export function runStartReceiptPreflight(config, nowMs) {
+  const lifecycle = config.lifecycle;
+  const receipt = lifecycle && lifecycle.startReceipt;
+  if (
+    !isPlainObject(lifecycle) ||
+    !isPlainObject(receipt) ||
+    !isDiscordId(lifecycle.controlConversationId) ||
+    !isDiscordId(receipt.conversationId) ||
+    !isDiscordId(receipt.messageId) ||
+    !Number.isSafeInteger(receipt.deliveredAtMs) ||
+    !isBoundedStartReceiptAge(lifecycle.maxStartReceiptAgeMs)
+  ) {
+    fail("start_receipt_missing");
+  }
+  if (receipt.conversationId !== lifecycle.controlConversationId) {
+    fail("start_receipt_conversation_mismatch");
+  }
+
+  const ageMs = nowMs - receipt.deliveredAtMs;
+  if (ageMs < -START_RECEIPT_FUTURE_SKEW_MS) {
+    fail("start_receipt_future");
+  }
+  if (ageMs > lifecycle.maxStartReceiptAgeMs) {
+    fail("start_receipt_stale");
+  }
+}
+
 export function runEnvironmentPreflight(config, env) {
   for (const name of config.requiredEnv || []) {
     const value = env[name];
@@ -237,6 +363,8 @@ export function loadSupervisorConfig(configPath) {
     }
   }
 
+  const lifecycle = parseLifecycleContract(raw.lifecycle);
+
   if (!Array.isArray(raw.allowKinds) || raw.allowKinds.length === 0) {
     fail("invalid_allow_kinds");
   }
@@ -259,6 +387,7 @@ export function loadSupervisorConfig(configPath) {
     timeoutMs,
     progressMs,
     allowKinds,
+    lifecycle,
     requiredEnv,
     forbiddenEnv,
     maxResponseBytes: raw.maxResponseBytes === undefined
@@ -906,6 +1035,7 @@ export async function runSupervisor(config, dependencies = {}) {
       );
 
   try {
+    runStartReceiptPreflight(config, now());
     runEnvironmentPreflight(config, dependencies.env || process.env);
     preparePrivateStateDirectory(config.stateDir);
     if (fs.existsSync(config.responseFile)) {

@@ -8,6 +8,7 @@ This reference defines the compatibility and evidence boundary for the direct AC
 - [Compatibility targets](#compatibility-targets)
 - [Private input and output](#private-input-and-output)
 - [Config fields](#config-fields)
+- [Start-receipt gate](#start-receipt-gate)
 - [Environment preflight](#environment-preflight)
 - [Permission decisions](#permission-decisions)
 - [Event identity](#event-identity)
@@ -62,14 +63,34 @@ Required:
 - `runtimeModule`: absolute ACPX package root or runtime module file
 - `allowKinds`: non-empty tool-kind allowlist that excludes the unclassified `other` kind
 - `timeoutMs`: positive turn deadline independent of watchdog cadence; the template ships a two-hour emergency ceiling, configurable per run
+- `lifecycle`: start-receipt contract binding the run to the control conversation
+  - `lifecycle.controlConversationId`: control conversation identifier
+  - `lifecycle.startReceipt.conversationId`: conversation the start message was delivered to
+  - `lifecycle.startReceipt.messageId`: delivered start-message identifier
+  - `lifecycle.startReceipt.deliveredAt`: caller-observed delivery instant
 
 Optional:
 
 - `model`: explicit ACP model
+- `lifecycle.maxStartReceiptAgeMs`: receipt freshness window; defaults to `300000` and is bounded to `1000`–`3600000`
 - `progressMs`: progress snapshot interval; zero disables snapshots
 - `maxResponseBytes`: bounded response capture size
 - `requiredEnv`: environment-variable names that must be present and non-empty in the supervisor's own environment
 - `forbiddenEnv`: environment-variable names that must be absent or empty in the supervisor's own environment
+
+## Start-receipt gate
+
+`lifecycle` is required. It states that the caller already announced this run in the control conversation and supplies the delivery receipt for that announcement.
+
+Identifiers are bounded decimal chat identifier strings of 1 to 32 digits; a JSON number is not a decimal spelling and is rejected rather than coerced. `deliveredAt` is a bounded ISO-8601 instant carrying at most six fractional-second digits and an explicit `Z` or numeric offset, so Discord's native `2026-08-22T07:47:48.530000+00:00` form is accepted as written; a local time without an offset is ambiguous and rejected, and a longer fraction is out of bounds. `lifecycle.startReceipt.conversationId` must equal `lifecycle.controlConversationId`, so a receipt earned in another conversation cannot start this run.
+
+Shape violations are invalid config and keep the invalid-config exit mapping: `invalid_lifecycle`, `invalid_start_receipt`, `invalid_control_conversation_id`, `invalid_start_receipt_conversation_id`, `invalid_start_receipt_message_id`, `invalid_start_receipt_conversation_mismatch`, `invalid_start_receipt_delivered_at`, and `invalid_max_start_receipt_age_ms`.
+
+Freshness depends on the clock rather than on the config text, so it is evaluated at run time before dynamic runtime import, runtime probing, `createAcpRuntime`, or any adapter startup. A receipt more than one second ahead of the supervisor clock fails with `start_receipt_future`; a receipt older than `lifecycle.maxStartReceiptAgeMs` fails with `start_receipt_stale`. The one-second forward allowance absorbs remote chat-clock skew and does not widen the freshness window. A config object that reaches `runSupervisor` without a bound, parsed receipt fails with `start_receipt_missing` or `start_receipt_conversation_mismatch`. That run-time check is a real backstop for configs assembled in memory instead of loaded from disk: it re-asserts string identifiers and the `1000`–`3600000` freshness bound rather than trusting or coercing them, so a numeric identifier or an out-of-range window fails with `start_receipt_missing`. These codes map to the supervisor error exit.
+
+The gate validates caller-attested receipt metadata only. The supervisor holds no chat credentials and makes no network call, so it cannot prove that the message exists, that its text matches, that the caller authored it, or that the identifiers were not replayed from an earlier run within the freshness window. It proves that the caller committed to a specific, recent, same-conversation start message before the turn began.
+
+The control conversation ID and the start message ID are never emitted in normalized events, stored in the response file, or hashed into any event field.
 
 ## Environment preflight
 
@@ -169,6 +190,7 @@ This contract does not:
 
 - globally disable OpenClaw ACP commands;
 - provide an operating-system sandbox;
+- read, authenticate, or otherwise confirm a chat message from the supervisor process;
 - guarantee containment of arbitrary foreground code that daemonizes internally;
 - define a personal watchdog interval, language, destination, or message template;
 - define host-specific stale-session detection or recovery;
