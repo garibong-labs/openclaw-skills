@@ -66,8 +66,12 @@ const MAX_ENV_NAME_LENGTH = 64;
 const PORTABLE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DISCORD_ID = /^[0-9]{1,32}$/;
 const MAX_DELIVERED_AT_LENGTH = 40;
+// Discord serializes message timestamps with microsecond precision and a
+// numeric offset, for example 2026-08-22T07:47:48.530000+00:00, so the
+// fractional part is bounded at six digits rather than three. The explicit
+// zone suffix stays mandatory: a local time without one is ambiguous.
 const ISO_INSTANT =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/;
 const DEFAULT_MAX_START_RECEIPT_AGE_MS = 300000;
 const MIN_MAX_START_RECEIPT_AGE_MS = 1000;
 const MAX_MAX_START_RECEIPT_AGE_MS = 3600000;
@@ -180,8 +184,20 @@ function parseEnvContractList(value, code) {
   return names;
 }
 
+function isDiscordId(value) {
+  return typeof value === "string" && DISCORD_ID.test(value);
+}
+
+function isBoundedStartReceiptAge(value) {
+  return (
+    Number.isSafeInteger(value) &&
+    value >= MIN_MAX_START_RECEIPT_AGE_MS &&
+    value <= MAX_MAX_START_RECEIPT_AGE_MS
+  );
+}
+
 function assertDiscordId(value, code) {
-  if (typeof value !== "string" || !DISCORD_ID.test(value)) {
+  if (!isDiscordId(value)) {
     fail(code);
   }
   return value;
@@ -228,14 +244,8 @@ function parseLifecycleContract(value) {
 
   const maxStartReceiptAgeMs = value.maxStartReceiptAgeMs === undefined
     ? DEFAULT_MAX_START_RECEIPT_AGE_MS
-    : assertPositiveInteger(
-        value.maxStartReceiptAgeMs,
-        "invalid_max_start_receipt_age_ms"
-      );
-  if (
-    maxStartReceiptAgeMs < MIN_MAX_START_RECEIPT_AGE_MS ||
-    maxStartReceiptAgeMs > MAX_MAX_START_RECEIPT_AGE_MS
-  ) {
+    : value.maxStartReceiptAgeMs;
+  if (!isBoundedStartReceiptAge(maxStartReceiptAgeMs)) {
     fail("invalid_max_start_receipt_age_ms");
   }
 
@@ -255,17 +265,21 @@ function parseLifecycleContract(value) {
 
 // Caller-attested metadata only: the supervisor holds no Discord credentials
 // and makes no network call, so it cannot read the announced message itself.
+// This is the backstop for configs built in memory rather than loaded from
+// disk, so it re-asserts the parsed shape instead of trusting or coercing it:
+// a numeric identifier is not the same value as its decimal spelling, and an
+// out-of-range freshness window would silently reopen the documented bound.
 export function runStartReceiptPreflight(config, nowMs) {
   const lifecycle = config.lifecycle;
   const receipt = lifecycle && lifecycle.startReceipt;
   if (
     !isPlainObject(lifecycle) ||
     !isPlainObject(receipt) ||
-    !DISCORD_ID.test(String(lifecycle.controlConversationId)) ||
-    !DISCORD_ID.test(String(receipt.conversationId)) ||
-    !DISCORD_ID.test(String(receipt.messageId)) ||
+    !isDiscordId(lifecycle.controlConversationId) ||
+    !isDiscordId(receipt.conversationId) ||
+    !isDiscordId(receipt.messageId) ||
     !Number.isSafeInteger(receipt.deliveredAtMs) ||
-    !Number.isSafeInteger(lifecycle.maxStartReceiptAgeMs)
+    !isBoundedStartReceiptAge(lifecycle.maxStartReceiptAgeMs)
   ) {
     fail("start_receipt_missing");
   }

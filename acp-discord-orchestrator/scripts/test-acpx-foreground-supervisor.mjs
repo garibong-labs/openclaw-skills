@@ -881,6 +881,7 @@ test("start-receipt config shape fails closed with exact codes", () => {
     ["delivered-no-offset", rawLifecycle({}, { deliveredAt: "2026-08-22T10:00:00" }), "invalid_start_receipt_delivered_at"],
     ["delivered-epoch", rawLifecycle({}, { deliveredAt: 1700000000000 }), "invalid_start_receipt_delivered_at"],
     ["delivered-impossible", rawLifecycle({}, { deliveredAt: "2026-13-45T99:99:99Z" }), "invalid_start_receipt_delivered_at"],
+    ["delivered-fraction-too-long", rawLifecycle({}, { deliveredAt: "2026-08-22T07:47:48.5300001+00:00" }), "invalid_start_receipt_delivered_at"],
     ["age-zero", rawLifecycle({ maxStartReceiptAgeMs: 0 }), "invalid_max_start_receipt_age_ms"],
     ["age-below-floor", rawLifecycle({ maxStartReceiptAgeMs: 999 }), "invalid_max_start_receipt_age_ms"],
     ["age-above-ceiling", rawLifecycle({ maxStartReceiptAgeMs: 3600001 }), "invalid_max_start_receipt_age_ms"],
@@ -916,6 +917,71 @@ test("start-receipt config shape fails closed with exact codes", () => {
     offset.lifecycle.startReceipt.deliveredAtMs,
     Date.parse("2026-08-22T09:30:00.000Z")
   );
+});
+
+test("delivered-at accepts Discord's native instant within a bounded fraction", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-receipt-instant-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const stateDir = path.join(root, "state");
+  const responseFile = path.join(root, "response.txt");
+  const writeCase = (name, deliveredAt) => {
+    const file = path.join(root, name + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent: "claude",
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile,
+      stateDir,
+      runtimeModule: root,
+      timeoutMs: 30000,
+      allowKinds: ["read"],
+      lifecycle: rawLifecycle({}, { deliveredAt })
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  // Discord serializes message timestamps with six fractional digits and a
+  // numeric offset, so that exact wire form must load without rewriting.
+  const accepted = [
+    ["discord-native", "2026-08-22T07:47:48.530000+00:00"],
+    ["discord-native-zulu", "2026-08-22T07:47:48.530000Z"],
+    ["discord-native-offset", "2026-08-22T16:47:48.530000+09:00"],
+    ["millisecond", "2026-08-22T07:47:48.530Z"],
+    ["single-digit-fraction", "2026-08-22T07:47:48.5Z"],
+    ["no-fraction", "2026-08-22T07:47:48Z"]
+  ];
+  for (const [name, deliveredAt] of accepted) {
+    const config = loadSupervisorConfig(writeCase(name, deliveredAt));
+    assert.equal(
+      config.lifecycle.startReceipt.deliveredAtMs,
+      Date.parse(deliveredAt),
+      name
+    );
+  }
+
+  // The fraction stays bounded and the explicit zone stays mandatory.
+  const rejected = [
+    ["seven-digit-fraction", "2026-08-22T07:47:48.5300001+00:00"],
+    ["unbounded-fraction", "2026-08-22T07:47:48." + "5".repeat(64) + "Z"],
+    ["empty-fraction", "2026-08-22T07:47:48.+00:00"],
+    ["no-zone", "2026-08-22T07:47:48.530000"],
+    ["offset-without-colon", "2026-08-22T07:47:48.530000+0000"],
+    ["lowercase-zulu", "2026-08-22T07:47:48.530000z"],
+    ["spaced-offset", "2026-08-22T07:47:48.530000 +00:00"]
+  ];
+  for (const [name, deliveredAt] of rejected) {
+    assert.throws(
+      () => loadSupervisorConfig(writeCase(name, deliveredAt)),
+      { message: "invalid_start_receipt_delivered_at", code: "invalid_start_receipt_delivered_at" },
+      name
+    );
+  }
+
+  // Config parsing precedes every side effect, so nothing was created.
+  assert.equal(fs.existsSync(stateDir), false);
+  assert.equal(fs.existsSync(responseFile), false);
 });
 
 test("invalid start receipt retains the invalid-config CLI mapping", async () => {
@@ -992,6 +1058,52 @@ test("start-receipt freshness boundaries are exact", () => {
   );
 });
 
+test("direct preflight re-asserts the documented freshness window bounds", () => {
+  const deliveredAtMs = Date.parse("2026-08-22T09:30:00.000Z");
+  const withAge = (maxStartReceiptAgeMs) => ({
+    lifecycle: parsedLifecycle({ maxStartReceiptAgeMs }, { deliveredAtMs })
+  });
+
+  runStartReceiptPreflight(withAge(1000), deliveredAtMs + 1000);
+  runStartReceiptPreflight(withAge(3600000), deliveredAtMs + 3600000);
+  for (const outOfRange of [0, 999, 3600001, 86400000, 60000.5]) {
+    assert.throws(
+      () => runStartReceiptPreflight(withAge(outOfRange), deliveredAtMs),
+      { code: "start_receipt_missing" },
+      String(outOfRange)
+    );
+  }
+});
+
+test("direct preflight rejects numeric identifiers without coercion", () => {
+  const deliveredAtMs = Date.parse("2026-08-22T09:30:00.000Z");
+  const numericControl = Number(CONTROL_CONVERSATION_ID);
+  const cases = [
+    ["control", parsedLifecycle({ controlConversationId: numericControl }, { deliveredAtMs })],
+    ["conversation", parsedLifecycle({}, { conversationId: numericControl, deliveredAtMs })],
+    ["message", parsedLifecycle({}, { messageId: Number(START_MESSAGE_ID), deliveredAtMs })],
+    [
+      "self-consistent-numbers",
+      parsedLifecycle(
+        { controlConversationId: numericControl },
+        {
+          conversationId: numericControl,
+          messageId: Number(START_MESSAGE_ID),
+          deliveredAtMs
+        }
+      )
+    ]
+  ];
+
+  for (const [name, lifecycle] of cases) {
+    assert.throws(
+      () => runStartReceiptPreflight({ lifecycle }, deliveredAtMs),
+      { code: "start_receipt_missing" },
+      name
+    );
+  }
+});
+
 test("rejected start receipts fail closed before runtime loading and probing", async () => {
   const deliveredAtMs = Date.parse("2026-08-22T09:30:00.000Z");
   const cases = [
@@ -1020,6 +1132,44 @@ test("rejected start receipts fail closed before runtime loading and probing", a
       parsedLifecycle({ maxStartReceiptAgeMs: 60000 }, { deliveredAtMs }),
       deliveredAtMs + 60001,
       "start_receipt_stale"
+    ],
+    // A JSON number is not a decimal identifier spelling. Coercing it would
+    // let a hand-built config satisfy both the digit shape and the
+    // same-conversation comparison without ever holding a chat identifier.
+    [
+      "numeric-message-id",
+      parsedLifecycle({}, { messageId: Number(START_MESSAGE_ID), deliveredAtMs }),
+      deliveredAtMs,
+      "start_receipt_missing"
+    ],
+    [
+      "numeric-conversation-ids",
+      parsedLifecycle(
+        { controlConversationId: Number(CONTROL_CONVERSATION_ID) },
+        { conversationId: Number(CONTROL_CONVERSATION_ID), deliveredAtMs }
+      ),
+      deliveredAtMs,
+      "start_receipt_missing"
+    ],
+    // The documented 1000-3600000 freshness window is re-asserted here, not
+    // only at config load, so an in-memory config cannot widen or collapse it.
+    [
+      "age-below-floor",
+      parsedLifecycle({ maxStartReceiptAgeMs: 999 }, { deliveredAtMs }),
+      deliveredAtMs,
+      "start_receipt_missing"
+    ],
+    [
+      "age-above-ceiling",
+      parsedLifecycle({ maxStartReceiptAgeMs: 86400000 }, { deliveredAtMs }),
+      deliveredAtMs + 3600001,
+      "start_receipt_missing"
+    ],
+    [
+      "age-fractional",
+      parsedLifecycle({ maxStartReceiptAgeMs: 60000.5 }, { deliveredAtMs }),
+      deliveredAtMs,
+      "start_receipt_missing"
     ]
   ];
 
