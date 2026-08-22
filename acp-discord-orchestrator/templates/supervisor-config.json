@@ -10,6 +10,15 @@
   "timeoutMs": 7200000,
   "progressMs": 600000,
   "maxResponseBytes": 1048576,
+  "lifecycle": {
+    "controlConversationId": "CONTROL_CONVERSATION_ID",
+    "maxStartReceiptAgeMs": 300000,
+    "startReceipt": {
+      "conversationId": "CONTROL_CONVERSATION_ID",
+      "messageId": "START_MESSAGE_ID",
+      "deliveredAt": "START_MESSAGE_DELIVERED_AT_ISO_8601"
+    }
+  },
   "requiredEnv": [],
   "forbiddenEnv": [],
   "allowKinds": [

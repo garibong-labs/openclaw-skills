@@ -49,6 +49,15 @@ export function createAcpRuntime() {
     stateDir,
     timeoutMs: 1000,
     progressMs: 0,
+    lifecycle: {
+      controlConversationId: "100000000000000001",
+      maxStartReceiptAgeMs: 60000,
+      startReceipt: {
+        conversationId: "100000000000000001",
+        messageId: "100000000000000002",
+        deliveredAt: new Date().toISOString()
+      }
+    },
     allowKinds: ["read"],
     runtimeModule: runtimeFile
   }), { mode: 0o600 });

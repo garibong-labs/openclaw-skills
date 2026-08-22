@@ -64,6 +64,16 @@ const MAX_INSPECTED_STRING_BYTES = 65536;
 const MAX_ENV_CONTRACT_ITEMS = 32;
 const MAX_ENV_NAME_LENGTH = 64;
 const PORTABLE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const DISCORD_ID = /^[0-9]{1,32}$/;
+const MAX_DELIVERED_AT_LENGTH = 40;
+const ISO_INSTANT =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+const DEFAULT_MAX_START_RECEIPT_AGE_MS = 300000;
+const MIN_MAX_START_RECEIPT_AGE_MS = 1000;
+const MAX_MAX_START_RECEIPT_AGE_MS = 3600000;
+// Delivery timestamps come from a remote chat clock, so a bounded forward
+// skew keeps an honest receipt usable without widening the freshness window.
+const START_RECEIPT_FUTURE_SKEW_MS = 1000;
 
 const EXECUTION_CONTRACT = [
   "",
@@ -170,6 +180,108 @@ function parseEnvContractList(value, code) {
   return names;
 }
 
+function assertDiscordId(value, code) {
+  if (typeof value !== "string" || !DISCORD_ID.test(value)) {
+    fail(code);
+  }
+  return value;
+}
+
+function parseDeliveredAt(value, code) {
+  if (
+    typeof value !== "string" ||
+    value.length > MAX_DELIVERED_AT_LENGTH ||
+    !ISO_INSTANT.test(value)
+  ) {
+    fail(code);
+  }
+  const deliveredAtMs = Date.parse(value);
+  if (!Number.isSafeInteger(deliveredAtMs)) {
+    fail(code);
+  }
+  return deliveredAtMs;
+}
+
+function parseLifecycleContract(value) {
+  if (!isPlainObject(value)) {
+    fail("invalid_lifecycle");
+  }
+  if (!isPlainObject(value.startReceipt)) {
+    fail("invalid_start_receipt");
+  }
+
+  const controlConversationId = assertDiscordId(
+    value.controlConversationId,
+    "invalid_control_conversation_id"
+  );
+  const conversationId = assertDiscordId(
+    value.startReceipt.conversationId,
+    "invalid_start_receipt_conversation_id"
+  );
+  const messageId = assertDiscordId(
+    value.startReceipt.messageId,
+    "invalid_start_receipt_message_id"
+  );
+  if (conversationId !== controlConversationId) {
+    fail("invalid_start_receipt_conversation_mismatch");
+  }
+
+  const maxStartReceiptAgeMs = value.maxStartReceiptAgeMs === undefined
+    ? DEFAULT_MAX_START_RECEIPT_AGE_MS
+    : assertPositiveInteger(
+        value.maxStartReceiptAgeMs,
+        "invalid_max_start_receipt_age_ms"
+      );
+  if (
+    maxStartReceiptAgeMs < MIN_MAX_START_RECEIPT_AGE_MS ||
+    maxStartReceiptAgeMs > MAX_MAX_START_RECEIPT_AGE_MS
+  ) {
+    fail("invalid_max_start_receipt_age_ms");
+  }
+
+  return {
+    controlConversationId,
+    maxStartReceiptAgeMs,
+    startReceipt: {
+      conversationId,
+      messageId,
+      deliveredAtMs: parseDeliveredAt(
+        value.startReceipt.deliveredAt,
+        "invalid_start_receipt_delivered_at"
+      )
+    }
+  };
+}
+
+// Caller-attested metadata only: the supervisor holds no Discord credentials
+// and makes no network call, so it cannot read the announced message itself.
+export function runStartReceiptPreflight(config, nowMs) {
+  const lifecycle = config.lifecycle;
+  const receipt = lifecycle && lifecycle.startReceipt;
+  if (
+    !isPlainObject(lifecycle) ||
+    !isPlainObject(receipt) ||
+    !DISCORD_ID.test(String(lifecycle.controlConversationId)) ||
+    !DISCORD_ID.test(String(receipt.conversationId)) ||
+    !DISCORD_ID.test(String(receipt.messageId)) ||
+    !Number.isSafeInteger(receipt.deliveredAtMs) ||
+    !Number.isSafeInteger(lifecycle.maxStartReceiptAgeMs)
+  ) {
+    fail("start_receipt_missing");
+  }
+  if (receipt.conversationId !== lifecycle.controlConversationId) {
+    fail("start_receipt_conversation_mismatch");
+  }
+
+  const ageMs = nowMs - receipt.deliveredAtMs;
+  if (ageMs < -START_RECEIPT_FUTURE_SKEW_MS) {
+    fail("start_receipt_future");
+  }
+  if (ageMs > lifecycle.maxStartReceiptAgeMs) {
+    fail("start_receipt_stale");
+  }
+}
+
 export function runEnvironmentPreflight(config, env) {
   for (const name of config.requiredEnv || []) {
     const value = env[name];
@@ -237,6 +349,8 @@ export function loadSupervisorConfig(configPath) {
     }
   }
 
+  const lifecycle = parseLifecycleContract(raw.lifecycle);
+
   if (!Array.isArray(raw.allowKinds) || raw.allowKinds.length === 0) {
     fail("invalid_allow_kinds");
   }
@@ -259,6 +373,7 @@ export function loadSupervisorConfig(configPath) {
     timeoutMs,
     progressMs,
     allowKinds,
+    lifecycle,
     requiredEnv,
     forbiddenEnv,
     maxResponseBytes: raw.maxResponseBytes === undefined
@@ -906,6 +1021,7 @@ export async function runSupervisor(config, dependencies = {}) {
       );
 
   try {
+    runStartReceiptPreflight(config, now());
     runEnvironmentPreflight(config, dependencies.env || process.env);
     preparePrivateStateDirectory(config.stateDir);
     if (fs.existsSync(config.responseFile)) {

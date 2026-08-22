@@ -14,9 +14,41 @@ import {
   loadSupervisorConfig,
   main,
   normalizeRuntimeEvent,
+  runStartReceiptPreflight,
   runSupervisor,
   validateRuntimeModuleExports
 } from "./acpx-foreground-supervisor.mjs";
+
+const CONTROL_CONVERSATION_ID = "100000000000000001";
+const START_MESSAGE_ID = "100000000000000002";
+
+function rawLifecycle(overrides = {}, receiptOverrides = {}) {
+  return {
+    controlConversationId: CONTROL_CONVERSATION_ID,
+    maxStartReceiptAgeMs: 300000,
+    startReceipt: {
+      conversationId: CONTROL_CONVERSATION_ID,
+      messageId: START_MESSAGE_ID,
+      deliveredAt: new Date().toISOString(),
+      ...receiptOverrides
+    },
+    ...overrides
+  };
+}
+
+function parsedLifecycle(overrides = {}, receiptOverrides = {}) {
+  return {
+    controlConversationId: CONTROL_CONVERSATION_ID,
+    maxStartReceiptAgeMs: 300000,
+    startReceipt: {
+      conversationId: CONTROL_CONVERSATION_ID,
+      messageId: START_MESSAGE_ID,
+      deliveredAtMs: Date.now(),
+      ...receiptOverrides
+    },
+    ...overrides
+  };
+}
 
 function deferred() {
   let resolve;
@@ -40,6 +72,7 @@ function makeConfig(root, overrides = {}) {
     timeoutMs: 30000,
     progressMs: 0,
     allowKinds: new Set(["read", "search", "think", "edit", "execute"]),
+    lifecycle: parsedLifecycle(),
     maxResponseBytes: 1024 * 1024,
     runtimeModule: root,
     ...overrides
@@ -589,6 +622,7 @@ test("config requires a timeout and rejects the unclassified other kind", () => 
     responseFile: path.join(root, "response.txt"),
     stateDir: path.join(root, "state"),
     runtimeModule: root,
+    lifecycle: rawLifecycle(),
     allowKinds: ["read"]
   };
 
@@ -625,6 +659,7 @@ test("environment contract config shape fails closed with exact codes", () => {
     stateDir: path.join(root, "state"),
     runtimeModule: root,
     timeoutMs: 30000,
+    lifecycle: rawLifecycle(),
     allowKinds: ["read"]
   };
   const writeCase = (name, extra) => {
@@ -693,6 +728,7 @@ test("invalid environment contract retains the invalid-config CLI mapping", asyn
     stateDir: path.join(root, "state"),
     runtimeModule: root,
     timeoutMs: 30000,
+    lifecycle: rawLifecycle(),
     allowKinds: ["read"],
     requiredEnv: "CLAUDE_CODE_OAUTH_TOKEN"
   }), { mode: 0o600 });
@@ -802,6 +838,263 @@ test("failed environment preflight precedes dynamic runtime loading and probing"
   assert.equal(exitCode, EXIT_CODES.supervisorError);
   assert.equal(emitted.at(-1).type, "supervisor_error");
   assert.equal(emitted.at(-1).code, "required_env_missing:ACP_TEST_REQUIRED_TOKEN");
+});
+
+test("start-receipt config shape fails closed with exact codes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-receipt-config-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const base = {
+    agent: "claude",
+    model: "test-model",
+    cwd: root,
+    sessionKey: "test-session",
+    promptFile: prompt,
+    responseFile: path.join(root, "response.txt"),
+    stateDir: path.join(root, "state"),
+    runtimeModule: root,
+    timeoutMs: 30000,
+    allowKinds: ["read"]
+  };
+  const writeCase = (name, lifecycle) => {
+    const file = path.join(root, name + ".json");
+    fs.writeFileSync(file, JSON.stringify({ ...base, lifecycle }), { mode: 0o600 });
+    return file;
+  };
+
+  const invalid = [
+    ["absent", undefined, "invalid_lifecycle"],
+    ["string", "start-receipt", "invalid_lifecycle"],
+    ["array", [], "invalid_lifecycle"],
+    ["receipt-absent", rawLifecycle({ startReceipt: undefined }), "invalid_start_receipt"],
+    ["receipt-array", rawLifecycle({ startReceipt: [] }), "invalid_start_receipt"],
+    ["control-absent", rawLifecycle({ controlConversationId: undefined }), "invalid_control_conversation_id"],
+    ["control-empty", rawLifecycle({ controlConversationId: "" }), "invalid_control_conversation_id"],
+    ["control-nonnumeric", rawLifecycle({ controlConversationId: "channel-one" }), "invalid_control_conversation_id"],
+    ["control-long", rawLifecycle({ controlConversationId: "1".repeat(33) }), "invalid_control_conversation_id"],
+    ["receipt-conversation-spaced", rawLifecycle({}, { conversationId: "1 2" }), "invalid_start_receipt_conversation_id"],
+    ["message-nonnumeric", rawLifecycle({}, { messageId: "msg_1" }), "invalid_start_receipt_message_id"],
+    ["message-number", rawLifecycle({}, { messageId: 100000000000000002 }), "invalid_start_receipt_message_id"],
+    ["mismatch", rawLifecycle({}, { conversationId: "100000000000000009" }), "invalid_start_receipt_conversation_mismatch"],
+    ["delivered-absent", rawLifecycle({}, { deliveredAt: undefined }), "invalid_start_receipt_delivered_at"],
+    ["delivered-prose", rawLifecycle({}, { deliveredAt: "yesterday" }), "invalid_start_receipt_delivered_at"],
+    ["delivered-no-offset", rawLifecycle({}, { deliveredAt: "2026-08-22T10:00:00" }), "invalid_start_receipt_delivered_at"],
+    ["delivered-epoch", rawLifecycle({}, { deliveredAt: 1700000000000 }), "invalid_start_receipt_delivered_at"],
+    ["delivered-impossible", rawLifecycle({}, { deliveredAt: "2026-13-45T99:99:99Z" }), "invalid_start_receipt_delivered_at"],
+    ["age-zero", rawLifecycle({ maxStartReceiptAgeMs: 0 }), "invalid_max_start_receipt_age_ms"],
+    ["age-below-floor", rawLifecycle({ maxStartReceiptAgeMs: 999 }), "invalid_max_start_receipt_age_ms"],
+    ["age-above-ceiling", rawLifecycle({ maxStartReceiptAgeMs: 3600001 }), "invalid_max_start_receipt_age_ms"],
+    ["age-fractional", rawLifecycle({ maxStartReceiptAgeMs: 1000.5 }), "invalid_max_start_receipt_age_ms"]
+  ];
+  for (const [name, lifecycle, expected] of invalid) {
+    assert.throws(
+      () => loadSupervisorConfig(writeCase(name, lifecycle)),
+      { message: expected, code: expected },
+      name
+    );
+  }
+
+  const valid = loadSupervisorConfig(writeCase("valid", rawLifecycle(
+    { maxStartReceiptAgeMs: undefined },
+    { deliveredAt: "2026-08-22T09:30:00.000Z" }
+  )));
+  assert.deepEqual(valid.lifecycle, {
+    controlConversationId: CONTROL_CONVERSATION_ID,
+    maxStartReceiptAgeMs: 300000,
+    startReceipt: {
+      conversationId: CONTROL_CONVERSATION_ID,
+      messageId: START_MESSAGE_ID,
+      deliveredAtMs: Date.parse("2026-08-22T09:30:00.000Z")
+    }
+  });
+
+  const offset = loadSupervisorConfig(writeCase("offset", rawLifecycle(
+    {},
+    { deliveredAt: "2026-08-22T18:30:00+09:00" }
+  )));
+  assert.equal(
+    offset.lifecycle.startReceipt.deliveredAtMs,
+    Date.parse("2026-08-22T09:30:00.000Z")
+  );
+});
+
+test("invalid start receipt retains the invalid-config CLI mapping", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-receipt-cli-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const configFile = path.join(root, "run.json");
+  fs.writeFileSync(configFile, JSON.stringify({
+    agent: "claude",
+    cwd: root,
+    sessionKey: "test-session",
+    promptFile: prompt,
+    responseFile: path.join(root, "response.txt"),
+    stateDir: path.join(root, "state"),
+    runtimeModule: root,
+    timeoutMs: 30000,
+    lifecycle: rawLifecycle({}, { conversationId: "100000000000000009" }),
+    allowKinds: ["read"]
+  }), { mode: 0o600 });
+
+  const writes = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    writes.push(String(chunk));
+    return true;
+  };
+  let exitCode;
+  try {
+    exitCode = await main(["--config", configFile]);
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(exitCode, EXIT_CODES.invalidConfig);
+  const emitted = JSON.parse(writes.join("").trim());
+  assert.equal(emitted.type, "supervisor_error");
+  assert.equal(emitted.code, "invalid_start_receipt_conversation_mismatch");
+  assert.equal(fs.existsSync(path.join(root, "state")), false);
+});
+
+test("fresh same-conversation start receipt reaches the runtime", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-receipt-fresh-"));
+  const deliveredAtMs = Date.parse("2026-08-22T09:30:00.000Z");
+  const { module, state } = makeRuntimeModule();
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(root, {
+    lifecycle: parsedLifecycle({ maxStartReceiptAgeMs: 60000 }, { deliveredAtMs })
+  }), {
+    runtimeModule: module,
+    bindSignals: false,
+    now: () => deliveredAtMs + 60000,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.completed);
+  assert.ok(state.runtimeOptions);
+  assert.equal(emitted.at(-1).type, "terminal");
+  assert.equal(emitted.at(-1).status, "completed");
+});
+
+test("start-receipt freshness boundaries are exact", () => {
+  const deliveredAtMs = Date.parse("2026-08-22T09:30:00.000Z");
+  const config = { lifecycle: parsedLifecycle({ maxStartReceiptAgeMs: 60000 }, { deliveredAtMs }) };
+
+  runStartReceiptPreflight(config, deliveredAtMs + 60000);
+  runStartReceiptPreflight(config, deliveredAtMs - 1000);
+  assert.throws(
+    () => runStartReceiptPreflight(config, deliveredAtMs + 60001),
+    { code: "start_receipt_stale" }
+  );
+  assert.throws(
+    () => runStartReceiptPreflight(config, deliveredAtMs - 1001),
+    { code: "start_receipt_future" }
+  );
+});
+
+test("rejected start receipts fail closed before runtime loading and probing", async () => {
+  const deliveredAtMs = Date.parse("2026-08-22T09:30:00.000Z");
+  const cases = [
+    ["absent", undefined, deliveredAtMs, "start_receipt_missing"],
+    ["receipt-absent", parsedLifecycle({ startReceipt: undefined }), deliveredAtMs, "start_receipt_missing"],
+    [
+      "unparsed-delivery",
+      parsedLifecycle({}, { deliveredAtMs: "2026-08-22T09:30:00.000Z" }),
+      deliveredAtMs,
+      "start_receipt_missing"
+    ],
+    [
+      "mismatch",
+      parsedLifecycle({}, { conversationId: "100000000000000009", deliveredAtMs }),
+      deliveredAtMs,
+      "start_receipt_conversation_mismatch"
+    ],
+    [
+      "future",
+      parsedLifecycle({}, { deliveredAtMs }),
+      deliveredAtMs - 1001,
+      "start_receipt_future"
+    ],
+    [
+      "stale",
+      parsedLifecycle({ maxStartReceiptAgeMs: 60000 }, { deliveredAtMs }),
+      deliveredAtMs + 60001,
+      "start_receipt_stale"
+    ]
+  ];
+
+  for (const [name, lifecycle, nowMs, expected] of cases) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-receipt-reject-"));
+    const config = makeConfig(root, {
+      lifecycle,
+      runtimeModule: path.join(root, "missing-runtime")
+    });
+    const emitted = [];
+    const exitCode = await runSupervisor(config, {
+      bindSignals: false,
+      now: () => nowMs,
+      writeEvent(event) {
+        emitted.push(event);
+      }
+    });
+    assert.equal(exitCode, EXIT_CODES.supervisorError, name);
+    assert.equal(emitted.at(-1).type, "supervisor_error", name);
+    assert.equal(emitted.at(-1).code, expected, name);
+    assert.equal(fs.existsSync(config.stateDir), false, name);
+    assert.equal(fs.existsSync(config.responseFile), false, name);
+  }
+});
+
+test("start-receipt identifiers stay out of normalized output", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-receipt-quiet-"));
+  const { module } = makeRuntimeModule({
+    events: [{ type: "text_delta", stream: "output", text: "bounded result" }]
+  });
+  const config = makeConfig(root);
+  const emitted = [];
+  assert.equal(await runSupervisor(config, {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  }), EXIT_CODES.completed);
+
+  const serialized = JSON.stringify(emitted);
+  assert.equal(serialized.includes(CONTROL_CONVERSATION_ID), false);
+  assert.equal(serialized.includes(START_MESSAGE_ID), false);
+  assert.equal(
+    fs.readFileSync(config.responseFile, "utf8").includes(START_MESSAGE_ID),
+    false
+  );
+});
+
+test("public docs and template describe the start-receipt gate", () => {
+  const skill = fs.readFileSync(new URL("../SKILL.md", import.meta.url), "utf8");
+  const contract = fs.readFileSync(
+    new URL("../references/runtime-contract.md", import.meta.url),
+    "utf8"
+  );
+  const template = JSON.parse(fs.readFileSync(
+    new URL("../templates/supervisor-config.json", import.meta.url),
+    "utf8"
+  ));
+
+  assert.match(contract, /^## Start-receipt gate$/m);
+  for (const doc of [skill, contract]) {
+    assert.match(doc, /controlConversationId/);
+    assert.match(doc, /startReceipt/);
+    assert.match(doc, /caller-attested receipt metadata/);
+  }
+
+  assert.equal(
+    template.lifecycle.startReceipt.conversationId,
+    template.lifecycle.controlConversationId
+  );
+  assert.equal(template.lifecycle.maxStartReceiptAgeMs, 300000);
+  assert.equal(typeof template.lifecycle.startReceipt.messageId, "string");
+  assert.equal(typeof template.lifecycle.startReceipt.deliveredAt, "string");
+  assert.doesNotMatch(skill + contract + JSON.stringify(template), /\b\d{15,}\b/);
 });
 
 test("public docs and template describe the generic environment preflight", () => {

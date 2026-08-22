@@ -28,9 +28,10 @@ This policy does not globally disable human-operated OpenClaw ACP commands.
 4. Create a private prompt file and choose a new response-file path.
 5. Set the config file and prompt file to owner-only permissions.
 6. Set an explicit working directory, ACP agent, model, unique session key, timeout, progress interval, and allowed tool kinds. The template's two-hour `timeoutMs` is an emergency ceiling independent of reporting cadence; set it per run.
-7. Optionally declare the run's environment contract with `requiredEnv` and `forbiddenEnv`. The supervisor fails closed before runtime loading, probing, or adapter startup when a required variable is absent or empty or a forbidden variable is non-empty, and it never discloses environment values. This generic gate complements credential-specific caller overlays; it does not prove how a variable was injected or validate credential sources.
-8. Define terminal acceptance checks in the prompt.
-9. Resolve this skill's directory and run the supervisor by absolute path in the foreground:
+7. Announce the run in the current control conversation first, then record that delivery in the required `lifecycle` block: `controlConversationId`, the same conversation ID and the delivered `messageId` under `startReceipt`, and the observed `deliveredAt` instant. The supervisor fails closed before runtime loading, probing, or adapter startup when the receipt is missing, malformed, bound to another conversation, dated ahead of its own clock, or older than `maxStartReceiptAgeMs`. It validates caller-attested receipt metadata only; it holds no chat credentials and makes no network call, so it does not prove the message exists or that its text matches.
+8. Optionally declare the run's environment contract with `requiredEnv` and `forbiddenEnv`. The supervisor fails closed before runtime loading, probing, or adapter startup when a required variable is absent or empty or a forbidden variable is non-empty, and it never discloses environment values. This generic gate complements credential-specific caller overlays; it does not prove how a variable was injected or validate credential sources.
+9. Define terminal acceptance checks in the prompt.
+10. Resolve this skill's directory and run the supervisor by absolute path in the foreground:
 
 ```bash
 node /absolute/path/to/acp-discord-orchestrator/scripts/acpx-foreground-supervisor.mjs --config /absolute/private/run.json
@@ -90,10 +91,10 @@ The guard is a permission-layer contract, not an operating-system sandbox. It re
 
 ## Report to Discord
 
-Route normalized `started`, `activity`, `progress`, `permission_rejected`, and `terminal` events to the current conversation according to the caller's local reporting policy.
+Route normalized `started`, `activity`, `progress`, `permission_rejected`, and `terminal` events to the current conversation according to the caller's local reporting policy. Normalized events never carry the control conversation ID or the start message ID; the caller already holds both.
 
 Keep personal channel IDs, operator identity, watchdog language and cadence, model fallback policy, and organization-specific Git workflow outside this public skill.
 
 ## Fail closed
 
-Stop without fallback when environment preflight, runtime discovery, capability checks, permission inspection, event/result identity, response storage, or terminal mapping is uncertain. Do not recover by creating an official ACP thread or launching untracked ACPX.
+Stop without fallback when the start-receipt gate, environment preflight, runtime discovery, capability checks, permission inspection, event/result identity, response storage, or terminal mapping is uncertain. Do not recover by creating an official ACP thread or launching untracked ACPX.
