@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const SCHEMA_VERSION = "acp-discord-orchestrator.v1";
 export const EXIT_CODES = Object.freeze({
@@ -11,6 +11,67 @@ export const EXIT_CODES = Object.freeze({
   supervisorError: 22,
   invalidConfig: 64
 });
+
+export const CLAUDE_AGENT = "claude";
+export const CLAUDE_AUTH_KIND = "claude-setup-token-env-file";
+export const CLAUDE_OAUTH_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN";
+// Credential-selection variables that would silently override or compete with
+// the injected setup token inside the Claude ACP adapter.
+export const CLAUDE_FORBIDDEN_ENV = Object.freeze([
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY"
+]);
+// Variables that can preload code into, redirect, or reconfigure the
+// token-bearing supervisor process. NODE_OPTIONS-injected flags never appear
+// in process.execArgv, so the exec-argv proof cannot see them; they are
+// rejected as environment state instead.
+export const CLAUDE_INJECTION_ENV = Object.freeze([
+  // Node.js process injection and module-resolution redirection
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "NODE_REPL_EXTERNAL_MODULE",
+  // Dynamic-linker code injection (Linux / macOS)
+  "LD_PRELOAD",
+  "LD_AUDIT",
+  "LD_LIBRARY_PATH",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "DYLD_FRAMEWORK_PATH",
+  // Anthropic endpoint, header, and config-directory selectors
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_BEDROCK_BASE_URL",
+  "ANTHROPIC_VERTEX_BASE_URL",
+  "ANTHROPIC_CUSTOM_HEADERS",
+  "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+  "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+  "CLAUDE_CONFIG_DIR",
+  // Proxy selectors that would route token-bearing traffic; POSIX
+  // environments are case-sensitive, so both spellings are listed.
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy"
+]);
+// The credential contract enforced automatically for every Claude run,
+// independent of the caller-declared requiredEnv/forbiddenEnv arrays.
+export const CLAUDE_IMPLICIT_ENV_CONTRACT = Object.freeze({
+  requiredEnv: Object.freeze([CLAUDE_OAUTH_TOKEN_ENV]),
+  forbiddenEnv: Object.freeze([...CLAUDE_FORBIDDEN_ENV, ...CLAUDE_INJECTION_ENV])
+});
+const MAX_CLAUDE_ENV_FILE_BYTES = 4096;
+// Exactly one assignment with an optional final newline. The value charset
+// excludes quotes, whitespace, comments, and interpolation so the file cannot
+// mean something different to Node's --env-file parser than it does here.
+const CLAUDE_ENV_FILE_ASSIGNMENT = new RegExp(
+  "^" + CLAUDE_OAUTH_TOKEN_ENV + "=([A-Za-z0-9_-]+)\\n?$"
+);
 
 const VALID_TOOL_KINDS = new Set([
   "read",
@@ -88,10 +149,33 @@ const EXECUTION_CONTRACT = [
   "- Do not return until implementation and required checks have reached their terminal state."
 ].join("\n");
 
-function fail(code) {
+export function fail(code) {
   const error = new Error(code);
   error.code = code;
   throw error;
+}
+
+// ACPX normalizes agent names with trim/lowercase, so any spelling that
+// normalizes to "claude" resolves to the Claude adapter and must receive the
+// Claude credential contract.
+export function isClaudeAgent(value) {
+  return typeof value === "string" && value.trim().toLowerCase() === CLAUDE_AGENT;
+}
+
+// Realpath-safe CLI entry guard. import.meta.url of an ESM main entry is
+// realpath-resolved while process.argv[1] is not, so a symlinked entry path
+// (including macOS /tmp -> /private/tmp) would make a naive href comparison
+// silently skip main() with exit 0.
+export function isCliEntry(argvPath, moduleUrl) {
+  if (typeof argvPath !== "string" || argvPath.length === 0) {
+    return false;
+  }
+  try {
+    return fs.realpathSync(path.resolve(argvPath)) ===
+      fs.realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
 }
 
 function assertString(value, code, maxLength = 4096) {
@@ -313,6 +397,183 @@ export function runEnvironmentPreflight(config, env) {
   }
 }
 
+// Maps filesystem errors on the env-file path to bounded diagnostic codes
+// without disclosing the path, the error text, or any file content.
+function envFileAccessFailureCode(error) {
+  const code = error && error.code;
+  if (code === "EACCES" || code === "EPERM") {
+    return "claude_env_file_open_denied";
+  }
+  if (code === "ENOTDIR") {
+    return "claude_env_file_parent_not_directory";
+  }
+  if (code === "ELOOP" || code === "EMLINK") {
+    return "claude_env_file_symlink";
+  }
+  if (code === "ENOENT") {
+    return "claude_env_file_missing";
+  }
+  return "claude_env_file_open_failed";
+}
+
+// Validates the private Claude setup-token env file without ever exposing its
+// content. Returns the assigned token value for source comparison only; every
+// failure carries a sanitized code with no path, value, hash, or length.
+export function validateClaudeAuthEnvFile(envFilePath) {
+  if (typeof envFilePath !== "string" || !path.isAbsolute(envFilePath)) {
+    fail("claude_env_file_not_absolute");
+  }
+  if (process.platform === "win32" || typeof process.getuid !== "function") {
+    fail("claude_env_file_unsupported_platform");
+  }
+  const uid = process.getuid();
+
+  const parent = path.dirname(envFilePath);
+  let parentStat;
+  try {
+    parentStat = fs.lstatSync(parent);
+  } catch {
+    fail("claude_env_file_parent_missing");
+  }
+  if (parentStat.isSymbolicLink()) {
+    fail("claude_env_file_parent_symlink");
+  }
+  if (!parentStat.isDirectory()) {
+    fail("claude_env_file_parent_not_directory");
+  }
+  if (parentStat.uid !== uid) {
+    fail("claude_env_file_parent_owner");
+  }
+  if ((parentStat.mode & 0o777) !== 0o700) {
+    fail("claude_env_file_parent_permissions");
+  }
+
+  // lstat before open so a FIFO (or other non-regular file) is rejected
+  // without the blocking open a FIFO would otherwise cause.
+  let pathStat;
+  try {
+    pathStat = fs.lstatSync(envFilePath);
+  } catch (error) {
+    fail(envFileAccessFailureCode(error));
+  }
+  if (pathStat.isSymbolicLink()) {
+    fail("claude_env_file_symlink");
+  }
+  if (!pathStat.isFile()) {
+    fail("claude_env_file_not_regular");
+  }
+
+  // Open with O_NOFOLLOW and re-check the open descriptor so the checked file
+  // is the read file, without a symlink or replacement race in between.
+  // O_NONBLOCK is harmless for a regular file and keeps a FIFO swapped in
+  // after the lstat from blocking the open; fstat below still rejects it.
+  let fd;
+  try {
+    fd = fs.openSync(
+      envFilePath,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK
+    );
+  } catch (error) {
+    fail(envFileAccessFailureCode(error));
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) {
+      fail("claude_env_file_not_regular");
+    }
+    if (stat.uid !== uid) {
+      fail("claude_env_file_owner");
+    }
+    if ((stat.mode & 0o777) !== 0o600) {
+      fail("claude_env_file_permissions");
+    }
+    if (stat.size === 0 || stat.size > MAX_CLAUDE_ENV_FILE_BYTES) {
+      fail("claude_env_file_size");
+    }
+    const buffer = Buffer.alloc(Number(stat.size));
+    const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    if (bytesRead !== buffer.length) {
+      fail("claude_env_file_size");
+    }
+    const match = CLAUDE_ENV_FILE_ASSIGNMENT.exec(buffer.toString("utf8"));
+    if (!match) {
+      fail("claude_env_file_format");
+    }
+    return match[1];
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Supervisor-side bypass guard. Runs before dynamic runtime import, probing,
+// or adapter startup, and re-asserts the auth profile rather than trusting a
+// config object assembled in memory. For agent "claude" it requires proof that
+// this exact process was started through the canonical --env-file injection,
+// and enforces the Claude credential contract even when the generic
+// requiredEnv/forbiddenEnv arrays are empty.
+export function runClaudeSupervisorPreflight(config, env, execArgv) {
+  if (!isClaudeAgent(config.agent)) {
+    if (config.auth !== undefined) {
+      fail("claude_auth_not_applicable");
+    }
+    return;
+  }
+  // A spelling that ACPX would normalize to "claude" but is not the exact
+  // canonical value gets the Claude gate, not a pass into the generic path.
+  if (config.agent !== CLAUDE_AGENT) {
+    fail("claude_agent_not_canonical");
+  }
+
+  const auth = config.auth;
+  if (
+    !isPlainObject(auth) ||
+    auth.kind !== CLAUDE_AUTH_KIND ||
+    typeof auth.envFile !== "string" ||
+    !path.isAbsolute(auth.envFile)
+  ) {
+    fail("claude_auth_missing");
+  }
+
+  // Exactly one Node option: the exact canonical single-token spelling bound
+  // to the declared file. An absent or empty exec argv is a bare launch and
+  // fails as missing; every other shape — a split "--env-file path" pair, an
+  // -if-exists variant, a different path, a duplicate, or any extra Node
+  // option — is one mismatch class.
+  if (!Array.isArray(execArgv) || execArgv.length === 0) {
+    fail("claude_env_file_option_missing");
+  }
+  if (execArgv.length !== 1 || execArgv[0] !== "--env-file=" + auth.envFile) {
+    fail("claude_env_file_option_mismatch");
+  }
+
+  runEnvironmentPreflight(CLAUDE_IMPLICIT_ENV_CONTRACT, env);
+
+  const fileToken = validateClaudeAuthEnvFile(auth.envFile);
+  // Compare the loaded environment value to the file assignment without
+  // disclosing either; fixed-size digests avoid a value or length leak.
+  const digestOf = (value) => crypto.createHash("sha256").update(value, "utf8").digest();
+  if (!crypto.timingSafeEqual(digestOf(env[CLAUDE_OAUTH_TOKEN_ENV]), digestOf(fileToken))) {
+    fail("claude_env_token_source_mismatch");
+  }
+}
+
+function parseClaudeAuthProfile(value) {
+  if (!isPlainObject(value)) {
+    fail("invalid_auth");
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== 2 || !keys.includes("kind") || !keys.includes("envFile")) {
+    fail("invalid_auth");
+  }
+  if (value.kind !== CLAUDE_AUTH_KIND) {
+    fail("invalid_auth_kind");
+  }
+  return {
+    kind: CLAUDE_AUTH_KIND,
+    envFile: resolveAbsolute(value.envFile, "invalid_auth_env_file")
+  };
+}
+
 export function loadSupervisorConfig(configPath) {
   const absoluteConfigPath = resolveAbsolute(configPath, "invalid_config_path");
   assertPrivateFile(absoluteConfigPath, "invalid_config_file");
@@ -325,6 +586,22 @@ export function loadSupervisorConfig(configPath) {
   }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     fail("invalid_config_object");
+  }
+
+  const agent = assertIdentifier(raw.agent, "invalid_agent", 128);
+  // ACPX trims and lowercases agent names, so "Claude" would still resolve to
+  // the Claude adapter while bypassing every agent === "claude" gate. Only the
+  // canonical spelling is accepted.
+  if (isClaudeAgent(agent) && agent !== CLAUDE_AGENT) {
+    fail("invalid_agent_not_canonical");
+  }
+  let auth;
+  if (agent === CLAUDE_AGENT) {
+    auth = parseClaudeAuthProfile(raw.auth);
+  } else if (raw.auth !== undefined) {
+    // A Claude auth profile on a non-Claude agent is misleading: it would
+    // never be enforced, so it is rejected rather than silently ignored.
+    fail("invalid_auth_agent");
   }
 
   const cwd = resolveAbsolute(raw.cwd, "invalid_cwd");
@@ -362,6 +639,26 @@ export function loadSupervisorConfig(configPath) {
       fail("invalid_env_contract_overlap");
     }
   }
+  if (agent === CLAUDE_AGENT) {
+    // The Claude credential contract is enforced automatically at run time;
+    // a caller-declared contract that contradicts it is invalid config.
+    const implicitForbidden = new Set(
+      CLAUDE_IMPLICIT_ENV_CONTRACT.forbiddenEnv.map((name) => name.toUpperCase())
+    );
+    const implicitRequired = new Set(
+      CLAUDE_IMPLICIT_ENV_CONTRACT.requiredEnv.map((name) => name.toUpperCase())
+    );
+    for (const name of requiredEnv) {
+      if (implicitForbidden.has(name.toUpperCase())) {
+        fail("invalid_env_contract_overlap");
+      }
+    }
+    for (const name of forbiddenEnv) {
+      if (implicitRequired.has(name.toUpperCase())) {
+        fail("invalid_env_contract_overlap");
+      }
+    }
+  }
 
   const lifecycle = parseLifecycleContract(raw.lifecycle);
 
@@ -377,7 +674,8 @@ export function loadSupervisorConfig(configPath) {
   }
 
   return {
-    agent: assertIdentifier(raw.agent, "invalid_agent", 128),
+    agent,
+    auth,
     model: raw.model === undefined ? undefined : assertIdentifier(raw.model, "invalid_model", 256),
     cwd,
     sessionKey: assertString(raw.sessionKey, "invalid_session_key", 256),
@@ -808,7 +1106,7 @@ function safeStopReason(value) {
   return /^[a-zA-Z0-9_.:-]{1,96}$/.test(value) ? value : undefined;
 }
 
-function safeDiagnosticCode(value, fallback, maxLength = 128) {
+export function safeDiagnosticCode(value, fallback, maxLength = 128) {
   if (typeof value !== "string") {
     return fallback;
   }
@@ -1034,9 +1332,18 @@ export async function runSupervisor(config, dependencies = {}) {
         dependencies.signalSource || process
       );
 
+  // Property presence, not truthiness: an explicitly injected undefined must
+  // exercise the invalid-shape branches instead of silently picking up the
+  // host process's own environment or exec argv.
+  const environment = "env" in dependencies ? dependencies.env : process.env;
+  const execArgv = "execArgv" in dependencies
+    ? dependencies.execArgv
+    : process.execArgv;
+
   try {
     runStartReceiptPreflight(config, now());
-    runEnvironmentPreflight(config, dependencies.env || process.env);
+    runClaudeSupervisorPreflight(config, environment, execArgv);
+    runEnvironmentPreflight(config, environment);
     preparePrivateStateDirectory(config.stateDir);
     if (fs.existsSync(config.responseFile)) {
       fail("response_file_exists");
@@ -1276,7 +1583,9 @@ export async function runSupervisor(config, dependencies = {}) {
   }
 }
 
-function parseCli(argv) {
+// Shared by the supervisor and the canonical Claude launcher: both accept
+// exactly one private config-file path behind --config.
+export function parseConfigCli(argv) {
   if (argv.length !== 2 || argv[0] !== "--config") {
     fail("usage");
   }
@@ -1286,7 +1595,7 @@ function parseCli(argv) {
 export async function main(argv = process.argv.slice(2)) {
   let config;
   try {
-    const configPath = parseCli(argv);
+    const configPath = parseConfigCli(argv);
     config = loadSupervisorConfig(configPath);
   } catch (error) {
     const code = safeDiagnosticCode(
@@ -1347,6 +1656,6 @@ async function exitCli(exitCode) {
   process.exit(exitCode);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isCliEntry(process.argv[1], import.meta.url)) {
   await exitCli(await main());
 }

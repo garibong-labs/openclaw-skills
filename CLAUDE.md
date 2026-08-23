@@ -32,9 +32,12 @@ bash -n tistory-publish/scripts/login.sh tistory-publish/scripts/publish-post.sh
 
 # acp-discord-orchestrator — node:test suites (not in CI; run manually)
 node --test acp-discord-orchestrator/scripts/test-acpx-foreground-supervisor.mjs
+node --test acp-discord-orchestrator/scripts/test-claude-acp-launcher.mjs
 node --test tests/acp-discord-orchestrator-cli.test.mjs
 node --test --test-name-pattern="distinct exit codes" acp-discord-orchestrator/scripts/test-acpx-foreground-supervisor.mjs
 ```
+
+The launcher suite's execve end-to-end tests self-skip on runtimes without `process.execve` (needs 22.15+/23.11+ or any later line; POSIX only) — run it on a runtime that has it for full coverage.
 
 ## tistory-publish architecture
 
@@ -61,11 +64,11 @@ Behavioral invariants worth knowing before changing it:
 
 ## acp-discord-orchestrator architecture
 
-A single ESM file, `scripts/acpx-foreground-supervisor.mjs`, that runs one ACPX turn in the foreground on behalf of an agent and emits newline-delimited JSON events. `references/runtime-contract.md` is the normative spec (config fields, exit codes `0/20/21/22/64`, permission rejection rules, start-receipt and env preflight gates, evidence boundary); SKILL.md is the operator-facing summary. Keep all three (code, contract, SKILL.md) in sync when changing behavior.
+A single ESM file, `scripts/acpx-foreground-supervisor.mjs`, that runs one ACPX turn in the foreground on behalf of an agent and emits newline-delimited JSON events, plus `scripts/claude-acp-launcher.mjs`, the canonical launcher that validates Claude setup-token auth and re-execs into the supervisor via `process.execve`. `references/runtime-contract.md` is the normative spec (config fields, exit codes `0/20/21/22/64`, permission rejection rules, start-receipt/env/Claude-credential preflight gates, evidence boundary); SKILL.md is the operator-facing summary. Keep all of them (code, contract, SKILL.md) in sync when changing behavior.
 
 - The module exports its internals (`loadSupervisorConfig`, `runSupervisor`, `buildPermissionHandler`, `normalizeRuntimeEvent`, `runStartReceiptPreflight`, `EXIT_CODES`, `main`, …) specifically so the sibling test file can unit-test them with an in-memory mock runtime module. `tests/acp-discord-orchestrator-cli.test.mjs` at the repo root spawns the real CLI against a mock runtime file to assert the process actually exits.
 - Everything is fail-closed and evidence-minimal: no raw prompt/model/tool text in events, no env values or conversation IDs leaked, distinct `completed`/`cancelled`/`failed` never collapsed. Preserve these properties when adding features — tests assert them.
-- Requires Node ≥ 22.13 and ACPX ≥ 0.11.2 (capability-detected, not version-string gated).
+- Requires Node ≥ 22.13 and ACPX ≥ 0.11.2 (capability-detected, not version-string gated). The Claude launcher additionally needs `process.execve` — Node 22.15+ in the 22.x line, 23.11+ in the 23.x line, or any later line — and is POSIX-only.
 
 ## Repo conventions
 
