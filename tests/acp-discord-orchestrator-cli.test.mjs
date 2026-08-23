@@ -40,7 +40,7 @@ export function createAcpRuntime() {
 `, { mode: 0o600 });
   fs.writeFileSync(promptFile, "bounded no-op", { mode: 0o600 });
   fs.writeFileSync(configFile, JSON.stringify({
-    agent: "claude",
+    agent: "test-agent",
     model: "test-model",
     cwd: root,
     sessionKey: "cli-exit-test",

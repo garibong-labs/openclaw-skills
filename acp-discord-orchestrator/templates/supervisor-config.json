@@ -1,5 +1,9 @@
 {
   "agent": "claude",
+  "auth": {
+    "kind": "claude-setup-token-env-file",
+    "envFile": "/absolute/private/path/claude-acp-oauth.env"
+  },
   "model": "MODEL_ID",
   "cwd": "/absolute/path/to/workspace",
   "sessionKey": "unique-task-id",

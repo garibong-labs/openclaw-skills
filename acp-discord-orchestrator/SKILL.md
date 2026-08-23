@@ -11,6 +11,8 @@ Run each agent-started ACP task through one observable direct ACPX turn. Keep th
 
 Use `scripts/acpx-foreground-supervisor.mjs` for every ACP task started by the calling agent.
 
+For `agent: "claude"`, start the supervisor only through the canonical launcher `scripts/claude-acp-launcher.mjs`. It validates the config's `auth` declaration, the parent environment, and the private setup-token env file, then replaces its own process with the supervisor via POSIX `process.execve` so the run still owns exactly one foreground PID and the supervisor starts as `node --env-file=<auth.envFile> acpx-foreground-supervisor.mjs --config <config>`. The launcher requires Node.js 22.15 or newer for `process.execve` and fails closed without it. A bare direct Claude supervisor launch is a bypass and fails closed with the supervisor policy exit before any runtime loading.
+
 Do not use:
 
 - OpenClaw `sessions_spawn` with `runtime: "acp"`
@@ -29,15 +31,28 @@ This policy does not globally disable human-operated OpenClaw ACP commands.
 5. Set the config file and prompt file to owner-only permissions.
 6. Set an explicit working directory, ACP agent, model, unique session key, timeout, progress interval, and allowed tool kinds. The template's two-hour `timeoutMs` is an emergency ceiling independent of reporting cadence; set it per run.
 7. Announce the run in the current control conversation first, then record that delivery in the required `lifecycle` block: `controlConversationId`, the same conversation ID and the delivered `messageId` under `startReceipt`, and the observed `deliveredAt` instant. The supervisor fails closed before runtime loading, probing, or adapter startup when the receipt is missing, malformed, bound to another conversation, dated ahead of its own clock, or older than `maxStartReceiptAgeMs`. It validates caller-attested receipt metadata only; it holds no chat credentials and makes no network call, so it does not prove the message exists or that its text matches.
-8. Optionally declare the run's environment contract with `requiredEnv` and `forbiddenEnv`. The supervisor fails closed before runtime loading, probing, or adapter startup when a required variable is absent or empty or a forbidden variable is non-empty, and it never discloses environment values. This generic gate complements credential-specific caller overlays; it does not prove how a variable was injected or validate credential sources.
-9. Define terminal acceptance checks in the prompt.
-10. Resolve this skill's directory and run the supervisor by absolute path in the foreground:
+8. Optionally declare the run's environment contract with `requiredEnv` and `forbiddenEnv`. The supervisor fails closed before runtime loading, probing, or adapter startup when a required variable is absent or empty or a forbidden variable is non-empty, and it never discloses environment values. This generic gate does not prove how a variable was injected or validate credential sources; for non-Claude agents it is the whole environment contract.
+9. For `agent: "claude"`, declare the required auth profile and keep the token in a private env file the config only points to:
+
+   ```json
+   "auth": { "kind": "claude-setup-token-env-file", "envFile": "/absolute/private/claude-acp-oauth.env" }
+   ```
+
+   The env file holds exactly one line, `CLAUDE_CODE_OAUTH_TOKEN=<token>`, with no quotes, comments, or extra variables. Its parent directory must be a real owner-only (0700) directory and the file a real owner-only (0600) regular file, both owned by the launching user. The Claude credential contract — `CLAUDE_CODE_OAUTH_TOKEN` required, competing `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, and `CLAUDE_CODE_USE_FOUNDRY` forbidden — is enforced automatically even when `requiredEnv` and `forbiddenEnv` are empty. Never place the token value in the config, argv, or any argument.
+10. Define terminal acceptance checks in the prompt.
+11. Resolve this skill's directory and run the run's canonical entry point by absolute path in the foreground. For Claude (Node.js 22.15 or newer):
+
+```bash
+node /absolute/path/to/acp-discord-orchestrator/scripts/claude-acp-launcher.mjs --config /absolute/private/run.json
+```
+
+The launcher re-execs in place via `process.execve`, so the same PID becomes the supervisor with the env file injected through Node's `--env-file` startup option. For every other agent, run the supervisor directly:
 
 ```bash
 node /absolute/path/to/acp-discord-orchestrator/scripts/acpx-foreground-supervisor.mjs --config /absolute/private/run.json
 ```
 
-Do not background the supervisor. Consume its newline-delimited JSON events while its process remains attached.
+A bare direct supervisor launch with `agent: "claude"` fails closed before runtime loading. Do not background either process. Consume the newline-delimited JSON events while the process remains attached.
 
 ## Own the process without blocking the conversation
 

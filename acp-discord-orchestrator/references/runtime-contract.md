@@ -10,6 +10,7 @@ This reference defines the compatibility and evidence boundary for the direct AC
 - [Config fields](#config-fields)
 - [Start-receipt gate](#start-receipt-gate)
 - [Environment preflight](#environment-preflight)
+- [Claude credential injection](#claude-credential-injection)
 - [Permission decisions](#permission-decisions)
 - [Event identity](#event-identity)
 - [Evidence boundary](#evidence-boundary)
@@ -21,7 +22,7 @@ This reference defines the compatibility and evidence boundary for the direct AC
 
 ## Required capabilities
 
-Run on Node.js 22.13 or newer.
+Run on Node.js 22.13 or newer. The Claude canonical launcher `claude-acp-launcher.mjs` additionally requires Node.js 22.15 or newer for POSIX `process.execve` and fails closed without it.
 
 Resolve ACPX from the explicit package root recorded in `runtimeModule`. Obtain that path from the active OpenClaw plugin's read-only dependency information before launch. The supervisor does not execute discovery commands. Require public equivalents of:
 
@@ -68,6 +69,11 @@ Required:
   - `lifecycle.startReceipt.conversationId`: conversation the start message was delivered to
   - `lifecycle.startReceipt.messageId`: delivered start-message identifier
   - `lifecycle.startReceipt.deliveredAt`: caller-observed delivery instant
+- `auth` (required exactly when `agent` is `claude`): Claude credential declaration
+  - `auth.kind`: must be `claude-setup-token-env-file`
+  - `auth.envFile`: absolute path to the private setup-token env file
+
+Declaring `auth` on a non-Claude agent is invalid config (`invalid_auth_agent`): the profile would never be enforced there, so it is rejected rather than silently ignored. A Claude config whose `requiredEnv` or `forbiddenEnv` contradicts the automatic Claude credential contract fails with `invalid_env_contract_overlap`. Shape violations map to `invalid_auth`, `invalid_auth_kind`, `invalid_auth_env_file`, and `invalid_auth_env_file_not_absolute` with the invalid-config exit.
 
 Optional:
 
@@ -98,7 +104,30 @@ The control conversation ID and the start message ID are never emitted in normal
 
 Before dynamic runtime import, runtime probing, `createAcpRuntime`, or any adapter startup, the supervisor fails closed when a required variable is absent or empty, or when a forbidden variable is non-empty. The stable failure codes name only the caller-declared variable — `required_env_missing:NAME`, `required_env_empty:NAME`, `forbidden_env_present:NAME` — and map to the supervisor error exit. Environment values are never emitted, stored, hashed, or otherwise disclosed.
 
-The gate proves presence or absence only. It does not prove how a variable was injected, validate credential files, or select a credential source. Credential-specific policy — secure file validation, precedence, and exact launch construction such as `node --env-file=...` — remains the responsibility of local caller overlays that complement this generic contract.
+The gate proves presence or absence only. It does not prove how a variable was injected, validate credential files, or select a credential source. For non-Claude agents this generic contract is the whole environment gate. For `agent: "claude"`, credential-specific policy is canonical and supervisor-enforced; see [Claude credential injection](#claude-credential-injection).
+
+## Claude credential injection
+
+Claude runs authenticate with a setup token that is never present in argv, config values, normalized events, error text, hashes, or logs. The config declares only a pointer: `auth.kind` fixed to `claude-setup-token-env-file` and an absolute `auth.envFile`.
+
+The canonical route is `scripts/claude-acp-launcher.mjs --config <config>`. The launcher:
+
+- accepts exactly the same single private config-path argument as the supervisor;
+- requires `agent: "claude"` (`launcher_agent_not_claude` otherwise, invalid-config exit);
+- rejects a parent environment that already defines `CLAUDE_CODE_OAUTH_TOKEN` — even empty — with `claude_oauth_token_preexisting`, and any non-empty `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, or `CLAUDE_CODE_USE_FOUNDRY` with `claude_competing_credential:NAME`; nothing is silently unset;
+- validates the env file (below), then replaces its own process image with POSIX `process.execve`, running `node --env-file=<auth.envFile> acpx-foreground-supervisor.mjs --config <config>` under the same PID, so no child wrapper or second tracked process ever exists;
+- requires Node.js 22.15 or newer and fails closed with `execve_unsupported` on runtimes or platforms without `process.execve`.
+
+Env-file validation is shared by the launcher and the supervisor and fails closed on: a parent directory that is a symlink, not owner-owned, or not mode `0700`; a file that is a symlink, not a regular file, not owner-owned, not mode `0600`, empty, or oversized; and content that is not exactly one `CLAUDE_CODE_OAUTH_TOKEN=<value>` assignment with an optional final newline — no comments, quotes, interpolation, whitespace, extra variables, or multiline values. Failure codes (`claude_env_file_*`) never include the file content, the token, a token hash, prefix, suffix, or the exact token length.
+
+The supervisor independently re-asserts the same route before dynamic runtime import, probing, or adapter startup, so bypassing the launcher fails closed with the supervisor policy exit:
+
+- `agent: "claude"` requires the auth profile (`claude_auth_missing`); an auth profile on another agent fails (`claude_auth_not_applicable`);
+- `process.execArgv` must contain exactly one Node option, the exact spelling `--env-file=<auth.envFile>`; a bare launch fails `claude_env_file_option_missing`, duplicates fail `claude_env_file_option_duplicate`, and a split, relative, `-if-exists`, different-path, or extra-option form fails `claude_env_file_option_mismatch`;
+- the Claude credential contract — `CLAUDE_CODE_OAUTH_TOKEN` required, the competing variables above forbidden — is enforced automatically even when `requiredEnv` and `forbiddenEnv` are empty, with the same `required_env_missing`/`required_env_empty`/`forbidden_env_present` codes;
+- the env file is validated again and the loaded environment value is compared against the file assignment through fixed-size digests; a difference fails `claude_env_token_source_mismatch` without disclosing either value.
+
+These are supervisor policy failures with exit `22`, evaluated before runtime loading. Invalid config shape remains exit `64`. Non-Claude agents are unaffected: they keep the generic environment contract and need no exec-argv proof.
 
 ## Permission decisions
 

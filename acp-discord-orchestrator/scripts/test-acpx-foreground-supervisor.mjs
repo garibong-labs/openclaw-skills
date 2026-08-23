@@ -6,6 +6,9 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  CLAUDE_AUTH_KIND,
+  CLAUDE_FORBIDDEN_ENV,
+  CLAUDE_OAUTH_TOKEN_ENV,
   EXIT_CODES,
   buildPermissionHandler,
   classifyPermissionRequest,
@@ -14,8 +17,10 @@ import {
   loadSupervisorConfig,
   main,
   normalizeRuntimeEvent,
+  runClaudeSupervisorPreflight,
   runStartReceiptPreflight,
   runSupervisor,
+  validateClaudeAuthEnvFile,
   validateRuntimeModuleExports
 } from "./acpx-foreground-supervisor.mjs";
 
@@ -62,7 +67,7 @@ function deferred() {
 
 function makeConfig(root, overrides = {}) {
   return {
-    agent: "claude",
+    agent: "test-agent",
     model: "test-model",
     cwd: root,
     sessionKey: "test-session",
@@ -422,7 +427,7 @@ test("private config rejects a symlinked prompt file", {
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
   fs.symlinkSync(prompt, promptLink);
   fs.writeFileSync(configFile, JSON.stringify({
-    agent: "claude",
+    agent: "test-agent",
     model: "test-model",
     cwd: root,
     sessionKey: "test-session",
@@ -614,7 +619,7 @@ test("config requires a timeout and rejects the unclassified other kind", () => 
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
   const base = {
-    agent: "claude",
+    agent: "test-agent",
     model: "test-model",
     cwd: root,
     sessionKey: "test-session",
@@ -650,7 +655,7 @@ test("environment contract config shape fails closed with exact codes", () => {
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
   const base = {
-    agent: "claude",
+    agent: "test-agent",
     model: "test-model",
     cwd: root,
     sessionKey: "test-session",
@@ -720,7 +725,7 @@ test("invalid environment contract retains the invalid-config CLI mapping", asyn
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
   const configFile = path.join(root, "run.json");
   fs.writeFileSync(configFile, JSON.stringify({
-    agent: "claude",
+    agent: "test-agent",
     cwd: root,
     sessionKey: "test-session",
     promptFile: prompt,
@@ -845,7 +850,7 @@ test("start-receipt config shape fails closed with exact codes", () => {
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
   const base = {
-    agent: "claude",
+    agent: "test-agent",
     model: "test-model",
     cwd: root,
     sessionKey: "test-session",
@@ -928,7 +933,7 @@ test("delivered-at accepts Discord's native instant within a bounded fraction", 
   const writeCase = (name, deliveredAt) => {
     const file = path.join(root, name + ".json");
     fs.writeFileSync(file, JSON.stringify({
-      agent: "claude",
+      agent: "test-agent",
       cwd: root,
       sessionKey: "test-session",
       promptFile: prompt,
@@ -990,7 +995,7 @@ test("invalid start receipt retains the invalid-config CLI mapping", async () =>
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
   const configFile = path.join(root, "run.json");
   fs.writeFileSync(configFile, JSON.stringify({
-    agent: "claude",
+    agent: "test-agent",
     cwd: root,
     sessionKey: "test-session",
     promptFile: prompt,
@@ -1423,4 +1428,429 @@ test("terminal is structurally the final event after a late stream", async () =>
     emitted.filter((event) => event.type === "terminal").length,
     1
   );
+});
+
+const DUMMY_CLAUDE_TOKEN = "test-dummy-oauth-token-value-0123456789";
+const POSIX_ONLY = { skip: process.platform === "win32" };
+
+function makeClaudeAuthFixture(root, options = {}) {
+  const authDir = path.join(root, "auth");
+  fs.mkdirSync(authDir, { mode: 0o700 });
+  fs.chmodSync(authDir, options.parentMode ?? 0o700);
+  const envFile = path.join(authDir, "claude-acp-oauth.env");
+  const content = options.content ??
+    (CLAUDE_OAUTH_TOKEN_ENV + "=" + (options.token ?? DUMMY_CLAUDE_TOKEN) + "\n");
+  fs.writeFileSync(envFile, content, { mode: 0o600 });
+  fs.chmodSync(envFile, options.fileMode ?? 0o600);
+  return envFile;
+}
+
+function makeClaudeConfig(root, envFile, overrides = {}) {
+  return makeConfig(root, {
+    agent: "claude",
+    auth: { kind: CLAUDE_AUTH_KIND, envFile },
+    ...overrides
+  });
+}
+
+function claudeEnv(envFile, overrides = {}) {
+  return { [CLAUDE_OAUTH_TOKEN_ENV]: DUMMY_CLAUDE_TOKEN, ...overrides };
+}
+
+test("claude config requires the exact setup-token auth profile", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-auth-config-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const base = {
+    agent: "claude",
+    model: "test-model",
+    cwd: root,
+    sessionKey: "test-session",
+    promptFile: prompt,
+    stateDir: path.join(root, "state"),
+    runtimeModule: root,
+    timeoutMs: 30000,
+    lifecycle: rawLifecycle(),
+    allowKinds: ["read"]
+  };
+  let caseIndex = 0;
+  const writeCase = (extra) => {
+    caseIndex += 1;
+    const file = path.join(root, "case-" + String(caseIndex) + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      ...base,
+      responseFile: path.join(root, "response-" + String(caseIndex) + ".txt"),
+      ...extra
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  const invalid = [
+    [{}, "invalid_auth"],
+    [{ auth: "claude-setup-token-env-file" }, "invalid_auth"],
+    [{ auth: [] }, "invalid_auth"],
+    [{ auth: { kind: CLAUDE_AUTH_KIND } }, "invalid_auth"],
+    [{
+      auth: { kind: CLAUDE_AUTH_KIND, envFile: "/private/x.env", extra: true }
+    }, "invalid_auth"],
+    [{ auth: { kind: "api-key", envFile: "/private/x.env" } }, "invalid_auth_kind"],
+    [{ auth: { kind: CLAUDE_AUTH_KIND, envFile: 7 } }, "invalid_auth_env_file"],
+    [{
+      auth: { kind: CLAUDE_AUTH_KIND, envFile: "relative/x.env" }
+    }, "invalid_auth_env_file_not_absolute"],
+    [{
+      auth: { kind: CLAUDE_AUTH_KIND, envFile: "/private/x.env" },
+      requiredEnv: ["ANTHROPIC_API_KEY"]
+    }, "invalid_env_contract_overlap"],
+    [{
+      auth: { kind: CLAUDE_AUTH_KIND, envFile: "/private/x.env" },
+      forbiddenEnv: ["claude_code_oauth_token"]
+    }, "invalid_env_contract_overlap"],
+    [{
+      agent: "test-agent",
+      auth: { kind: CLAUDE_AUTH_KIND, envFile: "/private/x.env" }
+    }, "invalid_auth_agent"]
+  ];
+  for (const [extra, expected] of invalid) {
+    assert.throws(
+      () => loadSupervisorConfig(writeCase(extra)),
+      { message: expected, code: expected },
+      expected
+    );
+  }
+
+  const valid = loadSupervisorConfig(writeCase({
+    auth: { kind: CLAUDE_AUTH_KIND, envFile: "/private/claude-acp-oauth.env" }
+  }));
+  assert.deepEqual(valid.auth, {
+    kind: CLAUDE_AUTH_KIND,
+    envFile: path.normalize("/private/claude-acp-oauth.env")
+  });
+
+  const generic = loadSupervisorConfig(writeCase({
+    agent: "test-agent",
+    requiredEnv: ["ANTHROPIC_API_KEY"]
+  }));
+  assert.equal(generic.auth, undefined);
+  assert.deepEqual(generic.requiredEnv, ["ANTHROPIC_API_KEY"]);
+});
+
+test("missing claude auth keeps the invalid-config CLI mapping", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-auth-cli-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const configFile = path.join(root, "run.json");
+  fs.writeFileSync(configFile, JSON.stringify({
+    agent: "claude",
+    cwd: root,
+    sessionKey: "test-session",
+    promptFile: prompt,
+    responseFile: path.join(root, "response.txt"),
+    stateDir: path.join(root, "state"),
+    runtimeModule: root,
+    timeoutMs: 30000,
+    lifecycle: rawLifecycle(),
+    allowKinds: ["read"]
+  }), { mode: 0o600 });
+
+  const writes = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    writes.push(String(chunk));
+    return true;
+  };
+  let exitCode;
+  try {
+    exitCode = await main(["--config", configFile]);
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(exitCode, EXIT_CODES.invalidConfig);
+  const emitted = JSON.parse(writes.join("").trim());
+  assert.equal(emitted.type, "supervisor_error");
+  assert.equal(emitted.code, "invalid_auth");
+});
+
+test("claude auth env file validation fails closed without disclosure", POSIX_ONLY, () => {
+  const cases = [
+    [{ content: "" }, "claude_env_file_size"],
+    [{ content: "X".repeat(4097) }, "claude_env_file_size"],
+    [{ content: "ANTHROPIC_API_KEY=" + DUMMY_CLAUDE_TOKEN + "\n" }, "claude_env_file_format"],
+    [{
+      content: CLAUDE_OAUTH_TOKEN_ENV + "=" + DUMMY_CLAUDE_TOKEN + "\nEXTRA_VAR=x\n"
+    }, "claude_env_file_format"],
+    [{
+      content: CLAUDE_OAUTH_TOKEN_ENV + "=" + DUMMY_CLAUDE_TOKEN + "\n\n"
+    }, "claude_env_file_format"],
+    [{ content: CLAUDE_OAUTH_TOKEN_ENV + "=\n" }, "claude_env_file_format"],
+    [{
+      content: CLAUDE_OAUTH_TOKEN_ENV + "=\"" + DUMMY_CLAUDE_TOKEN + "\"\n"
+    }, "claude_env_file_format"],
+    [{
+      content: CLAUDE_OAUTH_TOKEN_ENV + "='" + DUMMY_CLAUDE_TOKEN + "'\n"
+    }, "claude_env_file_format"],
+    [{ content: CLAUDE_OAUTH_TOKEN_ENV + "=$HOME_TOKEN\n" }, "claude_env_file_format"],
+    [{
+      content: "# comment\n" + CLAUDE_OAUTH_TOKEN_ENV + "=" + DUMMY_CLAUDE_TOKEN + "\n"
+    }, "claude_env_file_format"],
+    [{
+      content: CLAUDE_OAUTH_TOKEN_ENV + "=" + DUMMY_CLAUDE_TOKEN + " \n"
+    }, "claude_env_file_format"],
+    [{
+      content: CLAUDE_OAUTH_TOKEN_ENV + "=" + DUMMY_CLAUDE_TOKEN + "\r\n"
+    }, "claude_env_file_format"],
+    [{ fileMode: 0o644 }, "claude_env_file_permissions"],
+    [{ fileMode: 0o640 }, "claude_env_file_permissions"],
+    [{ parentMode: 0o755 }, "claude_env_file_parent_permissions"],
+    [{ parentMode: 0o750 }, "claude_env_file_parent_permissions"]
+  ];
+  for (const [options, expected] of cases) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-envfile-"));
+    const envFile = makeClaudeAuthFixture(root, options);
+    let observed;
+    try {
+      validateClaudeAuthEnvFile(envFile);
+    } catch (error) {
+      observed = error;
+    }
+    assert.ok(observed, expected);
+    assert.equal(observed.code, expected);
+    assert.equal(String(observed.message).includes(DUMMY_CLAUDE_TOKEN), false);
+  }
+
+  assert.throws(
+    () => validateClaudeAuthEnvFile("relative/claude.env"),
+    { code: "claude_env_file_not_absolute" }
+  );
+  const missingRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-envfile-"));
+  fs.chmodSync(missingRoot, 0o700);
+  assert.throws(
+    () => validateClaudeAuthEnvFile(path.join(missingRoot, "missing.env")),
+    { code: "claude_env_file_missing" }
+  );
+  assert.throws(
+    () => validateClaudeAuthEnvFile(path.join(missingRoot, "gone", "missing.env")),
+    { code: "claude_env_file_parent_missing" }
+  );
+
+  const linkRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-envlink-"));
+  const realEnvFile = makeClaudeAuthFixture(linkRoot);
+  const linkFile = path.join(path.dirname(realEnvFile), "link.env");
+  fs.symlinkSync(realEnvFile, linkFile);
+  assert.throws(
+    () => validateClaudeAuthEnvFile(linkFile),
+    { code: "claude_env_file_symlink" }
+  );
+
+  const linkedParentRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-envparent-"));
+  makeClaudeAuthFixture(linkedParentRoot);
+  const parentLink = path.join(linkedParentRoot, "auth-link");
+  fs.symlinkSync(path.join(linkedParentRoot, "auth"), parentLink);
+  assert.throws(
+    () => validateClaudeAuthEnvFile(path.join(parentLink, "claude-acp-oauth.env")),
+    { code: "claude_env_file_parent_symlink" }
+  );
+
+  const okRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-envok-"));
+  assert.equal(
+    validateClaudeAuthEnvFile(makeClaudeAuthFixture(okRoot)),
+    DUMMY_CLAUDE_TOKEN
+  );
+  const noNewlineRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-envok2-"));
+  assert.equal(
+    validateClaudeAuthEnvFile(makeClaudeAuthFixture(noNewlineRoot, {
+      content: CLAUDE_OAUTH_TOKEN_ENV + "=" + DUMMY_CLAUDE_TOKEN
+    })),
+    DUMMY_CLAUDE_TOKEN
+  );
+});
+
+test("bare claude supervisor launch fails closed before runtime loading", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-bare-"));
+  const envFile = makeClaudeAuthFixture(root);
+  const config = makeClaudeConfig(root, envFile, {
+    runtimeModule: path.join(root, "missing-runtime")
+  });
+  const emitted = [];
+  const exitCode = await runSupervisor(config, {
+    bindSignals: false,
+    env: claudeEnv(envFile),
+    execArgv: [],
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  assert.equal(emitted.at(-1).type, "supervisor_error");
+  assert.equal(emitted.at(-1).code, "claude_env_file_option_missing");
+  assert.equal(fs.existsSync(config.stateDir), false);
+  assert.equal(fs.existsSync(config.responseFile), false);
+});
+
+test("claude exec argv proof rejects every bypass spelling", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-argv-"));
+  const envFile = makeClaudeAuthFixture(root);
+  const cases = [
+    [undefined, "claude_env_file_option_missing"],
+    [[], "claude_env_file_option_missing"],
+    [["--test"], "claude_env_file_option_missing"],
+    [["--env-file=relative/claude.env"], "claude_env_file_option_mismatch"],
+    [["--env-file=" + envFile + ".other"], "claude_env_file_option_mismatch"],
+    [["--env-file-if-exists=" + envFile], "claude_env_file_option_mismatch"],
+    [["--env-file", envFile], "claude_env_file_option_mismatch"],
+    [["--env-file=" + envFile, "--env-file=" + envFile], "claude_env_file_option_duplicate"],
+    [["--env-file=" + envFile, "--experimental-vm-modules"], "claude_env_file_option_mismatch"]
+  ];
+  for (const [execArgv, expected] of cases) {
+    const caseRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-argv-case-"));
+    const config = makeClaudeConfig(caseRoot, envFile, {
+      runtimeModule: path.join(caseRoot, "missing-runtime")
+    });
+    const emitted = [];
+    const exitCode = await runSupervisor(config, {
+      bindSignals: false,
+      env: claudeEnv(envFile),
+      execArgv,
+      writeEvent(event) {
+        emitted.push(event);
+      }
+    });
+    assert.equal(exitCode, EXIT_CODES.supervisorError, expected);
+    assert.equal(emitted.at(-1).code, expected, JSON.stringify(execArgv));
+    assert.equal(fs.existsSync(config.stateDir), false, expected);
+  }
+});
+
+test("claude contract is automatic even with empty caller env arrays", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-auto-"));
+  const envFile = makeClaudeAuthFixture(root);
+  const cases = [
+    [{}, "required_env_missing:" + CLAUDE_OAUTH_TOKEN_ENV],
+    [{ [CLAUDE_OAUTH_TOKEN_ENV]: "" }, "required_env_empty:" + CLAUDE_OAUTH_TOKEN_ENV],
+    ...CLAUDE_FORBIDDEN_ENV.map((name) => [
+      claudeEnv(envFile, { [name]: "FORBIDDEN_SECRET_VALUE" }),
+      "forbidden_env_present:" + name
+    ])
+  ];
+  for (const [env, expected] of cases) {
+    const caseRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-auto-case-"));
+    const config = makeClaudeConfig(caseRoot, envFile, {
+      requiredEnv: [],
+      forbiddenEnv: [],
+      runtimeModule: path.join(caseRoot, "missing-runtime")
+    });
+    const emitted = [];
+    const exitCode = await runSupervisor(config, {
+      bindSignals: false,
+      env,
+      execArgv: ["--env-file=" + envFile],
+      writeEvent(event) {
+        emitted.push(event);
+      }
+    });
+    assert.equal(exitCode, EXIT_CODES.supervisorError, expected);
+    assert.equal(emitted.at(-1).code, expected);
+    assert.equal(
+      JSON.stringify(emitted).includes("FORBIDDEN_SECRET_VALUE"),
+      false
+    );
+  }
+});
+
+test("claude guard proves the token came from the declared env file", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-source-"));
+  const envFile = makeClaudeAuthFixture(root);
+  const config = makeClaudeConfig(root, envFile, {
+    runtimeModule: path.join(root, "missing-runtime")
+  });
+  const emitted = [];
+  const exitCode = await runSupervisor(config, {
+    bindSignals: false,
+    env: { [CLAUDE_OAUTH_TOKEN_ENV]: "another-injected-token-value" },
+    execArgv: ["--env-file=" + envFile],
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  assert.equal(emitted.at(-1).code, "claude_env_token_source_mismatch");
+  const serialized = JSON.stringify(emitted);
+  assert.equal(serialized.includes(DUMMY_CLAUDE_TOKEN), false);
+  assert.equal(serialized.includes("another-injected-token-value"), false);
+});
+
+test("in-memory claude config without auth cannot bypass the guard", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-inmemory-"));
+  const envFile = makeClaudeAuthFixture(root);
+  for (const auth of [undefined, { kind: "api-key", envFile }]) {
+    const caseRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-inmemory-case-"));
+    const config = makeConfig(caseRoot, {
+      agent: "claude",
+      auth,
+      runtimeModule: path.join(caseRoot, "missing-runtime")
+    });
+    const emitted = [];
+    const exitCode = await runSupervisor(config, {
+      bindSignals: false,
+      env: claudeEnv(envFile),
+      execArgv: ["--env-file=" + envFile],
+      writeEvent(event) {
+        emitted.push(event);
+      }
+    });
+    assert.equal(exitCode, EXIT_CODES.supervisorError);
+    assert.equal(emitted.at(-1).code, "claude_auth_missing");
+  }
+
+  assert.throws(
+    () => runClaudeSupervisorPreflight(
+      makeConfig(root, { agent: "test-agent", auth: { kind: CLAUDE_AUTH_KIND, envFile } }),
+      claudeEnv(envFile),
+      []
+    ),
+    { code: "claude_auth_not_applicable" }
+  );
+});
+
+test("canonical claude launch reaches the runtime without token disclosure", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-happy-"));
+  const envFile = makeClaudeAuthFixture(root);
+  const { module, state } = makeRuntimeModule({
+    events: [{ type: "text_delta", stream: "output", text: "bounded result" }]
+  });
+  const config = makeClaudeConfig(root, envFile);
+  const emitted = [];
+  const exitCode = await runSupervisor(config, {
+    runtimeModule: module,
+    bindSignals: false,
+    env: claudeEnv(envFile),
+    execArgv: ["--env-file=" + envFile],
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.completed);
+  assert.ok(state.runtimeOptions);
+  assert.equal(emitted.at(-1).type, "terminal");
+  assert.equal(emitted.at(-1).status, "completed");
+  assert.equal(JSON.stringify(emitted).includes(DUMMY_CLAUDE_TOKEN), false);
+});
+
+test("non-claude agents keep the generic environment contract without argv proof", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-generic-env-"));
+  const { module, state } = makeRuntimeModule();
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(root, {
+    requiredEnv: ["ACP_TEST_REQUIRED_TOKEN"]
+  }), {
+    runtimeModule: module,
+    bindSignals: false,
+    env: { ACP_TEST_REQUIRED_TOKEN: "present" },
+    execArgv: [],
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.completed);
+  assert.ok(state.runtimeOptions);
 });

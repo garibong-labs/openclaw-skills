@@ -12,6 +12,24 @@ export const EXIT_CODES = Object.freeze({
   invalidConfig: 64
 });
 
+export const CLAUDE_AGENT = "claude";
+export const CLAUDE_AUTH_KIND = "claude-setup-token-env-file";
+export const CLAUDE_OAUTH_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN";
+// Credential-selection variables that would silently override or compete with
+// the injected setup token inside the Claude ACP adapter.
+export const CLAUDE_FORBIDDEN_ENV = Object.freeze([
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY"
+]);
+const MAX_CLAUDE_ENV_FILE_BYTES = 4096;
+// Exactly one assignment with an optional final newline. The value charset
+// excludes quotes, whitespace, comments, and interpolation so the file cannot
+// mean something different to Node's --env-file parser than it does here.
+const CLAUDE_ENV_FILE_ASSIGNMENT = /^CLAUDE_CODE_OAUTH_TOKEN=([A-Za-z0-9_-]+)\n?$/;
+
 const VALID_TOOL_KINDS = new Set([
   "read",
   "edit",
@@ -313,6 +331,152 @@ export function runEnvironmentPreflight(config, env) {
   }
 }
 
+// Validates the private Claude setup-token env file without ever exposing its
+// content. Returns the assigned token value for source comparison only; every
+// failure carries a sanitized code with no path, value, hash, or length.
+export function validateClaudeAuthEnvFile(envFilePath) {
+  if (typeof envFilePath !== "string" || !path.isAbsolute(envFilePath)) {
+    fail("claude_env_file_not_absolute");
+  }
+  if (process.platform === "win32" || typeof process.getuid !== "function") {
+    fail("claude_env_file_unsupported_platform");
+  }
+  const uid = process.getuid();
+
+  const parent = path.dirname(envFilePath);
+  let parentStat;
+  try {
+    parentStat = fs.lstatSync(parent);
+  } catch {
+    fail("claude_env_file_parent_missing");
+  }
+  if (parentStat.isSymbolicLink()) {
+    fail("claude_env_file_parent_symlink");
+  }
+  if (!parentStat.isDirectory()) {
+    fail("claude_env_file_parent_not_directory");
+  }
+  if (parentStat.uid !== uid) {
+    fail("claude_env_file_parent_owner");
+  }
+  if ((parentStat.mode & 0o777) !== 0o700) {
+    fail("claude_env_file_parent_permissions");
+  }
+
+  // Open with O_NOFOLLOW and check the open descriptor so the checked file is
+  // the read file, without a symlink or replacement race in between.
+  let fd;
+  try {
+    fd = fs.openSync(envFilePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (error) {
+    fail(error && error.code === "ELOOP"
+      ? "claude_env_file_symlink"
+      : "claude_env_file_missing");
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) {
+      fail("claude_env_file_not_regular");
+    }
+    if (stat.uid !== uid) {
+      fail("claude_env_file_owner");
+    }
+    if ((stat.mode & 0o777) !== 0o600) {
+      fail("claude_env_file_permissions");
+    }
+    if (stat.size === 0 || stat.size > MAX_CLAUDE_ENV_FILE_BYTES) {
+      fail("claude_env_file_size");
+    }
+    const buffer = Buffer.alloc(Number(stat.size));
+    const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    if (bytesRead !== buffer.length) {
+      fail("claude_env_file_size");
+    }
+    const match = CLAUDE_ENV_FILE_ASSIGNMENT.exec(buffer.toString("utf8"));
+    if (!match) {
+      fail("claude_env_file_format");
+    }
+    return match[1];
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Supervisor-side bypass guard. Runs before dynamic runtime import, probing,
+// or adapter startup, and re-asserts the auth profile rather than trusting a
+// config object assembled in memory. For agent "claude" it requires proof that
+// this exact process was started through the canonical --env-file injection,
+// and enforces the Claude credential contract even when the generic
+// requiredEnv/forbiddenEnv arrays are empty.
+export function runClaudeSupervisorPreflight(config, env, execArgv) {
+  if (config.agent !== CLAUDE_AGENT) {
+    if (config.auth !== undefined) {
+      fail("claude_auth_not_applicable");
+    }
+    return;
+  }
+
+  const auth = config.auth;
+  if (
+    !isPlainObject(auth) ||
+    auth.kind !== CLAUDE_AUTH_KIND ||
+    typeof auth.envFile !== "string" ||
+    !path.isAbsolute(auth.envFile)
+  ) {
+    fail("claude_auth_missing");
+  }
+
+  if (!Array.isArray(execArgv)) {
+    fail("claude_env_file_option_missing");
+  }
+  const envFileOptions = execArgv.filter((option) =>
+    typeof option === "string" &&
+    (option === "--env-file" || option.startsWith("--env-file"))
+  );
+  if (envFileOptions.length === 0) {
+    fail("claude_env_file_option_missing");
+  }
+  if (envFileOptions.length > 1) {
+    fail("claude_env_file_option_duplicate");
+  }
+  // Exactly one Node option, the exact canonical single-token spelling, bound
+  // to the declared file. A split "--env-file path" pair, an -if-exists
+  // variant, a different path, or any extra Node option is a bypass.
+  if (execArgv.length !== 1 || execArgv[0] !== "--env-file=" + auth.envFile) {
+    fail("claude_env_file_option_mismatch");
+  }
+
+  runEnvironmentPreflight(
+    { requiredEnv: [CLAUDE_OAUTH_TOKEN_ENV], forbiddenEnv: CLAUDE_FORBIDDEN_ENV },
+    env
+  );
+
+  const fileToken = validateClaudeAuthEnvFile(auth.envFile);
+  // Compare the loaded environment value to the file assignment without
+  // disclosing either; fixed-size digests avoid a value or length leak.
+  const digestOf = (value) => crypto.createHash("sha256").update(value, "utf8").digest();
+  if (!crypto.timingSafeEqual(digestOf(env[CLAUDE_OAUTH_TOKEN_ENV]), digestOf(fileToken))) {
+    fail("claude_env_token_source_mismatch");
+  }
+}
+
+function parseClaudeAuthProfile(value) {
+  if (!isPlainObject(value)) {
+    fail("invalid_auth");
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== 2 || !keys.includes("kind") || !keys.includes("envFile")) {
+    fail("invalid_auth");
+  }
+  if (value.kind !== CLAUDE_AUTH_KIND) {
+    fail("invalid_auth_kind");
+  }
+  return {
+    kind: CLAUDE_AUTH_KIND,
+    envFile: resolveAbsolute(value.envFile, "invalid_auth_env_file")
+  };
+}
+
 export function loadSupervisorConfig(configPath) {
   const absoluteConfigPath = resolveAbsolute(configPath, "invalid_config_path");
   assertPrivateFile(absoluteConfigPath, "invalid_config_file");
@@ -325,6 +489,16 @@ export function loadSupervisorConfig(configPath) {
   }
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     fail("invalid_config_object");
+  }
+
+  const agent = assertIdentifier(raw.agent, "invalid_agent", 128);
+  let auth;
+  if (agent === CLAUDE_AGENT) {
+    auth = parseClaudeAuthProfile(raw.auth);
+  } else if (raw.auth !== undefined) {
+    // A Claude auth profile on a non-Claude agent is misleading: it would
+    // never be enforced, so it is rejected rather than silently ignored.
+    fail("invalid_auth_agent");
   }
 
   const cwd = resolveAbsolute(raw.cwd, "invalid_cwd");
@@ -362,6 +536,23 @@ export function loadSupervisorConfig(configPath) {
       fail("invalid_env_contract_overlap");
     }
   }
+  if (agent === CLAUDE_AGENT) {
+    // The Claude credential contract is enforced automatically at run time;
+    // a caller-declared contract that contradicts it is invalid config.
+    const implicitForbidden = new Set(
+      CLAUDE_FORBIDDEN_ENV.map((name) => name.toUpperCase())
+    );
+    for (const name of requiredEnv) {
+      if (implicitForbidden.has(name.toUpperCase())) {
+        fail("invalid_env_contract_overlap");
+      }
+    }
+    for (const name of forbiddenEnv) {
+      if (name.toUpperCase() === CLAUDE_OAUTH_TOKEN_ENV) {
+        fail("invalid_env_contract_overlap");
+      }
+    }
+  }
 
   const lifecycle = parseLifecycleContract(raw.lifecycle);
 
@@ -377,7 +568,8 @@ export function loadSupervisorConfig(configPath) {
   }
 
   return {
-    agent: assertIdentifier(raw.agent, "invalid_agent", 128),
+    agent,
+    auth,
     model: raw.model === undefined ? undefined : assertIdentifier(raw.model, "invalid_model", 256),
     cwd,
     sessionKey: assertString(raw.sessionKey, "invalid_session_key", 256),
@@ -808,7 +1000,7 @@ function safeStopReason(value) {
   return /^[a-zA-Z0-9_.:-]{1,96}$/.test(value) ? value : undefined;
 }
 
-function safeDiagnosticCode(value, fallback, maxLength = 128) {
+export function safeDiagnosticCode(value, fallback, maxLength = 128) {
   if (typeof value !== "string") {
     return fallback;
   }
@@ -1036,6 +1228,11 @@ export async function runSupervisor(config, dependencies = {}) {
 
   try {
     runStartReceiptPreflight(config, now());
+    runClaudeSupervisorPreflight(
+      config,
+      dependencies.env || process.env,
+      dependencies.execArgv || process.execArgv
+    );
     runEnvironmentPreflight(config, dependencies.env || process.env);
     preparePrivateStateDirectory(config.stateDir);
     if (fs.existsSync(config.responseFile)) {
