@@ -1,6 +1,13 @@
 ---
 name: "acp-discord-orchestrator"
 description: "Track foreground ACPX turns with bounded CLI exit and exact completion."
+runtime:
+  - node (22.13+; the Claude launcher additionally needs process.execve — 22.15+ in the 22.x line, 23.11+ in the 23.x line, or any later line — on a POSIX platform)
+credentials:
+  - purpose: Claude Code setup token for ACP runs with agent "claude", injected only via node --env-file by scripts/claude-acp-launcher.mjs
+    required: false
+    format: private env file with exactly one line, CLAUDE_CODE_OAUTH_TOKEN=<token>, mode 0600 inside a 0700 owner-only directory
+    note: Required exactly when agent is "claude". The config carries only the auth.envFile path; the token value never appears in config, argv, events, or logs and is never committed.
 ---
 
 # ACP Discord Orchestrator
@@ -11,7 +18,7 @@ Run each agent-started ACP task through one observable direct ACPX turn. Keep th
 
 Use `scripts/acpx-foreground-supervisor.mjs` for every ACP task started by the calling agent.
 
-For `agent: "claude"`, start the supervisor only through the canonical launcher `scripts/claude-acp-launcher.mjs`. It validates the config's `auth` declaration, the parent environment, and the private setup-token env file, then replaces its own process with the supervisor via POSIX `process.execve` so the run still owns exactly one foreground PID and the supervisor starts as `node --env-file=<auth.envFile> acpx-foreground-supervisor.mjs --config <config>`. The launcher requires Node.js 22.15 or newer for `process.execve` and fails closed without it. A bare direct Claude supervisor launch is a bypass and fails closed with the supervisor policy exit before any runtime loading.
+For `agent: "claude"`, start the supervisor only through the canonical launcher `scripts/claude-acp-launcher.mjs`. It validates the config's `auth` declaration, the parent environment, and the private setup-token env file, then replaces its own process with the supervisor via POSIX `process.execve` so the run still owns exactly one foreground PID and the supervisor starts as `node --env-file=<auth.envFile> acpx-foreground-supervisor.mjs --config <config>`. The launcher requires a POSIX platform and a Node.js runtime with `process.execve` — 22.15 or newer in the 22.x line, 23.11 or newer in the 23.x line, or any later release line (23.0–23.10 lack it) — and fails closed with `execve_unsupported` everywhere else. A bare direct Claude supervisor launch is a bypass and fails closed with the supervisor policy exit before any runtime loading. The agent name must be the canonical lowercase `claude`: ACPX normalizes agent names, so other spellings would reach the same adapter and are rejected as invalid config.
 
 Do not use:
 
@@ -38,9 +45,13 @@ This policy does not globally disable human-operated OpenClaw ACP commands.
    "auth": { "kind": "claude-setup-token-env-file", "envFile": "/absolute/private/claude-acp-oauth.env" }
    ```
 
-   The env file holds exactly one line, `CLAUDE_CODE_OAUTH_TOKEN=<token>`, with no quotes, comments, or extra variables. Its parent directory must be a real owner-only (0700) directory and the file a real owner-only (0600) regular file, both owned by the launching user. The Claude credential contract — `CLAUDE_CODE_OAUTH_TOKEN` required, competing `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, and `CLAUDE_CODE_USE_FOUNDRY` forbidden — is enforced automatically even when `requiredEnv` and `forbiddenEnv` are empty. Never place the token value in the config, argv, or any argument.
+   The env file holds exactly one line, `CLAUDE_CODE_OAUTH_TOKEN=<token>`, with no quotes, comments, or extra variables. Its parent directory must be a real owner-only (0700) directory and the file a real owner-only (0600) regular file, both owned by the launching user. The Claude credential contract — `CLAUDE_CODE_OAUTH_TOKEN` required; competing `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, and `CLAUDE_CODE_USE_FOUNDRY` forbidden; and every injection-capable variable in the runtime contract's clean-baseline list (`NODE_OPTIONS`, dynamic-linker preloads, Anthropic endpoint/header/config selectors, proxy selectors) forbidden — is enforced automatically even when `requiredEnv` and `forbiddenEnv` are empty. Never place the token value in the config, argv, or any argument.
+
+   The template ships with this Claude `auth` block. For every other agent, delete the entire `auth` block and set `agent` accordingly: an `auth` profile on a non-Claude agent is invalid config (`invalid_auth_agent`), and non-Claude runs declare their whole environment contract through `requiredEnv`/`forbiddenEnv` instead.
+
+   The launcher certifies a clean parent environment and unsets nothing silently. If the launching shell already exports `CLAUDE_CODE_OAUTH_TOKEN` (even empty), a competing credential selector, or an injection-capable variable such as `NODE_OPTIONS`, the launch fails closed with a code naming the variable. Remediate by removing the variable explicitly in the launching shell — for example `env -u NODE_OPTIONS -u CLAUDE_CODE_OAUTH_TOKEN node …` — rather than expecting the launcher to strip it.
 10. Define terminal acceptance checks in the prompt.
-11. Resolve this skill's directory and run the run's canonical entry point by absolute path in the foreground. For Claude (Node.js 22.15 or newer):
+11. Resolve this skill's directory and run the run's canonical entry point by absolute path in the foreground. For Claude (POSIX, Node.js 22.15+/23.11+ or any later line):
 
 ```bash
 node /absolute/path/to/acp-discord-orchestrator/scripts/claude-acp-launcher.mjs --config /absolute/private/run.json

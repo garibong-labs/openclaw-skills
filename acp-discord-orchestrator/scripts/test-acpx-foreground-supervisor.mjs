@@ -1,19 +1,25 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   CLAUDE_AUTH_KIND,
   CLAUDE_FORBIDDEN_ENV,
+  CLAUDE_IMPLICIT_ENV_CONTRACT,
+  CLAUDE_INJECTION_ENV,
   CLAUDE_OAUTH_TOKEN_ENV,
   EXIT_CODES,
   buildPermissionHandler,
   classifyPermissionRequest,
   containsDetachedShell,
   discoverRuntimeLocation,
+  isClaudeAgent,
+  isCliEntry,
   loadSupervisorConfig,
   main,
   normalizeRuntimeEvent,
@@ -1504,6 +1510,10 @@ test("claude config requires the exact setup-token auth profile", () => {
     }, "invalid_env_contract_overlap"],
     [{
       auth: { kind: CLAUDE_AUTH_KIND, envFile: "/private/x.env" },
+      requiredEnv: ["NODE_OPTIONS"]
+    }, "invalid_env_contract_overlap"],
+    [{
+      auth: { kind: CLAUDE_AUTH_KIND, envFile: "/private/x.env" },
       forbiddenEnv: ["claude_code_oauth_token"]
     }, "invalid_env_contract_overlap"],
     [{
@@ -1691,14 +1701,17 @@ test("claude exec argv proof rejects every bypass spelling", POSIX_ONLY, async (
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-argv-"));
   const envFile = makeClaudeAuthFixture(root);
   const cases = [
+    // Property-presence dependency injection: the explicit undefined must
+    // exercise the non-array branch instead of falling back to the host
+    // process's own exec argv.
     [undefined, "claude_env_file_option_missing"],
     [[], "claude_env_file_option_missing"],
-    [["--test"], "claude_env_file_option_missing"],
+    [["--test"], "claude_env_file_option_mismatch"],
     [["--env-file=relative/claude.env"], "claude_env_file_option_mismatch"],
     [["--env-file=" + envFile + ".other"], "claude_env_file_option_mismatch"],
     [["--env-file-if-exists=" + envFile], "claude_env_file_option_mismatch"],
     [["--env-file", envFile], "claude_env_file_option_mismatch"],
-    [["--env-file=" + envFile, "--env-file=" + envFile], "claude_env_file_option_duplicate"],
+    [["--env-file=" + envFile, "--env-file=" + envFile], "claude_env_file_option_mismatch"],
     [["--env-file=" + envFile, "--experimental-vm-modules"], "claude_env_file_option_mismatch"]
   ];
   for (const [execArgv, expected] of cases) {
@@ -1724,14 +1737,28 @@ test("claude exec argv proof rejects every bypass spelling", POSIX_ONLY, async (
 test("claude contract is automatic even with empty caller env arrays", POSIX_ONLY, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-auto-"));
   const envFile = makeClaudeAuthFixture(root);
+  // The implicit contract covers the credential selectors and every
+  // injection-capable variable (NODE_OPTIONS preloads, dynamic-linker
+  // preloads, endpoint/header/config selectors, proxies): none of them can
+  // be non-empty in the token-bearing supervisor's environment.
   const cases = [
     [{}, "required_env_missing:" + CLAUDE_OAUTH_TOKEN_ENV],
     [{ [CLAUDE_OAUTH_TOKEN_ENV]: "" }, "required_env_empty:" + CLAUDE_OAUTH_TOKEN_ENV],
-    ...CLAUDE_FORBIDDEN_ENV.map((name) => [
+    ...CLAUDE_IMPLICIT_ENV_CONTRACT.forbiddenEnv.map((name) => [
       claudeEnv(envFile, { [name]: "FORBIDDEN_SECRET_VALUE" }),
       "forbidden_env_present:" + name
     ])
   ];
+  assert.ok(CLAUDE_IMPLICIT_ENV_CONTRACT.forbiddenEnv.includes("NODE_OPTIONS"));
+  assert.ok(CLAUDE_IMPLICIT_ENV_CONTRACT.forbiddenEnv.includes("LD_PRELOAD"));
+  assert.ok(CLAUDE_IMPLICIT_ENV_CONTRACT.forbiddenEnv.includes("DYLD_INSERT_LIBRARIES"));
+  assert.ok(CLAUDE_IMPLICIT_ENV_CONTRACT.forbiddenEnv.includes("ANTHROPIC_BASE_URL"));
+  for (const name of CLAUDE_FORBIDDEN_ENV) {
+    assert.ok(CLAUDE_IMPLICIT_ENV_CONTRACT.forbiddenEnv.includes(name), name);
+  }
+  for (const name of CLAUDE_INJECTION_ENV) {
+    assert.ok(CLAUDE_IMPLICIT_ENV_CONTRACT.forbiddenEnv.includes(name), name);
+  }
   for (const [env, expected] of cases) {
     const caseRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-auto-case-"));
     const config = makeClaudeConfig(caseRoot, envFile, {
@@ -1853,4 +1880,143 @@ test("non-claude agents keep the generic environment contract without argv proof
   });
   assert.equal(exitCode, EXIT_CODES.completed);
   assert.ok(state.runtimeOptions);
+});
+
+test("non-canonical claude spellings cannot bypass the claude gates", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-case-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+
+  assert.equal(isClaudeAgent("claude"), true);
+  assert.equal(isClaudeAgent("Claude"), true);
+  assert.equal(isClaudeAgent("CLAUDE"), true);
+  assert.equal(isClaudeAgent(" claude "), true);
+  assert.equal(isClaudeAgent("claude-x"), false);
+  assert.equal(isClaudeAgent(7), false);
+
+  // On-disk configs: any spelling ACPX would normalize to "claude" other
+  // than the canonical one is invalid config, with or without auth.
+  let caseIndex = 0;
+  for (const agent of ["Claude", "CLAUDE", "cLaUdE"]) {
+    caseIndex += 1;
+    const configFile = path.join(root, "case-" + String(caseIndex) + ".json");
+    fs.writeFileSync(configFile, JSON.stringify({
+      agent,
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile: path.join(root, "response-" + String(caseIndex) + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: root,
+      timeoutMs: 30000,
+      lifecycle: rawLifecycle(),
+      allowKinds: ["read"]
+    }), { mode: 0o600 });
+    assert.throws(
+      () => loadSupervisorConfig(configFile),
+      { code: "invalid_agent_not_canonical" },
+      agent
+    );
+  }
+
+  // In-memory configs: a normalized-to-claude spelling reaching the
+  // supervisor without the canonical value gets the Claude gate, not the
+  // generic path — previously "Claude" skipped auth, argv proof, and the
+  // credential contract entirely and still resolved to Claude in ACPX.
+  for (const agent of ["Claude", " claude "]) {
+    const caseRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-case-mem-"));
+    const config = makeConfig(caseRoot, {
+      agent,
+      runtimeModule: path.join(caseRoot, "missing-runtime")
+    });
+    const emitted = [];
+    const exitCode = await runSupervisor(config, {
+      bindSignals: false,
+      env: {},
+      execArgv: [],
+      writeEvent(event) {
+        emitted.push(event);
+      }
+    });
+    assert.equal(exitCode, EXIT_CODES.supervisorError, agent);
+    assert.equal(emitted.at(-1).code, "claude_agent_not_canonical", agent);
+    assert.equal(fs.existsSync(config.stateDir), false, agent);
+  }
+
+  assert.throws(
+    () => runClaudeSupervisorPreflight({ agent: "Claude" }, {}, []),
+    { code: "claude_agent_not_canonical" }
+  );
+});
+
+test("claude env file rejects a FIFO without blocking", POSIX_ONLY, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-fifo-"));
+  const authDir = path.join(root, "auth");
+  fs.mkdirSync(authDir, { mode: 0o700 });
+  fs.chmodSync(authDir, 0o700);
+  const fifoPath = path.join(authDir, "claude-acp-oauth.env");
+  const created = spawnSync("mkfifo", ["-m", "600", fifoPath], { timeout: 5000 });
+  assert.equal(created.status, 0, String(created.stderr));
+
+  // An open-first validation would block here forever waiting for a writer;
+  // the lstat pre-check must fail closed immediately instead.
+  const startedAt = Date.now();
+  assert.throws(
+    () => validateClaudeAuthEnvFile(fifoPath),
+    { code: "claude_env_file_not_regular" }
+  );
+  assert.ok(Date.now() - startedAt < 2000);
+});
+
+test("claude env file open errors map to bounded distinct codes", POSIX_ONLY, () => {
+  // EACCES on open: correct type and ownership, but no read permission. The
+  // mode gate itself lives behind fstat, so the open is what fails first.
+  const deniedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-denied-"));
+  const deniedFile = makeClaudeAuthFixture(deniedRoot, { fileMode: 0o000 });
+  assert.throws(
+    () => validateClaudeAuthEnvFile(deniedFile),
+    { code: "claude_env_file_open_denied" }
+  );
+
+  // ENOENT stays the missing-file code.
+  const missingRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-envmap-"));
+  fs.chmodSync(missingRoot, 0o700);
+  assert.throws(
+    () => validateClaudeAuthEnvFile(path.join(missingRoot, "absent.env")),
+    { code: "claude_env_file_missing" }
+  );
+});
+
+test("cli entry guard is realpath-safe for symlinked entry paths", () => {
+  const moduleUrl = pathToFileURL(fs.realpathSync(fileURLToPath(import.meta.url))).href;
+  assert.equal(isCliEntry(fileURLToPath(import.meta.url), moduleUrl), true);
+  assert.equal(isCliEntry(undefined, moduleUrl), false);
+  assert.equal(isCliEntry("", moduleUrl), false);
+  assert.equal(isCliEntry(path.join(os.tmpdir(), "does-not-exist.mjs"), moduleUrl), false);
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-entry-guard-"));
+  const link = path.join(root, "entry-link.mjs");
+  fs.symlinkSync(fileURLToPath(import.meta.url), link);
+  assert.equal(isCliEntry(link, moduleUrl), true);
+});
+
+test("supervisor invoked through a symlinked path still runs main", POSIX_ONLY, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-entry-symlink-"));
+  const supervisorFile = fileURLToPath(
+    new URL("./acpx-foreground-supervisor.mjs", import.meta.url)
+  );
+  const link = path.join(root, "supervisor-link.mjs");
+  fs.symlinkSync(supervisorFile, link);
+
+  // Before the realpath-safe guard, a symlinked argv path (or macOS /tmp)
+  // made the module-vs-argv comparison false, so the CLI silently exited 0
+  // without running main. A usage failure proves main actually ran.
+  const result = spawnSync(process.execPath, [link], {
+    encoding: "utf8",
+    timeout: 15000
+  });
+  assert.equal(result.status, EXIT_CODES.invalidConfig);
+  const events = result.stdout.trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(events.at(-1).type, "supervisor_error");
+  assert.equal(events.at(-1).code, "usage");
 });

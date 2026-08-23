@@ -133,7 +133,7 @@ Refer to each skill's `SKILL.md` for detailed setup instructions and usage examp
 | Skill | Runtime | Additional requirements |
 |-------|---------|-------------------------|
 | `tistory-publish` | Python 3.9+, Playwright; Node.js 18+ (optional, banner generation) | OpenClaw Chrome reachable over CDP, logged-in Tistory session (or Kakao credentials for `login.sh`) |
-| `acp-discord-orchestrator` | Node.js 22.13+ | OpenClaw ACPX plugin 0.11.2+ |
+| `acp-discord-orchestrator` | Node.js 22.13+; the Claude launcher needs `process.execve` (22.15+/23.11+ or any later line, POSIX only) | OpenClaw ACPX plugin 0.11.2+ |
 | `ipo-alert` | Python 3.6+ (stdlib only) | `curl` |
 | `olympic-alert` | Python 3.6+ (stdlib only) | — |
 | `daum-trends` | Python 3.10+ (stdlib only) | — |
@@ -154,6 +154,7 @@ node tistory-publish/tests/test_tistory_editor_helpers.js
 
 # acp-discord-orchestrator
 node --test acp-discord-orchestrator/scripts/test-acpx-foreground-supervisor.mjs
+node --test acp-discord-orchestrator/scripts/test-claude-acp-launcher.mjs
 node --test tests/acp-discord-orchestrator-cli.test.mjs
 ```
 

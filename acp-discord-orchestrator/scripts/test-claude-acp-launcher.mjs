@@ -14,6 +14,7 @@ import {
 import {
   CLAUDE_AUTH_KIND,
   CLAUDE_FORBIDDEN_ENV,
+  CLAUDE_INJECTION_ENV,
   CLAUDE_OAUTH_TOKEN_ENV,
   EXIT_CODES
 } from "./acpx-foreground-supervisor.mjs";
@@ -121,11 +122,10 @@ function writeClaudeRunConfig(root, overrides = {}) {
 
 function cleanSpawnEnv(overrides = {}) {
   const env = { ...process.env, ...overrides };
-  delete env.NODE_OPTIONS;
   if (!(CLAUDE_OAUTH_TOKEN_ENV in overrides)) {
     delete env[CLAUDE_OAUTH_TOKEN_ENV];
   }
-  for (const name of CLAUDE_FORBIDDEN_ENV) {
+  for (const name of [...CLAUDE_FORBIDDEN_ENV, ...CLAUDE_INJECTION_ENV]) {
     if (!(name in overrides)) {
       delete env[name];
     }
@@ -185,6 +185,14 @@ test("launcher parent-environment preflight fails closed per credential", () => 
     );
     runLauncherEnvironmentPreflight({ [name]: "" });
   }
+  for (const name of CLAUDE_INJECTION_ENV) {
+    assert.throws(
+      () => runLauncherEnvironmentPreflight({ [name]: "--require /tmp/x" }),
+      { code: "claude_env_injection_capable:" + name },
+      name
+    );
+    runLauncherEnvironmentPreflight({ [name]: "" });
+  }
 });
 
 test("launcher CLI usage and config-shape errors keep exit 64", POSIX_ONLY, async () => {
@@ -235,6 +243,15 @@ test("launcher rejects credentialed parent environments before re-exec", POSIX_O
     ...CLAUDE_FORBIDDEN_ENV.map((name) => [
       { [name]: "1" },
       "claude_competing_credential:" + name
+    ]),
+    // Injection-capable variables (Node preloads, dynamic-linker preloads,
+    // Anthropic endpoint/header/config selectors, proxies) never show up in
+    // the supervisor's exec-argv proof, so the launcher must reject them
+    // before the token-bearing re-exec. Empty values stay allowed: an empty
+    // string cannot inject anything.
+    ...CLAUDE_INJECTION_ENV.map((name) => [
+      { [name]: "/tmp/injected" },
+      "claude_env_injection_capable:" + name
     ])
   ];
   for (const [env, expected] of cases) {
@@ -430,9 +447,15 @@ test("public docs and template describe the canonical claude route", () => {
     assert.match(doc, /claude-acp-launcher\.mjs/);
     assert.match(doc, /claude-setup-token-env-file/);
     assert.match(doc, /process\.execve|--env-file/);
+    // Accurate runtime matrix: execve exists in 22.15+ (22.x), 23.11+
+    // (23.x), and every later release line, on POSIX platforms only.
+    assert.match(doc, /22\.15/);
+    assert.match(doc, /23\.11/);
+    // The clean-baseline contract names the preload-injection rejection.
+    assert.match(doc, /NODE_OPTIONS/);
   }
-  assert.match(skill, /22\.15/);
   assert.match(contract, /^## Claude credential injection$/m);
+  assert.match(contract, /launcher_error/);
 
   assert.equal(template.agent, "claude");
   assert.equal(template.auth.kind, CLAUDE_AUTH_KIND);
@@ -440,4 +463,152 @@ test("public docs and template describe the canonical claude route", () => {
   const serialized = skill + contract + JSON.stringify(template);
   assert.doesNotMatch(serialized, /sk-ant-/);
   assert.doesNotMatch(serialized, /\/Users\/[a-z]/);
+});
+
+test("launcher rejects a non-canonical claude spelling as invalid config", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-launcher-case-"));
+  const envFile = makeAuthEnvFile(root);
+  const configFile = writeClaudeRunConfig(root, {
+    agent: "Claude",
+    auth: { kind: CLAUDE_AUTH_KIND, envFile }
+  });
+  let execveCalled = false;
+  const sink = collectEvents();
+  const exitCode = await main(["--config", configFile], {
+    env: {},
+    execve() {
+      execveCalled = true;
+    },
+    writeEvent: sink.writeEvent
+  });
+  assert.equal(exitCode, EXIT_CODES.invalidConfig);
+  assert.equal(sink.events.at(-1).type, "launcher_error");
+  assert.equal(sink.events.at(-1).code, "invalid_agent_not_canonical");
+  assert.equal(execveCalled, false);
+});
+
+test("launcher pre-checks exec targets and maps a throwing execve", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-launcher-targets-"));
+  const envFile = makeAuthEnvFile(root);
+  const configFile = writeClaudeRunConfig(root, {
+    auth: { kind: CLAUDE_AUTH_KIND, envFile }
+  });
+
+  const targetCases = [
+    [{ execPath: path.join(root, "missing-node") }, "launcher_exec_target_missing"],
+    [{ supervisorPath: path.join(root, "missing-supervisor.mjs") }, "launcher_supervisor_missing"]
+  ];
+  for (const [overrides, expected] of targetCases) {
+    let execveCalled = false;
+    const sink = collectEvents();
+    const exitCode = await main(["--config", configFile], {
+      env: {},
+      ...overrides,
+      execve() {
+        execveCalled = true;
+      },
+      writeEvent: sink.writeEvent
+    });
+    assert.equal(exitCode, EXIT_CODES.supervisorError, expected);
+    assert.equal(sink.events.at(-1).code, expected);
+    assert.equal(execveCalled, false, expected);
+  }
+
+  // The real process.execve throws a catchable system error on failure; the
+  // launcher maps it to a bounded code instead of leaking error text.
+  const throwingSink = collectEvents();
+  const exitCode = await main(["--config", configFile], {
+    env: {},
+    execve() {
+      const error = new Error("boom");
+      error.code = "ETXTBSY";
+      throw error;
+    },
+    writeEvent: throwingSink.writeEvent
+  });
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  assert.equal(throwingSink.events.at(-1).code, "execve_failed:ETXTBSY");
+});
+
+test("real execve failure throws and is catchable, not an abort", EXECVE_E2E, () => {
+  // Regression proof for the launcher's failure contract: a failing
+  // process.execve raises a normal system error in-process, so the
+  // launcher's catch path is reachable with the real binding.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-execve-throw-"));
+  const probe = path.join(root, "probe.mjs");
+  fs.writeFileSync(probe, [
+    "try {",
+    "  process.execve(process.argv[2], [process.argv[2]], {});",
+    "  console.log('returned');",
+    "} catch (error) {",
+    "  console.log('threw:' + error.code);",
+    "}"
+  ].join("\n"), { mode: 0o600 });
+  const result = spawnSync(process.execPath, [
+    probe,
+    path.join(root, "missing-target")
+  ], { encoding: "utf8", timeout: 15000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.signal, null);
+  assert.match(result.stdout, /^threw:ENOENT$/m);
+});
+
+test("parent NODE_OPTIONS preload cannot reach the token-bearing re-exec", POSIX_ONLY, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-launcher-preload-"));
+  const envFile = makeAuthEnvFile(root);
+  const runtimeDir = makeMockRuntimePackage(root);
+  const configFile = writeClaudeRunConfig(root, {
+    runtimeModule: runtimeDir,
+    auth: { kind: CLAUDE_AUTH_KIND, envFile }
+  });
+
+  // The preload marker records whether it ever observed the setup token.
+  // Node itself preloads it into the launcher process (that is unavoidable
+  // and token-free); the launcher must then refuse the re-exec so the marker
+  // never runs inside a process whose environment holds the token.
+  const canary = path.join(root, "preload-canary.txt");
+  const marker = path.join(root, "marker.cjs");
+  fs.writeFileSync(marker, [
+    "require('node:fs').appendFileSync(" + JSON.stringify(canary) + ",",
+    "  'token_present=' + String(" +
+      JSON.stringify(CLAUDE_OAUTH_TOKEN_ENV) + " in process.env) + '\\n');"
+  ].join("\n"), { mode: 0o600 });
+
+  const result = spawnSync(process.execPath, [LAUNCHER_PATH, "--config", configFile], {
+    env: cleanSpawnEnv({ NODE_OPTIONS: "--require " + marker }),
+    encoding: "utf8",
+    timeout: 30000
+  });
+
+  assert.equal(result.status, EXIT_CODES.supervisorError);
+  const events = result.stdout.trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(events.at(-1).type, "launcher_error");
+  assert.equal(events.at(-1).code, "claude_env_injection_capable:NODE_OPTIONS");
+  // No supervisor start, no state, no response: the re-exec never happened.
+  assert.equal(events.some((event) => event.type === "started"), false);
+  assert.equal(fs.existsSync(path.join(root, "state")), false);
+  assert.equal(fs.existsSync(path.join(root, "response.txt")), false);
+  // The marker ran only in token-free processes.
+  if (fs.existsSync(canary)) {
+    assert.doesNotMatch(fs.readFileSync(canary, "utf8"), /token_present=true/);
+  }
+});
+
+test("launcher invoked through a symlinked path still runs main", POSIX_ONLY, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-launcher-symlink-"));
+  const link = path.join(root, "launcher-link.mjs");
+  fs.symlinkSync(LAUNCHER_PATH, link);
+
+  // Before the realpath-safe entry guard, a symlinked argv path (or macOS
+  // /tmp) silently exited 0 without running main. A usage failure proves
+  // main actually ran.
+  const result = spawnSync(process.execPath, [link], {
+    env: cleanSpawnEnv(),
+    encoding: "utf8",
+    timeout: 15000
+  });
+  assert.equal(result.status, EXIT_CODES.invalidConfig);
+  const events = result.stdout.trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(events.at(-1).type, "launcher_error");
+  assert.equal(events.at(-1).code, "usage");
 });
