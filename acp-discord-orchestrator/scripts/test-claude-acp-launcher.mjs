@@ -96,16 +96,24 @@ function makeMockRuntimePackage(root) {
 const CONTROL_CONVERSATION_ID = "100000000000000001";
 const START_MESSAGE_ID = "100000000000000002";
 
-// Deterministic acp-reporting-v1 bundle from the shared integration fixture,
-// bound to the launcher lifecycle fixture. Launcher fixtures need this to
-// pass the mandatory reporting config gate and reach auth/exec behavior.
+// Deterministic claude acp-reporting-v2 bundle from the shared integration
+// fixture, bound to the launcher lifecycle fixture. Launcher fixtures need
+// this to pass the mandatory reporting config gate and reach auth/exec
+// behavior.
 function validReporting({
   controlConversationId = CONTROL_CONVERSATION_ID,
   messageId = START_MESSAGE_ID,
   deliveredAt,
+  agent = "claude",
   model = "test-model"
 }) {
-  return buildValidReporting({ controlConversationId, messageId, deliveredAt, model });
+  return buildValidReporting({
+    agent,
+    controlConversationId,
+    messageId,
+    deliveredAt,
+    model
+  });
 }
 
 function writeClaudeRunConfig(root, overrides = {}) {
@@ -113,6 +121,12 @@ function writeClaudeRunConfig(root, overrides = {}) {
   fs.writeFileSync(prompt, "perform the bounded test task", { mode: 0o600 });
   const configFile = path.join(root, "run.json");
   const deliveredAt = new Date().toISOString();
+  // The reporting bundle must bind to the effective agent so overriding the
+  // agent (to exercise the launcher's own agent gate) still ships a bundle
+  // the loader accepts; deliberately non-canonical spellings fail the loader
+  // before reporting and keep the default claude bundle.
+  const agent = overrides.agent ?? "claude";
+  const reportingAgent = agent === "codex" ? "codex" : "claude";
   fs.writeFileSync(configFile, JSON.stringify({
     agent: "claude",
     model: "test-model",
@@ -133,7 +147,7 @@ function writeClaudeRunConfig(root, overrides = {}) {
         deliveredAt
       }
     },
-    reporting: validReporting({ deliveredAt }),
+    reporting: validReporting({ deliveredAt, agent: reportingAgent }),
     allowKinds: ["read", "execute"],
     ...overrides
   }), { mode: 0o600 });
@@ -230,15 +244,30 @@ test("launcher CLI usage and config-shape errors keep exit 64", POSIX_ONLY, asyn
   );
   assert.equal(relativeSink.events.at(-1).code, "invalid_config_path_not_absolute");
 
+  // A valid supported non-Claude agent loads but is refused by the launcher:
+  // the canonical Claude route is for agent "claude" only.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-launcher-agent-"));
   makeAuthEnvFile(root);
-  const configFile = writeClaudeRunConfig(root, { agent: "test-agent" });
+  const configFile = writeClaudeRunConfig(root, { agent: "codex" });
   const agentSink = collectEvents();
   assert.equal(
     await main(["--config", configFile], { env: {}, writeEvent: agentSink.writeEvent }),
     EXIT_CODES.invalidConfig
   );
   assert.equal(agentSink.events.at(-1).code, "launcher_agent_not_claude");
+
+  // An agent outside the closed presentation mapping never loads at all: the
+  // reporting contract rejects it during config loading, before the
+  // launcher's own agent gate.
+  const unsupportedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-launcher-unsupported-"));
+  makeAuthEnvFile(unsupportedRoot);
+  const unsupportedConfig = writeClaudeRunConfig(unsupportedRoot, { agent: "test-agent" });
+  const unsupportedSink = collectEvents();
+  assert.equal(
+    await main(["--config", unsupportedConfig], { env: {}, writeEvent: unsupportedSink.writeEvent }),
+    EXIT_CODES.invalidConfig
+  );
+  assert.equal(unsupportedSink.events.at(-1).code, "invalid_reporting_agent");
 
   const missingAuthRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-launcher-noauth-"));
   const missingAuthConfig = writeClaudeRunConfig(missingAuthRoot);
@@ -463,6 +492,11 @@ test("public docs and template describe the canonical claude route", () => {
     "utf8"
   ));
 
+  const claudeProfile = JSON.parse(fs.readFileSync(
+    new URL("../templates/claude-auth-profile.json", import.meta.url),
+    "utf8"
+  ));
+
   for (const doc of [skill, contract]) {
     assert.match(doc, /claude-acp-launcher\.mjs/);
     assert.match(doc, /claude-setup-token-env-file/);
@@ -477,23 +511,32 @@ test("public docs and template describe the canonical claude route", () => {
   assert.match(contract, /^## Claude credential injection$/m);
   assert.match(contract, /launcher_error/);
 
-  assert.equal(template.agent, "claude");
-  assert.equal(template.auth.kind, CLAUDE_AUTH_KIND);
-  assert.match(template.auth.envFile, /^\/absolute\//);
+  // The main template is agent-neutral: no auth block ships in it, and the
+  // agent is a caller-substituted placeholder. Claude-specific auth lives in
+  // the explicitly provider-specific profile template.
+  assert.equal(template.agent, "AGENT_NAME");
+  assert.equal("auth" in template, false);
+  assert.equal(claudeProfile.agent, "claude");
+  assert.equal(claudeProfile.auth.kind, CLAUDE_AUTH_KIND);
+  assert.match(claudeProfile.auth.envFile, /^\/absolute\//);
 
-  // Both public docs must describe the mandatory fail-closed reporting gate,
-  // and the runtime contract must document every stable reporting error code
-  // the validator can produce.
+  // Both public docs must describe the mandatory fail-closed reporting gate —
+  // the current v2 schema, its bounded v1 Claude migration path, and the
+  // closed agent presentation mapping — and the runtime contract must
+  // document every stable reporting error code the validator can produce.
   for (const doc of [skill, contract]) {
+    assert.match(doc, /acp-reporting-v2/);
     assert.match(doc, /acp-reporting-v1/);
     assert.match(doc, /invalid_reporting_/);
+    assert.match(doc, /Claude Code/);
+    assert.match(doc, /Codex/);
   }
   assert.match(contract, /^## Reporting contract$/m);
   for (const code of ACP_REPORTING_ERROR_CODES) {
     assert.ok(contract.includes(code), `runtime contract must document ${code}`);
   }
 
-  const serialized = skill + contract + JSON.stringify(template);
+  const serialized = skill + contract + JSON.stringify(template) + JSON.stringify(claudeProfile);
   assert.doesNotMatch(serialized, /sk-ant-/);
   assert.doesNotMatch(serialized, /\/Users\/[a-z]/);
 });
@@ -509,8 +552,12 @@ test("substituted public template loads through the real supervisor loader", () 
 
   // Every caller-substituted placeholder must be present, then bound, so the
   // loaded config exercises the loader's full reporting context wiring —
-  // model, repository, branch, receipt, and destinations — not just IDs.
+  // agent, model, repository, branch, receipt, and destinations — not just
+  // IDs. AGENT_DISPLAY_NAME is replaced before AGENT_NAME so the longer
+  // placeholder can never be corrupted by the shorter one.
   const placeholders = [
+    "AGENT_DISPLAY_NAME",
+    "AGENT_NAME",
     "MODEL_ID",
     "CONTROL_CONVERSATION_ID",
     "START_MESSAGE_ID",
@@ -522,34 +569,63 @@ test("substituted public template loads through the real supervisor loader", () 
     assert.ok(templateText.includes(placeholder), `template must ship ${placeholder}`);
   }
   const deliveredAt = "2026-08-24T09:30:00.530000+00:00";
-  const bound = templateText
-    .replaceAll("MODEL_ID", "test-model")
-    .replaceAll("CONTROL_CONVERSATION_ID", CONTROL_CONVERSATION_ID)
-    .replaceAll("START_MESSAGE_ID", START_MESSAGE_ID)
-    .replaceAll("START_MESSAGE_DELIVERED_AT_ISO_8601", deliveredAt)
-    .replaceAll("REPOSITORY_BASENAME", "openclaw-skills")
-    .replaceAll("BRANCH_NAME", "fix/acp-reporting-fail-closed-guard")
-    .replaceAll("/absolute/path/to/workspace", root)
-    .replaceAll("/absolute/private/path/prompt.txt", promptFile)
-    .replaceAll("/absolute/private/path/response.txt", path.join(root, "response.txt"))
-    .replaceAll("/absolute/private/path/acpx-state", path.join(root, "acpx-state"));
-  for (const placeholder of placeholders) {
-    assert.equal(bound.includes(placeholder), false, `${placeholder} must be bound`);
-  }
+  const bind = (agent, displayName, suffix) => {
+    const bound = templateText
+      .replaceAll("AGENT_DISPLAY_NAME", displayName)
+      .replaceAll("AGENT_NAME", agent)
+      .replaceAll("MODEL_ID", "test-model")
+      .replaceAll("CONTROL_CONVERSATION_ID", CONTROL_CONVERSATION_ID)
+      .replaceAll("START_MESSAGE_ID", START_MESSAGE_ID)
+      .replaceAll("START_MESSAGE_DELIVERED_AT_ISO_8601", deliveredAt)
+      .replaceAll("REPOSITORY_BASENAME", "openclaw-skills")
+      .replaceAll("BRANCH_NAME", "fix/acp-reporting-fail-closed-guard")
+      .replaceAll("/absolute/path/to/workspace", root)
+      .replaceAll("/absolute/private/path/prompt.txt", promptFile)
+      .replaceAll("/absolute/private/path/response.txt", path.join(root, "response-" + suffix + ".txt"))
+      .replaceAll("/absolute/private/path/acpx-state", path.join(root, "acpx-state"));
+    for (const placeholder of placeholders) {
+      assert.equal(bound.includes(placeholder), false, `${placeholder} must be bound`);
+    }
+    return bound;
+  };
 
-  const configFile = path.join(root, "template-run.json");
-  fs.writeFileSync(configFile, bound, { mode: 0o600 });
-  const loaded = loadSupervisorConfig(configFile);
+  // The agent-neutral template loads as-is for codex: no auth block needed.
+  const codexFile = path.join(root, "template-codex.json");
+  fs.writeFileSync(codexFile, bind("codex", "Codex", "codex"), { mode: 0o600 });
+  const codex = loadSupervisorConfig(codexFile);
+  assert.equal(codex.agent, "codex");
+  assert.equal(codex.auth, undefined);
+  assert.equal(codex.reporting.schemaVersion, "acp-reporting-v2");
+  assert.equal(codex.reporting.agent, "codex");
+  assert.match(codex.reporting.startMessage, /🤖 \*\*ACP\*\*: Codex · `test-model`/);
+
+  // For claude, the same neutral template composes with the provider-specific
+  // auth profile template: substitute claude/Claude Code and merge the
+  // profile's auth block.
+  const claudeProfile = JSON.parse(fs.readFileSync(
+    new URL("../templates/claude-auth-profile.json", import.meta.url),
+    "utf8"
+  ));
+  const claudeConfig = JSON.parse(bind("claude", "Claude Code", "claude"));
+  assert.equal(claudeConfig.agent, claudeProfile.agent);
+  claudeConfig.auth = claudeProfile.auth;
+  const claudeFile = path.join(root, "template-claude.json");
+  fs.writeFileSync(claudeFile, JSON.stringify(claudeConfig), { mode: 0o600 });
+  const loaded = loadSupervisorConfig(claudeFile);
 
   assert.equal(loaded.agent, "claude");
+  assert.equal(loaded.auth.kind, CLAUDE_AUTH_KIND);
   assert.equal(loaded.model, "test-model");
   assert.equal(loaded.lifecycle.controlConversationId, CONTROL_CONVERSATION_ID);
   assert.equal(loaded.lifecycle.startReceipt.deliveredAt, deliveredAt);
   assert.equal(Object.isFrozen(loaded.reporting), true);
+  assert.equal(loaded.reporting.schemaVersion, "acp-reporting-v2");
+  assert.equal(loaded.reporting.agent, "claude");
   assert.equal(loaded.reporting.roundIndex, 1);
   assert.equal(loaded.reporting.repository, "openclaw-skills");
   assert.equal(loaded.reporting.branch, "fix/acp-reporting-fail-closed-guard");
   assert.equal(loaded.reporting.startMessage.split("\n").length, 13);
+  assert.match(loaded.reporting.startMessage, /🤖 \*\*ACP\*\*: Claude Code · `test-model`/);
   assert.equal(loaded.reporting.startDestination, CONTROL_CONVERSATION_ID);
   assert.equal(loaded.reporting.watchdogDestination, CONTROL_CONVERSATION_ID);
   assert.equal(loaded.reporting.terminalDestination, CONTROL_CONVERSATION_ID);

@@ -1,5 +1,6 @@
 /**
- * ACP reporting contract (acp-reporting-v1).
+ * ACP reporting contract (acp-reporting-v2, with a bounded acp-reporting-v1
+ * compatibility path for the canonical Claude agent).
  *
  * Pure, deterministic, dependency-free validation of the reporting bundle an
  * ACP turn must register before doing any work: the public round-start
@@ -9,6 +10,13 @@
  * `invalid_reporting_*` error code. Error messages never echo secrets or the
  * full rejected payload — at most a key name or a forbidden-pattern label.
  * No I/O, no clock access, no randomness.
+ *
+ * The public harness label on the ACP identity lines is never caller-chosen:
+ * it is resolved from the closed ACP_AGENT_PRESENTATIONS mapping keyed by the
+ * canonical config agent that the caller binds through the validation
+ * context. An agent outside the mapping, or any non-canonical spelling of a
+ * supported agent, is rejected with `invalid_reporting_agent` before any
+ * template content is examined.
  */
 
 const MAX_DISCORD_MESSAGE_LENGTH = 1400;
@@ -26,7 +34,29 @@ const MAX_DELIVERED_AT_LENGTH = 40;
 const WATCHDOG_EVERY_MS = 600000;
 const MAX_WATCHDOG_TIMEOUT_SECONDS = 60;
 
-export const ACP_REPORTING_SCHEMA_VERSION = 'acp-reporting-v1';
+export const ACP_REPORTING_SCHEMA_VERSION_V1 = 'acp-reporting-v1';
+export const ACP_REPORTING_SCHEMA_VERSION_V2 = 'acp-reporting-v2';
+export const ACP_REPORTING_SCHEMA_VERSIONS = Object.freeze([
+  ACP_REPORTING_SCHEMA_VERSION_V1,
+  ACP_REPORTING_SCHEMA_VERSION_V2,
+]);
+
+// Closed, fail-closed agent presentation mapping. The key is the canonical
+// ACP agent name a supervisor config may declare; the value is the only
+// public harness label the reporting templates may show for it. Extending
+// support to another agent means adding it here (and updating the runtime
+// contract) — a caller can never introduce a label through config data.
+export const ACP_AGENT_PRESENTATIONS = Object.freeze({
+  claude: 'Claude Code',
+  codex: 'Codex',
+});
+export const ACP_SUPPORTED_AGENTS = Object.freeze(Object.keys(ACP_AGENT_PRESENTATIONS));
+
+// The one agent whose runs may still present the legacy acp-reporting-v1
+// bundle shape during the bounded v1 → v2 migration. Every other agent —
+// including codex — must use acp-reporting-v2 from its first supported run,
+// so no v1 bundle ever exists that names a non-Claude label.
+export const ACP_REPORTING_V1_COMPAT_AGENT = 'claude';
 
 // Label used on the ACP identity line when the run has no pinned model. The
 // supervisor emits the same label in its `started` event, so the public
@@ -59,6 +89,7 @@ export const ACP_REPORT_PHASES = Object.freeze({
 
 export const ACP_REPORTING_ERROR_CODES = Object.freeze([
   'invalid_reporting_context',
+  'invalid_reporting_agent',
   'invalid_reporting_root',
   'invalid_reporting_unknown_key',
   'invalid_reporting_schema_version',
@@ -205,7 +236,18 @@ function deepFreeze(value) {
 
 function validateContext(context) {
   if (!isPlainObject(context)) fail('invalid_reporting_context', 'context must be a plain object');
-  const { model, controlConversationId, lifecycleStartReceipt } = context;
+  const { agent, model, controlConversationId, lifecycleStartReceipt } = context;
+  // The agent is the supervisor's canonical config agent, not caller-chosen
+  // presentation data. Only an exact canonical key of the closed presentation
+  // mapping passes: an unsupported agent, a non-string, or any spelling that
+  // merely normalizes to a supported agent ("Claude", " codex ", "CODEX")
+  // fails closed before any template content is examined.
+  if (
+    typeof agent !== 'string' ||
+    !Object.prototype.hasOwnProperty.call(ACP_AGENT_PRESENTATIONS, agent)
+  ) {
+    fail('invalid_reporting_agent', 'context.agent must be one of the canonical supported ACP agent names');
+  }
   // `model` is optional in the supervisor config. A run without a pinned
   // model identifies itself with the same fixed label the supervisor's
   // `started` event emits, so the public templates and the event stream never
@@ -251,6 +293,7 @@ function validateContext(context) {
     fail('invalid_reporting_context', 'context.lifecycleStartReceipt.deliveredAt must be a non-empty single-line string');
   }
   return {
+    agent,
     model: resolvedModel,
     controlConversationId,
     lifecycleStartReceipt: { conversationId, messageId, deliveredAt },
@@ -329,7 +372,7 @@ function validateStartMessage(startMessage, expected) {
     }
   };
   expectLine(1, '', 'blank');
-  expectLine(2, `🤖 **ACP**: Claude Code · \`${expected.model}\``, 'the ACP identity line');
+  expectLine(2, `🤖 **ACP**: ${expected.agentLabel} · \`${expected.model}\``, 'the ACP identity line');
   expectLine(3, `📍 **작업**: \`${expected.repository}\` · \`${expected.branch}\``, 'the repository/branch line');
   expectLine(4, '', 'blank');
   expectLine(5, '🎯 **범위**', 'the 범위 section header');
@@ -382,7 +425,7 @@ function validateMiddleReport(report, expected) {
     }
   };
   expectLine(1, '', 'blank');
-  expectLine(2, `🤖 **ACP**: Claude Code · \`${expected.model}\``, 'the ACP identity line');
+  expectLine(2, `🤖 **ACP**: ${expected.agentLabel} · \`${expected.model}\``, 'the ACP identity line');
   expectLine(3, `📍 **작업**: \`${expected.repository}\` · \`${expected.branch}\``, 'the repository/branch line');
   const allowedRoundLines = Object.entries(ACP_REPORT_PHASES).map(
     ([phaseIndex, phaseName]) => `🔢 **라운드**: ${expected.roundIndex} · ${phaseIndex}/4 ${phaseName}`
@@ -552,7 +595,7 @@ function validateWatchdog(watchdog, expected) {
 // the routes actually configured), and the validator's equality checks are
 // the point: deriving these fields would turn "prove the artifacts agree"
 // into "assume they agree". Keep them explicit.
-const TOP_LEVEL_KEYS = Object.freeze([
+const TOP_LEVEL_KEYS_V1 = Object.freeze([
   'schemaVersion',
   'roundIndex',
   'repository',
@@ -564,9 +607,21 @@ const TOP_LEVEL_KEYS = Object.freeze([
   'startReceipt',
   'watchdog',
 ]);
+// acp-reporting-v2 is the v1 shape plus a mandatory top-level `agent`
+// attestation: the caller states which canonical agent presentation the
+// templates were prepared for, and the validator proves it equals the
+// canonical config agent bound through the context. A v1 bundle carrying
+// `agent` is rejected as an unknown key, keeping v1 byte-compatible with
+// the pre-migration Claude bundles.
+const TOP_LEVEL_KEYS_V2 = Object.freeze(['agent', ...TOP_LEVEL_KEYS_V1]);
 
 /**
- * Validate a reporting bundle against the acp-reporting-v1 contract.
+ * Validate a reporting bundle against the ACP reporting contract.
+ *
+ * The current schema is acp-reporting-v2. The legacy acp-reporting-v1 shape
+ * is accepted only when the bound canonical agent is `claude`, as a bounded
+ * migration path; every other agent must present a v2 bundle whose top-level
+ * `agent` equals the canonical config agent.
  *
  * Every untrusted property is read exactly once into a local before it is
  * checked, and the normalized copy is built only from those validated locals
@@ -575,25 +630,45 @@ const TOP_LEVEL_KEYS = Object.freeze([
  * the normalized output.
  *
  * @param {unknown} reporting — the untrusted reporting bundle
- * @param {{ model?: string, controlConversationId: string,
+ * @param {{ agent: string, model?: string, controlConversationId: string,
  *           lifecycleStartReceipt: { conversationId: string, messageId: string, deliveredAt: string } }} context
- *   — `model` may be omitted; the templates must then use the literal
- *   `runtime-default` label on the ACP identity lines
+ *   — `agent` must be a canonical key of ACP_AGENT_PRESENTATIONS; `model` may
+ *   be omitted; the templates must then use the literal `runtime-default`
+ *   label on the ACP identity lines
  * @returns {object} a deep-frozen normalized copy of the validated bundle
  * @throws {AcpReportingContractError} with a stable `invalid_reporting_*` code
  */
 export function validateAcpReportingContract(reporting, context) {
   const ctx = validateContext(context);
+  // The public harness label is derived only from the closed mapping and the
+  // canonical context agent — never from any value inside the bundle.
+  const agentLabel = ACP_AGENT_PRESENTATIONS[ctx.agent];
   if (!isPlainObject(reporting)) {
     fail('invalid_reporting_root', 'reporting must be a plain object');
   }
+  const { schemaVersion } = reporting;
+  if (!ACP_REPORTING_SCHEMA_VERSIONS.includes(schemaVersion)) {
+    fail('invalid_reporting_schema_version', `schemaVersion must be "${ACP_REPORTING_SCHEMA_VERSION_V2}" (or "${ACP_REPORTING_SCHEMA_VERSION_V1}" during the bounded Claude migration)`);
+  }
+  if (
+    schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V1 &&
+    ctx.agent !== ACP_REPORTING_V1_COMPAT_AGENT
+  ) {
+    fail('invalid_reporting_schema_version', `schemaVersion "${ACP_REPORTING_SCHEMA_VERSION_V1}" is only accepted for the canonical "${ACP_REPORTING_V1_COMPAT_AGENT}" agent during migration`);
+  }
+  const topLevelKeys = schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V2
+    ? TOP_LEVEL_KEYS_V2
+    : TOP_LEVEL_KEYS_V1;
   for (const key of Object.keys(reporting)) {
-    if (!TOP_LEVEL_KEYS.includes(key)) {
+    if (!topLevelKeys.includes(key)) {
       fail('invalid_reporting_unknown_key', `reporting contains unsupported key "${describeKey(key)}"`);
     }
   }
-  if (reporting.schemaVersion !== ACP_REPORTING_SCHEMA_VERSION) {
-    fail('invalid_reporting_schema_version', `schemaVersion must be exactly "${ACP_REPORTING_SCHEMA_VERSION}"`);
+  if (
+    schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V2 &&
+    reporting.agent !== ctx.agent
+  ) {
+    fail('invalid_reporting_agent', 'reporting.agent must equal the canonical config agent');
   }
   const { roundIndex, startMessage } = reporting;
   if (!Number.isInteger(roundIndex) || roundIndex < 1 || roundIndex > MAX_ROUND_INDEX) {
@@ -605,6 +680,7 @@ export function validateAcpReportingContract(reporting, context) {
     roundIndex,
     repository,
     branch,
+    agentLabel,
     model: ctx.model,
     controlConversationId: ctx.controlConversationId,
   };
@@ -634,7 +710,8 @@ export function validateAcpReportingContract(reporting, context) {
   }
   const watchdog = validateWatchdog(reporting.watchdog, expected);
   return deepFreeze({
-    schemaVersion: ACP_REPORTING_SCHEMA_VERSION,
+    schemaVersion,
+    ...(schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V2 ? { agent: ctx.agent } : {}),
     roundIndex,
     repository,
     branch,

@@ -40,9 +40,9 @@ Handles TinyMCE body insertion, category and tag setting, inline image and banne
 
 #### 🛰️ [acp-discord-orchestrator](./acp-discord-orchestrator)
 
-Runs each agent-started ACP task as a single foreground ACPX turn under a supervisor that emits newline-delimited JSON events (`started`, `activity`, `progress`, `terminal`) back to the current Discord conversation.
+Runs each agent-started ACP task as a single foreground ACPX turn under a supervisor that emits newline-delimited JSON events (`started`, `activity`, `progress`, `terminal`) back to the current Discord conversation. Agent-neutral within a closed supported set: ACP agent `claude` (presented publicly as `Claude Code`, with a canonical setup-token launcher) and ACP agent `codex` (presented publicly as `Codex`); the public harness label is bound to the canonical config agent and cannot be chosen or spoofed by the caller.
 
-Fails closed on a missing or stale start receipt, unmet environment contracts, incompatible ACPX capabilities, detached/background execution, or tool kinds outside the allowlist. Keeps `completed`, `cancelled`, and `failed` as distinct exit codes and never collapses them into success. The normative behavior is spelled out in [references/runtime-contract.md](./acp-discord-orchestrator/references/runtime-contract.md).
+Fails closed on a missing or stale start receipt, an unsupported or non-canonical agent, a reporting bundle that does not match the exact public templates, unmet environment contracts, incompatible ACPX capabilities, detached/background execution, or tool kinds outside the allowlist. Keeps `completed`, `cancelled`, and `failed` as distinct exit codes and never collapses them into success. The normative behavior is spelled out in [references/runtime-contract.md](./acp-discord-orchestrator/references/runtime-contract.md).
 
 **Use when:** An agent needs to delegate work to ACP from Discord with observable, bounded completion instead of an untracked spawn or child thread.
 
@@ -153,12 +153,13 @@ python3 -m unittest discover -s tistory-publish/tests -p "test_*.py" -v
 node tistory-publish/tests/test_tistory_editor_helpers.js
 
 # acp-discord-orchestrator
+node --test acp-discord-orchestrator/scripts/test-acp-reporting-contract.mjs
 node --test acp-discord-orchestrator/scripts/test-acpx-foreground-supervisor.mjs
 node --test acp-discord-orchestrator/scripts/test-claude-acp-launcher.mjs
 node --test tests/acp-discord-orchestrator-cli.test.mjs
 ```
 
-GitHub Actions runs the `tistory-publish` tests and syntax checks (Python 3.9/3.13, Node 24) on pull requests that touch that directory. See [CLAUDE.md](./CLAUDE.md) for architecture notes and repository conventions.
+GitHub Actions runs the `tistory-publish` tests and syntax checks (Python 3.9/3.13, Node 24) on pull requests that touch that directory. See [AGENTS.md](./AGENTS.md) for architecture notes and repository conventions ([CLAUDE.md](./CLAUDE.md) is the Claude Code compatibility entrypoint to the same guidance).
 
 This is a public repository: deployment-specific values such as blog domains, CDP ports, credential paths, and account mappings are passed in by the caller and must not be committed here (see [docs/tistory-cdp-architecture.md](./docs/tistory-cdp-architecture.md)).
 

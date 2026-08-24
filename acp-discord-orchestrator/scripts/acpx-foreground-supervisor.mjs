@@ -5,9 +5,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL,
+  ACP_SUPPORTED_AGENTS,
   AcpReportingContractError,
   validateAcpReportingContract
 } from "./acp-reporting-contract.mjs";
+
+export { ACP_AGENT_PRESENTATIONS, ACP_SUPPORTED_AGENTS } from "./acp-reporting-contract.mjs";
 
 export const SCHEMA_VERSION = "acp-discord-orchestrator.v1";
 export const EXIT_CODES = Object.freeze({
@@ -408,15 +411,17 @@ function assertReportingContract(reporting, context) {
 
 // In-memory backstop mirroring runStartReceiptPreflight: a config assembled
 // without loadSupervisorConfig must still carry a reporting bundle satisfying
-// the full pure acp-reporting-v1 contract, and it must fail closed with the
-// same bounded invalid_reporting_* codes before any runtime module import,
-// probe, or adapter startup.
+// the full pure reporting contract (acp-reporting-v2, or v1 for the bounded
+// canonical-Claude migration), bound to the canonical config agent, and it
+// must fail closed with the same bounded invalid_reporting_* codes before any
+// runtime module import, probe, or adapter startup.
 export function runReportingPreflight(config) {
   const lifecycle = isPlainObject(config.lifecycle) ? config.lifecycle : undefined;
   const receipt = lifecycle && isPlainObject(lifecycle.startReceipt)
     ? lifecycle.startReceipt
     : undefined;
   assertReportingContract(config.reporting, {
+    agent: config.agent,
     model: config.model,
     controlConversationId: lifecycle ? lifecycle.controlConversationId : undefined,
     lifecycleStartReceipt: receipt
@@ -638,10 +643,10 @@ export function loadSupervisorConfig(configPath) {
   }
 
   const agent = assertIdentifier(raw.agent, "invalid_agent", 128);
-  // ACPX trims and lowercases agent names, so "Claude" would still resolve to
-  // the Claude adapter while bypassing every agent === "claude" gate. Only the
-  // canonical spelling is accepted.
-  if (isClaudeAgent(agent) && agent !== CLAUDE_AGENT) {
+  // ACPX trims and lowercases agent names, so "Claude" or "Codex" would still
+  // resolve to the same adapter while bypassing every exact-match agent gate.
+  // Only the canonical lowercase spelling of a supported agent is accepted.
+  if (ACP_SUPPORTED_AGENTS.includes(agent.trim().toLowerCase()) && !ACP_SUPPORTED_AGENTS.includes(agent)) {
     fail("invalid_agent_not_canonical");
   }
   let auth;
@@ -727,11 +732,16 @@ export function loadSupervisorConfig(configPath) {
     : assertIdentifier(raw.model, "invalid_model", 256);
 
   // Mandatory reporting bundle, validated last so every structural field it
-  // binds to (model, lifecycle receipt) is already trusted, and before any
-  // runtime import, probe, or adapter startup can occur. The context receipt
-  // uses the parsed lifecycle's original deliveredAt spelling: the contract
-  // compares it byte-for-byte against the caller-attested lifecycle receipt.
+  // binds to (agent, model, lifecycle receipt) is already trusted, and before
+  // any runtime import, probe, or adapter startup can occur. Binding the
+  // canonical agent here is what makes the public harness label unforgeable:
+  // the contract derives the label from its closed mapping and this agent,
+  // and rejects an unsupported agent with invalid_reporting_agent. The
+  // context receipt uses the parsed lifecycle's original deliveredAt
+  // spelling: the contract compares it byte-for-byte against the
+  // caller-attested lifecycle receipt.
   const reporting = assertReportingContract(raw.reporting, {
+    agent,
     model,
     controlConversationId: lifecycle.controlConversationId,
     lifecycleStartReceipt: {
@@ -1411,8 +1421,12 @@ export async function runSupervisor(config, dependencies = {}) {
 
   try {
     runStartReceiptPreflight(config, now());
-    runReportingPreflight(config);
+    // The Claude route guard runs before the reporting backstop so an
+    // in-memory config whose agent merely normalizes to "claude" keeps its
+    // documented claude_agent_not_canonical code instead of surfacing as a
+    // generic reporting-agent rejection. Both gates precede runtime loading.
     runClaudeSupervisorPreflight(config, environment, execArgv);
+    runReportingPreflight(config);
     runEnvironmentPreflight(config, environment);
     preparePrivateStateDirectory(config.stateDir);
     if (fs.existsSync(config.responseFile)) {

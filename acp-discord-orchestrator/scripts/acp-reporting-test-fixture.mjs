@@ -1,5 +1,5 @@
-// Shared integration-test fixture for the acp-reporting-v1 bundle. Imported
-// by the supervisor suite, the launcher suite, and the repo-root CLI suite so
+// Shared integration-test fixture for the ACP reporting bundle. Imported by
+// the supervisor suite, the launcher suite, and the repo-root CLI suite so
 // the three integration layers exercise one canonical bundle instead of three
 // drifting copies. It is intentionally built FROM the contract module's
 // exported template constants: the integration layers test wiring, not
@@ -10,7 +10,8 @@
 // Not a test file: no assertions, nothing executable beyond the builder.
 
 import {
-  ACP_REPORTING_SCHEMA_VERSION,
+  ACP_AGENT_PRESENTATIONS,
+  ACP_REPORTING_SCHEMA_VERSION_V2,
   ACP_REPORT_BEGIN_DELIMITER,
   ACP_REPORT_END_DELIMITER,
   ACP_REPORT_INSTRUCTION,
@@ -30,17 +31,27 @@ const DEFAULT_SECTION_BULLETS = Object.freeze([
 ]);
 
 /**
- * Build a fully valid acp-reporting-v1 bundle bound to the given control
- * conversation and lifecycle receipt: a round start message, matching
- * destinations and receipt snapshot, and one disabled tool-less 10-minute
- * public watchdog whose payload carries the exact 19-line (or 22-line, with
- * issueBullet) report layout.
+ * Build a fully valid reporting bundle bound to the given canonical agent,
+ * control conversation, and lifecycle receipt: a round start message,
+ * matching destinations and receipt snapshot, and one disabled tool-less
+ * 10-minute public watchdog whose payload carries the exact 19-line (or
+ * 22-line, with issueBullet) report layout.
+ *
+ * Defaults to schema acp-reporting-v2, whose bundle carries the top-level
+ * `agent` attestation; pass `schemaVersion: "acp-reporting-v1"` to build the
+ * legacy bundle shape (valid only for agent "claude" — the contract enforces
+ * that, not this builder). `agentLabel` exists only so tests can deliberately
+ * build spoofed bundles; valid bundles always derive the label from the
+ * closed presentation mapping.
  */
 export function buildValidReporting({
   controlConversationId,
   messageId,
   deliveredAt,
   receiptConversationId = controlConversationId,
+  agent = "claude",
+  schemaVersion = ACP_REPORTING_SCHEMA_VERSION_V2,
+  agentLabel = ACP_AGENT_PRESENTATIONS[agent] ?? String(agent),
   model = "test-model",
   roundIndex = 1,
   repository = FIXTURE_REPOSITORY,
@@ -55,7 +66,7 @@ export function buildValidReporting({
   const startMessage = [
     title,
     "",
-    `🤖 **ACP**: Claude Code · \`${model}\``,
+    `🤖 **ACP**: ${agentLabel} · \`${model}\``,
     `📍 **작업**: \`${repository}\` · \`${branch}\``,
     "",
     "🎯 **범위**",
@@ -70,7 +81,7 @@ export function buildValidReporting({
   const reportLines = [
     "🔄 **ACP 중간 보고 · 18:45 KST**",
     "",
-    `🤖 **ACP**: Claude Code · \`${model}\``,
+    `🤖 **ACP**: ${agentLabel} · \`${model}\``,
     `📍 **작업**: \`${repository}\` · \`${branch}\``,
     `🔢 **라운드**: ${roundIndex} · 2/4 ${ACP_REPORT_PHASES[2]}`,
     "⏱️ **ACP 시간**: 12분 경과",
@@ -88,7 +99,8 @@ export function buildValidReporting({
   }
   const report = reportLines.join("\n");
   return {
-    schemaVersion: ACP_REPORTING_SCHEMA_VERSION,
+    schemaVersion,
+    ...(schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V2 ? { agent } : {}),
     roundIndex,
     repository,
     branch,
