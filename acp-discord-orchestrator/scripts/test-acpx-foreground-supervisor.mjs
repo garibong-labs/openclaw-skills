@@ -12,6 +12,7 @@ import {
   ACP_BASELINE_ENV_CONTRACT,
   ACP_INJECTION_ENV,
   ACP_SUPPORTED_AGENTS,
+  ACPX_UNSUPPORTED_CONTROL_ERROR_CODE,
   CLAUDE_AUTH_KIND,
   CLAUDE_FORBIDDEN_ENV,
   CLAUDE_IMPLICIT_ENV_CONTRACT,
@@ -26,6 +27,7 @@ import {
   discoverRuntimeLocation,
   isClaudeAgent,
   isCliEntry,
+  isUnsupportedSessionCloseCleanupError,
   loadSupervisorConfig,
   main,
   normalizeRuntimeEvent,
@@ -151,6 +153,7 @@ function makeRuntimeModule(options = {}) {
     ensureInput: undefined,
     turnInput: undefined,
     closeInput: undefined,
+    closeInputs: [],
     cancelCalls: 0,
     closeStreamCalls: 0,
     streamClosed: false,
@@ -212,7 +215,15 @@ function makeRuntimeModule(options = {}) {
         },
         async close(input) {
           state.closeInput = input;
+          state.closeInputs.push(input);
           state.closeAttempts += 1;
+          if (typeof options.closeError === "function") {
+            const error = options.closeError(input, state);
+            if (error) {
+              throw error;
+            }
+            return;
+          }
           if (options.closeError) {
             throw new Error("private cleanup detail");
           }
@@ -584,6 +595,262 @@ test("completed ACP result fails closed when cleanup fails", async () => {
   assert.equal(emitted.at(-1).cleanupOk, false);
   assert.ok(state.closeAttempts >= 1);
   assert.equal(JSON.stringify(emitted).includes("private cleanup detail"), false);
+});
+
+// The structured rejection the ACPX runtime raises when the backend adapter
+// does not implement the session/close control requested by a
+// discardPersistentState close. The record identifier in the message is
+// private detail and must never reach normalized output.
+function unsupportedSessionCloseError() {
+  const error = new Error("Agent does not support session/close for private-record-id.");
+  error.name = "AcpRuntimeError";
+  error.code = ACPX_UNSUPPORTED_CONTROL_ERROR_CODE;
+  return error;
+}
+
+test("unsupported session/close detection is structured, never message-based", () => {
+  assert.equal(isUnsupportedSessionCloseCleanupError(unsupportedSessionCloseError()), true);
+  // The stable code is the whole surface, so a bare object carrying it also
+  // qualifies while a matching message without the code never does.
+  assert.equal(
+    isUnsupportedSessionCloseCleanupError({ code: ACPX_UNSUPPORTED_CONTROL_ERROR_CODE }),
+    true
+  );
+  assert.equal(
+    isUnsupportedSessionCloseCleanupError(
+      new Error("Agent does not support session/close for private-record-id.")
+    ),
+    false
+  );
+  const otherCode = new Error("Agent does not support session/close for private-record-id.");
+  otherCode.code = "ACP_TURN_FAILED";
+  assert.equal(isUnsupportedSessionCloseCleanupError(otherCode), false);
+  assert.equal(isUnsupportedSessionCloseCleanupError(null), false);
+  assert.equal(isUnsupportedSessionCloseCleanupError(undefined), false);
+  assert.equal(
+    isUnsupportedSessionCloseCleanupError(ACPX_UNSUPPORTED_CONTROL_ERROR_CODE),
+    false
+  );
+});
+
+test("codex oneshot unsupported session/close falls back to a local close", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-close-fallback-"));
+  const { module, state } = makeRuntimeModule({
+    events: [{ type: "text_delta", stream: "output", text: "codex bounded result" }],
+    closeError: (input) => input.discardPersistentState === true
+      ? unsupportedSessionCloseError()
+      : undefined
+  });
+  const config = makeConfig(root);
+  const emitted = [];
+  const exitCode = await runSupervisor(config, {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+
+  assert.equal(exitCode, EXIT_CODES.completed);
+  assert.equal(fs.readFileSync(config.responseFile, "utf8"), "codex bounded result");
+  const terminal = emitted.at(-1);
+  assert.equal(terminal.type, "terminal");
+  assert.equal(terminal.status, "completed");
+  assert.equal(terminal.supervisorStatus, "ok");
+  assert.equal(terminal.cleanupOk, true);
+  assert.equal(terminal.cleanupFallback, true);
+  assert.equal(terminal.responseStored, true);
+  // No duplicate terminal event and no output after the terminal latch.
+  assert.equal(emitted.filter((event) => event.type === "terminal").length, 1);
+  assert.equal(
+    emitted.filter((event) => event.activity === "cleanup_unsupported_close_fallback").length,
+    1
+  );
+  // Exactly one discard attempt, then one local close without requesting
+  // backend persistent-state disposal.
+  assert.equal(state.closeAttempts, 2);
+  assert.equal(state.closeInputs[0].discardPersistentState, true);
+  assert.equal("discardPersistentState" in state.closeInputs[1], false);
+  assert.equal(state.closeInputs[1].reason, "supervisor_terminal_unsupported_close");
+  assert.equal(JSON.stringify(emitted).includes("private-record-id"), false);
+});
+
+test("non-unsupported codex close failures keep the fail-closed cleanup contract", async () => {
+  const messageOnly = new Error("Agent does not support session/close for private-record-id.");
+  const wrongCode = new Error("backend close failed");
+  wrongCode.code = "ACP_TURN_FAILED";
+  for (const closeFailure of [messageOnly, wrongCode]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-close-hardfail-"));
+    const { module, state } = makeRuntimeModule({
+      closeError: () => closeFailure
+    });
+    const emitted = [];
+    const exitCode = await runSupervisor(makeConfig(root), {
+      runtimeModule: module,
+      bindSignals: false,
+      writeEvent(event) {
+        emitted.push(event);
+      }
+    });
+    assert.equal(exitCode, EXIT_CODES.supervisorError);
+    const terminal = emitted.at(-1);
+    assert.equal(terminal.type, "terminal");
+    assert.equal(terminal.status, "completed");
+    assert.equal(terminal.supervisorStatus, "degraded");
+    assert.equal(terminal.cleanupOk, false);
+    assert.equal("cleanupFallback" in terminal, false);
+    // Never a fallback close: every attempt requests the canonical discard.
+    assert.ok(state.closeInputs.length >= 1);
+    assert.ok(state.closeInputs.every((input) => input.discardPersistentState === true));
+    assert.equal(
+      emitted.some((event) => event.activity === "cleanup_unsupported_close_fallback"),
+      false
+    );
+    assert.equal(JSON.stringify(emitted).includes("private-record-id"), false);
+  }
+});
+
+test("codex fallback close failure remains degraded with supervisor exit", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-fallback-fail-"));
+  const { module, state } = makeRuntimeModule({
+    closeError: (input) => input.discardPersistentState === true
+      ? unsupportedSessionCloseError()
+      : new Error("private fallback close detail")
+  });
+  const config = makeConfig(root);
+  const emitted = [];
+  const exitCode = await runSupervisor(config, {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  const terminal = emitted.at(-1);
+  assert.equal(terminal.type, "terminal");
+  assert.equal(terminal.status, "completed");
+  assert.equal(terminal.supervisorStatus, "degraded");
+  assert.equal(terminal.cleanupOk, false);
+  assert.equal("cleanupFallback" in terminal, false);
+  assert.equal(
+    emitted.filter((event) => event.activity === "cleanup_unsupported_close_fallback").length,
+    1
+  );
+  // Discard attempt, failed local fallback, then the finally-path close.
+  assert.equal(state.closeInputs[0].discardPersistentState, true);
+  assert.equal("discardPersistentState" in state.closeInputs[1], false);
+  const serialized = JSON.stringify(emitted);
+  assert.equal(serialized.includes("private fallback close detail"), false);
+  assert.equal(serialized.includes("private-record-id"), false);
+});
+
+test("unsupported close without an exact completed result never falls back", async () => {
+  const results = [
+    { status: "failed", stopReason: "turn_failed", error: { code: "acp_turn_failed", retryable: false } },
+    { status: "cancelled", stopReason: "cancelled" }
+  ];
+  for (const result of results) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-nonsuccess-close-"));
+    const { module, state } = makeRuntimeModule({
+      result: Promise.resolve(result),
+      closeError: (input) => input.discardPersistentState === true
+        ? unsupportedSessionCloseError()
+        : undefined
+    });
+    const emitted = [];
+    const exitCode = await runSupervisor(makeConfig(root), {
+      runtimeModule: module,
+      bindSignals: false,
+      writeEvent(event) {
+        emitted.push(event);
+      }
+    });
+    assert.equal(exitCode, EXIT_CODES.supervisorError, result.status);
+    const terminal = emitted.at(-1);
+    assert.equal(terminal.type, "terminal");
+    assert.equal(terminal.status, result.status);
+    assert.equal(terminal.supervisorStatus, "degraded");
+    assert.equal(terminal.cleanupOk, false);
+    assert.equal("cleanupFallback" in terminal, false);
+    assert.ok(state.closeInputs.every((input) => input.discardPersistentState === true));
+    assert.equal(
+      emitted.some((event) => event.activity === "cleanup_unsupported_close_fallback"),
+      false
+    );
+  }
+});
+
+test("catch-path cleanup never uses the codex unsupported-close fallback", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-catch-close-"));
+  const terminal = deferred();
+  const { module, state } = makeRuntimeModule({
+    result: terminal.promise,
+    closeError: (input) => input.discardPersistentState === true
+      ? unsupportedSessionCloseError()
+      : undefined
+  });
+  const config = makeConfig(root);
+  const emitted = [];
+  const run = runSupervisor(config, {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const turnError = new Error("acpx_turn_transport_failed");
+  turnError.code = "acpx_turn_transport_failed";
+  terminal.reject(turnError);
+
+  assert.equal(await run, EXIT_CODES.supervisorError);
+  assert.equal(emitted.at(-1).type, "supervisor_error");
+  assert.equal(emitted.at(-1).code, "acpx_turn_transport_failed");
+  assert.equal(fs.existsSync(config.responseFile), false);
+  // The finally path keeps the canonical discard close and never retries a
+  // local close, even though the rejection carries the unsupported code.
+  assert.ok(state.closeInputs.length >= 1);
+  assert.ok(state.closeInputs.every((input) => input.discardPersistentState === true));
+  assert.equal(
+    emitted.some((event) => event.activity === "cleanup_unsupported_close_fallback"),
+    false
+  );
+});
+
+test("response storage stays authoritative after a successful codex close fallback", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-fallback-storage-"));
+  const config = makeConfig(root);
+  const { module, state } = makeRuntimeModule({
+    events: [{ type: "text_delta", stream: "output", text: "codex bounded result" }],
+    closeError: (input) => {
+      if (input.discardPersistentState === true) {
+        return unsupportedSessionCloseError();
+      }
+      // Occupy the response path during the fallback close so the later
+      // exclusive response write fails after cleanup succeeded.
+      fs.writeFileSync(config.responseFile, "occupied");
+      return undefined;
+    }
+  });
+  const emitted = [];
+  const exitCode = await runSupervisor(config, {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  const terminal = emitted.at(-1);
+  assert.equal(terminal.type, "terminal");
+  assert.equal(terminal.status, "completed");
+  assert.equal(terminal.supervisorStatus, "degraded");
+  assert.equal(terminal.cleanupOk, true);
+  assert.equal(terminal.cleanupFallback, true);
+  assert.equal(terminal.responseStored, false);
+  assert.equal(state.closeAttempts, 2);
+  assert.equal(fs.readFileSync(config.responseFile, "utf8"), "occupied");
 });
 
 test("runtime location accepts an explicit package root", () => {
@@ -2179,6 +2446,44 @@ test("canonical claude launch reaches the runtime without token disclosure", POS
   assert.equal(emitted.at(-1).type, "terminal");
   assert.equal(emitted.at(-1).status, "completed");
   assert.equal(JSON.stringify(emitted).includes(DUMMY_CLAUDE_TOKEN), false);
+});
+
+test("claude unsupported session/close keeps the fail-closed cleanup contract", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-close-unsupported-"));
+  const envFile = makeClaudeAuthFixture(root);
+  const { module, state } = makeRuntimeModule({
+    events: [{ type: "text_delta", stream: "output", text: "bounded result" }],
+    closeError: (input) => input.discardPersistentState === true
+      ? unsupportedSessionCloseError()
+      : undefined
+  });
+  const config = makeClaudeConfig(root, envFile);
+  const emitted = [];
+  const exitCode = await runSupervisor(config, {
+    runtimeModule: module,
+    bindSignals: false,
+    env: claudeEnv(envFile),
+    execArgv: ["--env-file=" + envFile],
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  const terminal = emitted.at(-1);
+  assert.equal(terminal.type, "terminal");
+  assert.equal(terminal.status, "completed");
+  assert.equal(terminal.supervisorStatus, "degraded");
+  assert.equal(terminal.cleanupOk, false);
+  assert.equal("cleanupFallback" in terminal, false);
+  // The codex-only fallback never runs for claude: every close attempt keeps
+  // the canonical persistent-state discard.
+  assert.ok(state.closeInputs.length >= 1);
+  assert.ok(state.closeInputs.every((input) => input.discardPersistentState === true));
+  assert.equal(
+    emitted.some((event) => event.activity === "cleanup_unsupported_close_fallback"),
+    false
+  );
+  assert.equal(JSON.stringify(emitted).includes("private-record-id"), false);
 });
 
 test("non-claude agents keep the generic environment contract without argv proof", async () => {

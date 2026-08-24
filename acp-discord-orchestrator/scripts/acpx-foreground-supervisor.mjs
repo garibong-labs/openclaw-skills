@@ -22,6 +22,14 @@ export const EXIT_CODES = Object.freeze({
 });
 
 export const CLAUDE_AGENT = "claude";
+export const CODEX_AGENT = "codex";
+// The supervisor runs every turn as a oneshot ACP session; the constant keeps
+// the ensureSession request and the codex cleanup-fallback gate bound to the
+// same mode value.
+const ACP_SESSION_MODE = "oneshot";
+// Stable public error code the ACPX runtime raises when a backend adapter
+// does not implement a requested control (for cleanup: session/close).
+export const ACPX_UNSUPPORTED_CONTROL_ERROR_CODE = "ACP_BACKEND_UNSUPPORTED_CONTROL";
 export const CLAUDE_AUTH_KIND = "claude-setup-token-env-file";
 export const CLAUDE_OAUTH_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN";
 // Credential-selection variables that would silently override or compete with
@@ -1385,6 +1393,36 @@ async function waitForTurnResult(turn, timeoutMs, emit, graceMs) {
   fail("supervisor_timeout");
 }
 
+// A close rejection counts as "backend does not implement session/close" only
+// through the runtime's structured error code, never through message text:
+// runtime.close with discardPersistentState requests exactly one backend
+// control, so an ACP_BACKEND_UNSUPPORTED_CONTROL rejection of that call is
+// unambiguous. Anything else — other codes, code-less errors whose message
+// merely mentions session/close, timeouts — is not an unsupported-close
+// signal.
+export function isUnsupportedSessionCloseCleanupError(error) {
+  return error !== null &&
+    typeof error === "object" &&
+    error.code === ACPX_UNSUPPORTED_CONTROL_ERROR_CODE;
+}
+
+// Like settleEventPump, but keeps the rejection value: the cleanup fallback
+// gate has to distinguish the structured unsupported-control rejection from
+// every other cleanup failure. The error never reaches normalized output.
+async function settleCleanupClose(closeTask, timeoutMs) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, timedOut: true }), timeoutMs);
+  });
+  const settled = closeTask.then(
+    () => ({ ok: true, timedOut: false }),
+    (error) => ({ ok: false, timedOut: false, error })
+  );
+  const result = await Promise.race([settled, timeout]);
+  clearTimeout(timer);
+  return result;
+}
+
 async function settleEventPump(eventPump, timeoutMs) {
   let timer;
   const timeout = new Promise((resolve) => {
@@ -1514,7 +1552,7 @@ export async function runSupervisor(config, dependencies = {}) {
     handle = await runtime.ensureSession({
       sessionKey: config.sessionKey,
       agent: config.agent,
-      mode: "oneshot",
+      mode: ACP_SESSION_MODE,
       cwd: config.cwd,
       sessionOptions: {
         ...(config.model ? { model: config.model } : {}),
@@ -1635,7 +1673,8 @@ export async function runSupervisor(config, dependencies = {}) {
     }
 
     let cleanupOk = true;
-    const cleanupState = await settleEventPump(
+    let cleanupFallback = false;
+    const cleanupState = await settleCleanupClose(
       Promise.resolve().then(() => runtime.close({
         handle,
         reason: "supervisor_terminal",
@@ -1645,6 +1684,39 @@ export async function runSupervisor(config, dependencies = {}) {
     );
     if (cleanupState.ok) {
       runtime = undefined;
+    } else if (
+      // Bounded capability exception for one exact shape: the canonical codex
+      // adapter completes the oneshot turn but does not implement the
+      // session/close backend control, so the discardPersistentState close is
+      // rejected with the runtime's structured unsupported-control code. Only
+      // then — after an exact completed result, a fully drained event stream,
+      // and an untruncated response, and never on a timeout — close is
+      // retried once without requesting backend persistent-state disposal,
+      // which still cancels and closes the local handle deterministically.
+      // Every other agent, terminal status, cleanup error, and the
+      // catch/finally cleanup path keeps the fail-closed contract unchanged.
+      config.agent === CODEX_AGENT &&
+      ACP_SESSION_MODE === "oneshot" &&
+      result.status === "completed" &&
+      streamState.ok &&
+      !responseTruncated &&
+      !cleanupState.timedOut &&
+      isUnsupportedSessionCloseCleanupError(cleanupState.error)
+    ) {
+      emit("activity", { activity: "cleanup_unsupported_close_fallback" });
+      const fallbackState = await settleCleanupClose(
+        Promise.resolve().then(() => runtime.close({
+          handle,
+          reason: "supervisor_terminal_unsupported_close"
+        })),
+        cleanupTimeoutMs
+      );
+      if (fallbackState.ok) {
+        cleanupFallback = true;
+        runtime = undefined;
+      } else {
+        cleanupOk = false;
+      }
     } else {
       cleanupOk = false;
     }
@@ -1672,6 +1744,9 @@ export async function runSupervisor(config, dependencies = {}) {
       cleanupOk,
       counters: publicCounters(counters)
     };
+    if (cleanupFallback) {
+      terminal.cleanupFallback = true;
+    }
     if (result.status === "failed" && result.error) {
       terminal.errorCode = safeErrorCode(result.error.code);
       terminal.retryable = result.error.retryable === true;
