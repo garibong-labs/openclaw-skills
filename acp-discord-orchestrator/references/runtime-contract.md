@@ -9,6 +9,7 @@ This reference defines the compatibility and evidence boundary for the direct AC
 - [Private input and output](#private-input-and-output)
 - [Config fields](#config-fields)
 - [Start-receipt gate](#start-receipt-gate)
+- [Reporting contract](#reporting-contract)
 - [Environment preflight](#environment-preflight)
 - [Claude credential injection](#claude-credential-injection)
 - [Permission decisions](#permission-decisions)
@@ -69,6 +70,7 @@ Required:
   - `lifecycle.startReceipt.conversationId`: conversation the start message was delivered to
   - `lifecycle.startReceipt.messageId`: delivered start-message identifier
   - `lifecycle.startReceipt.deliveredAt`: caller-observed delivery instant
+- `reporting`: mandatory `acp-reporting-v1` public reporting bundle bound to the control conversation and the lifecycle receipt; see [Reporting contract](#reporting-contract)
 - `auth` (required exactly when `agent` is `claude`): Claude credential declaration
   - `auth.kind`: must be `claude-setup-token-env-file`
   - `auth.envFile`: absolute path to the private setup-token env file
@@ -97,6 +99,18 @@ Freshness depends on the clock rather than on the config text, so it is evaluate
 The gate validates caller-attested receipt metadata only. The supervisor holds no chat credentials and makes no network call, so it cannot prove that the message exists, that its text matches, that the caller authored it, or that the identifiers were not replayed from an earlier run within the freshness window. It proves that the caller committed to a specific, recent, same-conversation start message before the turn began.
 
 The control conversation ID and the start message ID are never emitted in normalized events, stored in the response file, or hashed into any event field.
+
+## Reporting contract
+
+`reporting` is required. It is the generic mandatory reporting safety contract, schema `acp-reporting-v1`: before dispatch, the caller must have sent one public round-start boundary message to the control conversation and created exactly one disabled public-only watchdog for the round, and the config must carry a byte-exact snapshot of both. The contract is validated purely and deterministically — no I/O, no clock access, no randomness — implemented in `scripts/acp-reporting-contract.mjs`.
+
+Ordering is pre-runtime: the bundle is validated during config loading, after every structural field it binds to (`model`, `lifecycle`) is already trusted, and before dynamic runtime import, runtime probing, `createAcpRuntime`, or any adapter startup. A missing or malformed bundle is invalid config and maps to a stable bounded `invalid_reporting_*` code with the invalid-config exit: `invalid_reporting_root`, `invalid_reporting_unknown_key`, `invalid_reporting_schema_version`, `invalid_reporting_round_index`, `invalid_reporting_repository`, `invalid_reporting_branch`, `invalid_reporting_start_message`, `invalid_reporting_destination`, `invalid_reporting_start_receipt`, `invalid_reporting_watchdog`, `invalid_reporting_watchdog_round`, `invalid_reporting_watchdog_schedule`, `invalid_reporting_watchdog_delivery`, `invalid_reporting_watchdog_payload`, `invalid_reporting_watchdog_message`, `invalid_reporting_report`, `invalid_reporting_forbidden_content`, and `invalid_reporting_context`. Error messages name at most a config key or a forbidden-pattern label; they never echo the rejected payload, a secret, or free text.
+
+Start-message binding is caller-attested, like the start-receipt gate. `reporting.startReceipt` must byte-match the lifecycle receipt — same `conversationId`, same `messageId`, and the same `deliveredAt` spelling as written in `lifecycle.startReceipt` — and `reporting.startReceipt.message` must equal `reporting.startMessage`, so the attested delivery is bound to exact public content, not just to an identifier. `startDestination`, `watchdogDestination`, and `terminalDestination` must all equal `lifecycle.controlConversationId`: every reporting surface for the run is the one control conversation. The supervisor holds no chat credentials and makes no network call, so it cannot prove the message was actually delivered or that the watchdog actually exists in a scheduler; it proves the caller committed to specific, template-exact public content bound to the same recent control-conversation receipt that gates the run.
+
+The public message formats are fixed, not advisory. `startMessage` must match the 13-line round-start template exactly (round 1 uses the `ACP 작업 시작` title; correction rounds use the `ACP 수정 라운드 N 시작` title), embedding the config's `model`, the declared `repository` basename, and the declared Git `branch` verbatim. The watchdog snapshot must be exactly tool-less and public-only: `enabled: false`, `sessionTarget: "isolated"`, `schedule` exactly `{ "kind": "every", "everyMs": 600000 }`, delivery exactly a Discord announce to the control conversation channel, `deleteAfterRun: false`, `payload.kind: "agentTurn"`, `payload.toolsAllow` present and exactly `[]`, and an integer `payload.timeoutSeconds` of at most 60. The payload message is exactly the minimal verbatim relay instruction, one blank line, and one delimited 19-line public `ACP 중간 보고` report (22 lines with the optional trailing 이슈 section) whose metadata lines repeat the same model, repository, branch, and round. A bounded forbidden-content screen rejects operational or internal material in the watchdog message — filesystem paths, shell and Git commands, process or session inspection, scheduler internals, and any silence/self-decision instruction — with `invalid_reporting_forbidden_content`.
+
+The fixed schema is generic and public: templates, cadence, routing shape, and screening are defined here and in the validator, with Korean public report layouts as the canonical wording. Organization-specific material stays outside the schema: actual channel identifiers, operator identity, and run-specific wording appear only inside the bounded free-text slots (the 범위 and 외부 작업 bullets, the section bullets, the elapsed-time and 실행 상태 lines) or as caller-substituted placeholder values, and none of it is emitted in normalized events.
 
 ## Environment preflight
 
@@ -231,6 +245,7 @@ This contract does not:
 - provide an operating-system sandbox;
 - read, authenticate, or otherwise confirm a chat message from the supervisor process;
 - guarantee containment of arbitrary foreground code that daemonizes internally;
-- define a personal watchdog interval, language, destination, or message template;
+- leave the watchdog interval, destination routing, or public message templates caller-defined — the [Reporting contract](#reporting-contract) fixes them generically, and only the bounded free-text slots plus the actual (organization-private) channel identifiers vary per run;
+- prove that the attested start message or watchdog snapshot exists outside the config;
 - define host-specific stale-session detection or recovery;
 - make an official ACP child thread observable by the direct supervisor.

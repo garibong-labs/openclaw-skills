@@ -61,6 +61,94 @@ function parsedLifecycle(overrides = {}, receiptOverrides = {}) {
   };
 }
 
+const REPORT_REPOSITORY = "openclaw-skills";
+const REPORT_BRANCH = "fix/acp-reporting-fail-closed-guard";
+const REPORT_INSTRUCTION =
+  "다음 구분자 사이의 메시지만 그대로 반환해. 앞말·뒷말·설명·코드펜스·바꿔쓰기·두 번째 메시지를 추가하지 마.";
+
+// One reusable acp-reporting-v1 bundle bound to a raw lifecycle fixture: a
+// round-1 start message for the fixture model/repository/branch, matching
+// destinations and receipt, and one disabled tool-less 10-minute public
+// watchdog whose payload carries the exact 19-line report layout. Reads the
+// lifecycle defensively so deliberately malformed lifecycle fixtures still
+// serialize (they fail on lifecycle before reporting is ever validated).
+function validReporting(lifecycle = rawLifecycle(), { model = "test-model", roundIndex = 1 } = {}) {
+  const receipt = (lifecycle && lifecycle.startReceipt) || {};
+  const controlConversationId =
+    (lifecycle && lifecycle.controlConversationId) ?? CONTROL_CONVERSATION_ID;
+  const startMessage = [
+    "🚀 **ACP 작업 시작 · 18:30 KST**",
+    "",
+    "🤖 **ACP**: Claude Code · `" + model + "`",
+    "📍 **작업**: `" + REPORT_REPOSITORY + "` · `" + REPORT_BRANCH + "`",
+    "",
+    "🎯 **범위**",
+    "- 감독 통합 검증",
+    "",
+    "🕒 **중간 보고**",
+    "- ACP 실행 10분 이상일 때만 시작",
+    "",
+    "🔒 **외부 작업**",
+    "- 없음"
+  ].join("\n");
+  const report = [
+    "🔄 **ACP 중간 보고 · 18:45 KST**",
+    "",
+    "🤖 **ACP**: Claude Code · `" + model + "`",
+    "📍 **작업**: `" + REPORT_REPOSITORY + "` · `" + REPORT_BRANCH + "`",
+    "🔢 **라운드**: " + String(roundIndex) + " · 2/4 구현",
+    "⏱️ **ACP 시간**: 12분 경과",
+    "🔁 **실행 상태**: 감독 통합 검증이 계속되는 중",
+    "",
+    "✅ **새 결과**",
+    "- 통합 픽스처 준비 완료",
+    "",
+    "🛠️ **ACP 진행 중**",
+    "- 감독 통합 테스트 작성",
+    "",
+    "🧪 **ACP 자체 검증**",
+    "- 단위 테스트 통과 확인",
+    "",
+    "⏭️ **ACP 다음**",
+    "- 통합 검증 마무리"
+  ].join("\n");
+  return {
+    schemaVersion: "acp-reporting-v1",
+    roundIndex,
+    repository: REPORT_REPOSITORY,
+    branch: REPORT_BRANCH,
+    startMessage,
+    startDestination: controlConversationId,
+    watchdogDestination: controlConversationId,
+    terminalDestination: controlConversationId,
+    startReceipt: {
+      conversationId: receipt.conversationId ?? CONTROL_CONVERSATION_ID,
+      messageId: receipt.messageId ?? START_MESSAGE_ID,
+      deliveredAt: receipt.deliveredAt ?? "2026-08-24T09:30:00.000Z",
+      message: startMessage
+    },
+    watchdog: {
+      id: "acp-watchdog-round-" + String(roundIndex),
+      roundIndex,
+      enabled: false,
+      sessionTarget: "isolated",
+      schedule: { kind: "every", everyMs: 600000 },
+      delivery: {
+        mode: "announce",
+        channel: "discord",
+        to: "channel:" + controlConversationId
+      },
+      deleteAfterRun: false,
+      payload: {
+        kind: "agentTurn",
+        toolsAllow: [],
+        timeoutSeconds: 45,
+        message: REPORT_INSTRUCTION + "\n\n---BEGIN ACP REPORT---\n" + report + "\n---END ACP REPORT---"
+      }
+    }
+  };
+}
+
 function deferred() {
   let resolve;
   let reject;
@@ -624,6 +712,7 @@ test("config requires a timeout and rejects the unclassified other kind", () => 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-config-required-"));
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
   const base = {
     agent: "test-agent",
     model: "test-model",
@@ -633,7 +722,8 @@ test("config requires a timeout and rejects the unclassified other kind", () => 
     responseFile: path.join(root, "response.txt"),
     stateDir: path.join(root, "state"),
     runtimeModule: root,
-    lifecycle: rawLifecycle(),
+    lifecycle,
+    reporting: validReporting(lifecycle),
     allowKinds: ["read"]
   };
 
@@ -660,6 +750,7 @@ test("environment contract config shape fails closed with exact codes", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-env-config-"));
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
   const base = {
     agent: "test-agent",
     model: "test-model",
@@ -670,7 +761,8 @@ test("environment contract config shape fails closed with exact codes", () => {
     stateDir: path.join(root, "state"),
     runtimeModule: root,
     timeoutMs: 30000,
-    lifecycle: rawLifecycle(),
+    lifecycle,
+    reporting: validReporting(lifecycle),
     allowKinds: ["read"]
   };
   const writeCase = (name, extra) => {
@@ -869,7 +961,11 @@ test("start-receipt config shape fails closed with exact codes", () => {
   };
   const writeCase = (name, lifecycle) => {
     const file = path.join(root, name + ".json");
-    fs.writeFileSync(file, JSON.stringify({ ...base, lifecycle }), { mode: 0o600 });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ ...base, lifecycle, reporting: validReporting(lifecycle) }),
+      { mode: 0o600 }
+    );
     return file;
   };
 
@@ -938,8 +1034,10 @@ test("delivered-at accepts Discord's native instant within a bounded fraction", 
   const responseFile = path.join(root, "response.txt");
   const writeCase = (name, deliveredAt) => {
     const file = path.join(root, name + ".json");
+    const lifecycle = rawLifecycle({}, { deliveredAt });
     fs.writeFileSync(file, JSON.stringify({
       agent: "test-agent",
+      model: "test-model",
       cwd: root,
       sessionKey: "test-session",
       promptFile: prompt,
@@ -948,7 +1046,8 @@ test("delivered-at accepts Discord's native instant within a bounded fraction", 
       runtimeModule: root,
       timeoutMs: 30000,
       allowKinds: ["read"],
-      lifecycle: rawLifecycle({}, { deliveredAt })
+      lifecycle,
+      reporting: validReporting(lifecycle)
     }), { mode: 0o600 });
     return file;
   };
@@ -1030,6 +1129,104 @@ test("invalid start receipt retains the invalid-config CLI mapping", async () =>
   assert.equal(emitted.type, "supervisor_error");
   assert.equal(emitted.code, "invalid_start_receipt_conversation_mismatch");
   assert.equal(fs.existsSync(path.join(root, "state")), false);
+});
+
+test("malformed reporting fails closed before any runtime module access", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-gate-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+
+  // A real runtime module that records every stage of access: static import,
+  // probe, and adapter construction each leave a sentinel file behind.
+  const sentinelFile = path.join(root, "runtime-touched.txt");
+  const runtimeFile = path.join(root, "runtime.mjs");
+  fs.writeFileSync(runtimeFile, [
+    'import fs from "node:fs";',
+    `fs.writeFileSync(${JSON.stringify(sentinelFile)}, "imported");`,
+    "export function createRuntimeStore() { return {}; }",
+    "export function createAgentRegistry() { return {}; }",
+    "export function createAcpRuntime() {",
+    `  fs.writeFileSync(${JSON.stringify(sentinelFile)}, "adapter-started");`,
+    "  return {",
+    "    async probeAvailability() {",
+    `      fs.writeFileSync(${JSON.stringify(sentinelFile)}, "probed");`,
+    "    },",
+    "    async ensureSession() { return {}; },",
+    "    startTurn() { return {}; },",
+    "    async close() {}",
+    "  };",
+    "}"
+  ].join("\n"), { mode: 0o600 });
+
+  const lifecycle = rawLifecycle();
+  const writeCase = (name, reporting) => {
+    const file = path.join(root, name + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent: "test-agent",
+      model: "test-model",
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile: path.join(root, "response-" + name + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: runtimeFile,
+      timeoutMs: 30000,
+      lifecycle,
+      allowKinds: ["read"],
+      ...(reporting === undefined ? {} : { reporting })
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  // Absent reporting is invalid config, not a pass-through.
+  assert.throws(
+    () => loadSupervisorConfig(writeCase("absent", undefined)),
+    { message: "invalid_reporting_root", code: "invalid_reporting_root" }
+  );
+
+  // Malformed reporting keeps the module's stable bounded code.
+  const misrouted = {
+    ...validReporting(lifecycle),
+    startDestination: "999888777666555444"
+  };
+  assert.throws(
+    () => loadSupervisorConfig(writeCase("misrouted", misrouted)),
+    { message: "invalid_reporting_destination", code: "invalid_reporting_destination" }
+  );
+
+  // The CLI layer maps the same failure to the invalid-config exit while
+  // preserving the code.
+  const writes = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    writes.push(String(chunk));
+    return true;
+  };
+  let exitCode;
+  try {
+    exitCode = await main(["--config", writeCase("misrouted-cli", misrouted)]);
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(exitCode, EXIT_CODES.invalidConfig);
+  const emitted = JSON.parse(writes.join("").trim());
+  assert.equal(emitted.type, "supervisor_error");
+  assert.equal(emitted.code, "invalid_reporting_destination");
+
+  // The runtime module was never imported, probed, or started, and no
+  // supervisor side effects happened.
+  assert.equal(fs.existsSync(sentinelFile), false);
+  assert.equal(fs.existsSync(path.join(root, "state")), false);
+  assert.equal(fs.existsSync(path.join(root, "response-misrouted-cli.txt")), false);
+
+  // A valid bundle still loads, with the normalized frozen result stored on
+  // the supervisor config.
+  const valid = loadSupervisorConfig(writeCase("valid", validReporting(lifecycle)));
+  assert.equal(valid.reporting.schemaVersion, "acp-reporting-v1");
+  assert.equal(valid.reporting.startReceipt.deliveredAt, lifecycle.startReceipt.deliveredAt);
+  assert.equal(valid.reporting.startDestination, CONTROL_CONVERSATION_ID);
+  assert.equal(Object.isFrozen(valid.reporting), true);
+  assert.equal(Object.isFrozen(valid.reporting.watchdog.payload), true);
 });
 
 test("fresh same-conversation start receipt reaches the runtime", async () => {
@@ -1467,6 +1664,7 @@ test("claude config requires the exact setup-token auth profile", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-auth-config-"));
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
   const base = {
     agent: "claude",
     model: "test-model",
@@ -1476,7 +1674,8 @@ test("claude config requires the exact setup-token auth profile", () => {
     stateDir: path.join(root, "state"),
     runtimeModule: root,
     timeoutMs: 30000,
-    lifecycle: rawLifecycle(),
+    lifecycle,
+    reporting: validReporting(lifecycle),
     allowKinds: ["read"]
   };
   let caseIndex = 0;

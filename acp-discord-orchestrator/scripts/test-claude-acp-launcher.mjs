@@ -11,6 +11,7 @@ import {
   main,
   runLauncherEnvironmentPreflight
 } from "./claude-acp-launcher.mjs";
+import { validateAcpReportingContract } from "./acp-reporting-contract.mjs";
 import {
   CLAUDE_AUTH_KIND,
   CLAUDE_FORBIDDEN_ENV,
@@ -90,10 +91,103 @@ function makeMockRuntimePackage(root) {
   return runtimeDir;
 }
 
+const CONTROL_CONVERSATION_ID = "100000000000000001";
+const START_MESSAGE_ID = "100000000000000002";
+const REPORT_REPOSITORY = "openclaw-skills";
+const REPORT_BRANCH = "fix/acp-reporting-fail-closed-guard";
+const REPORT_INSTRUCTION =
+  "다음 구분자 사이의 메시지만 그대로 반환해. 앞말·뒷말·설명·코드펜스·바꿔쓰기·두 번째 메시지를 추가하지 마.";
+
+// Deterministic acp-reporting-v1 bundle mirroring the canonical fixture in
+// test-acpx-foreground-supervisor.mjs: a round-1 start message for the fixture
+// model/repository/branch, destinations and receipt bound to the launcher
+// lifecycle fixture, and one disabled tool-less 10-minute public watchdog
+// carrying the exact 19-line report layout. Launcher fixtures need this to
+// pass the mandatory reporting config gate and reach auth/exec behavior.
+function validReporting({
+  controlConversationId = CONTROL_CONVERSATION_ID,
+  messageId = START_MESSAGE_ID,
+  deliveredAt,
+  model = "test-model"
+}) {
+  const startMessage = [
+    "🚀 **ACP 작업 시작 · 18:30 KST**",
+    "",
+    "🤖 **ACP**: Claude Code · `" + model + "`",
+    "📍 **작업**: `" + REPORT_REPOSITORY + "` · `" + REPORT_BRANCH + "`",
+    "",
+    "🎯 **범위**",
+    "- 런처 통합 검증",
+    "",
+    "🕒 **중간 보고**",
+    "- ACP 실행 10분 이상일 때만 시작",
+    "",
+    "🔒 **외부 작업**",
+    "- 없음"
+  ].join("\n");
+  const report = [
+    "🔄 **ACP 중간 보고 · 18:45 KST**",
+    "",
+    "🤖 **ACP**: Claude Code · `" + model + "`",
+    "📍 **작업**: `" + REPORT_REPOSITORY + "` · `" + REPORT_BRANCH + "`",
+    "🔢 **라운드**: 1 · 2/4 구현",
+    "⏱️ **ACP 시간**: 12분 경과",
+    "🔁 **실행 상태**: 런처 통합 검증이 계속되는 중",
+    "",
+    "✅ **새 결과**",
+    "- 런처 픽스처 준비 완료",
+    "",
+    "🛠️ **ACP 진행 중**",
+    "- 런처 통합 테스트 작성",
+    "",
+    "🧪 **ACP 자체 검증**",
+    "- 단위 테스트 통과 확인",
+    "",
+    "⏭️ **ACP 다음**",
+    "- 통합 검증 마무리"
+  ].join("\n");
+  return {
+    schemaVersion: "acp-reporting-v1",
+    roundIndex: 1,
+    repository: REPORT_REPOSITORY,
+    branch: REPORT_BRANCH,
+    startMessage,
+    startDestination: controlConversationId,
+    watchdogDestination: controlConversationId,
+    terminalDestination: controlConversationId,
+    startReceipt: {
+      conversationId: controlConversationId,
+      messageId,
+      deliveredAt,
+      message: startMessage
+    },
+    watchdog: {
+      id: "acp-watchdog-round-1",
+      roundIndex: 1,
+      enabled: false,
+      sessionTarget: "isolated",
+      schedule: { kind: "every", everyMs: 600000 },
+      delivery: {
+        mode: "announce",
+        channel: "discord",
+        to: "channel:" + controlConversationId
+      },
+      deleteAfterRun: false,
+      payload: {
+        kind: "agentTurn",
+        toolsAllow: [],
+        timeoutSeconds: 45,
+        message: REPORT_INSTRUCTION + "\n\n---BEGIN ACP REPORT---\n" + report + "\n---END ACP REPORT---"
+      }
+    }
+  };
+}
+
 function writeClaudeRunConfig(root, overrides = {}) {
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "perform the bounded test task", { mode: 0o600 });
   const configFile = path.join(root, "run.json");
+  const deliveredAt = new Date().toISOString();
   fs.writeFileSync(configFile, JSON.stringify({
     agent: "claude",
     model: "test-model",
@@ -106,14 +200,15 @@ function writeClaudeRunConfig(root, overrides = {}) {
     timeoutMs: 30000,
     progressMs: 0,
     lifecycle: {
-      controlConversationId: "100000000000000001",
+      controlConversationId: CONTROL_CONVERSATION_ID,
       maxStartReceiptAgeMs: 300000,
       startReceipt: {
-        conversationId: "100000000000000001",
-        messageId: "100000000000000002",
-        deliveredAt: new Date().toISOString()
+        conversationId: CONTROL_CONVERSATION_ID,
+        messageId: START_MESSAGE_ID,
+        deliveredAt
       }
     },
+    reporting: validReporting({ deliveredAt }),
     allowKinds: ["read", "execute"],
     ...overrides
   }), { mode: 0o600 });
@@ -460,6 +555,33 @@ test("public docs and template describe the canonical claude route", () => {
   assert.equal(template.agent, "claude");
   assert.equal(template.auth.kind, CLAUDE_AUTH_KIND);
   assert.match(template.auth.envFile, /^\/absolute\//);
+
+  // Both public docs must describe the mandatory fail-closed reporting gate.
+  for (const doc of [skill, contract]) {
+    assert.match(doc, /acp-reporting-v1/);
+    assert.match(doc, /invalid_reporting_/);
+  }
+  assert.match(contract, /^## Reporting contract$/m);
+
+  // The template's reporting bundle must be internally consistent: once the
+  // conversation/message placeholders are bound to decimal identifiers, it
+  // passes the real contract validator against the template's own model,
+  // control conversation, and lifecycle receipt.
+  const bound = JSON.parse(
+    JSON.stringify(template)
+      .replaceAll("CONTROL_CONVERSATION_ID", "100000000000000001")
+      .replaceAll("START_MESSAGE_ID", "100000000000000002")
+  );
+  const normalized = validateAcpReportingContract(bound.reporting, {
+    model: bound.model,
+    controlConversationId: bound.lifecycle.controlConversationId,
+    lifecycleStartReceipt: bound.lifecycle.startReceipt
+  });
+  assert.equal(normalized.roundIndex, 1);
+  assert.equal(normalized.watchdog.enabled, false);
+  assert.deepEqual(normalized.watchdog.payload.toolsAllow, []);
+  assert.equal(normalized.startDestination, bound.lifecycle.controlConversationId);
+
   const serialized = skill + contract + JSON.stringify(template);
   assert.doesNotMatch(serialized, /sk-ant-/);
   assert.doesNotMatch(serialized, /\/Users\/[a-z]/);

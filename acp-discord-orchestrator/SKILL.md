@@ -38,8 +38,13 @@ This policy does not globally disable human-operated OpenClaw ACP commands.
 5. Set the config file and prompt file to owner-only permissions.
 6. Set an explicit working directory, ACP agent, model, unique session key, timeout, progress interval, and allowed tool kinds. The template's two-hour `timeoutMs` is an emergency ceiling independent of reporting cadence; set it per run.
 7. Announce the run in the current control conversation first, then record that delivery in the required `lifecycle` block: `controlConversationId`, the same conversation ID and the delivered `messageId` under `startReceipt`, and the observed `deliveredAt` instant. The supervisor fails closed before runtime loading, probing, or adapter startup when the receipt is missing, malformed, bound to another conversation, dated ahead of its own clock, or older than `maxStartReceiptAgeMs`. It validates caller-attested receipt metadata only; it holds no chat credentials and makes no network call, so it does not prove the message exists or that its text matches.
-8. Optionally declare the run's environment contract with `requiredEnv` and `forbiddenEnv`. The supervisor fails closed before runtime loading, probing, or adapter startup when a required variable is absent or empty or a forbidden variable is non-empty, and it never discloses environment values. This generic gate does not prove how a variable was injected or validate credential sources; for non-Claude agents it is the whole environment contract.
-9. For `agent: "claude"`, declare the required auth profile and keep the token in a private env file the config only points to:
+8. Prepare the round's public reporting bundle and record it in the required `reporting` block (schema `acp-reporting-v1`), in this order, before any launch:
+   - Create exactly one disabled public-only watchdog for this round: tool-less (`toolsAllow: []`), isolated session, `{ "kind": "every", "everyMs": 600000 }` schedule, Discord announce to the control conversation channel, `deleteAfterRun: false`, and a timeout of at most 60 seconds. Its payload is only the minimal verbatim relay instruction plus one exact 19-line public `ACP 중간 보고` report between the delimiters — no operational detail, paths, commands, or silence/self-decision instructions.
+   - Send the exact round-start boundary message to the control conversation — the same delivery already recorded in `lifecycle.startReceipt` — matching the fixed 13-line start template for this round and model/repository/branch.
+   - Store the watchdog snapshot and the start message with its receipt in `reporting`, keeping `startDestination`, `watchdogDestination`, and `terminalDestination` all equal to `lifecycle.controlConversationId` and `reporting.startReceipt` byte-identical to the lifecycle receipt.
+   - Only then launch. A missing or malformed `reporting` bundle is invalid config: the supervisor fails closed with a stable `invalid_reporting_*` code before runtime import, probing, or adapter startup. The template ships a complete placeholder bundle; the exact schema and message templates are defined in [references/runtime-contract.md](references/runtime-contract.md).
+9. Optionally declare the run's environment contract with `requiredEnv` and `forbiddenEnv`. The supervisor fails closed before runtime loading, probing, or adapter startup when a required variable is absent or empty or a forbidden variable is non-empty, and it never discloses environment values. This generic gate does not prove how a variable was injected or validate credential sources; for non-Claude agents it is the whole environment contract.
+10. For `agent: "claude"`, declare the required auth profile and keep the token in a private env file the config only points to:
 
    ```json
    "auth": { "kind": "claude-setup-token-env-file", "envFile": "/absolute/private/claude-acp-oauth.env" }
@@ -50,8 +55,8 @@ This policy does not globally disable human-operated OpenClaw ACP commands.
    The template ships with this Claude `auth` block. For every other agent, delete the entire `auth` block and set `agent` accordingly: an `auth` profile on a non-Claude agent is invalid config (`invalid_auth_agent`), and non-Claude runs declare their whole environment contract through `requiredEnv`/`forbiddenEnv` instead.
 
    The launcher certifies a clean parent environment and unsets nothing silently. If the launching shell already exports `CLAUDE_CODE_OAUTH_TOKEN` (even empty), a competing credential selector, or an injection-capable variable such as `NODE_OPTIONS`, the launch fails closed with a code naming the variable. Remediate by removing the variable explicitly in the launching shell — for example `env -u NODE_OPTIONS -u CLAUDE_CODE_OAUTH_TOKEN node …` — rather than expecting the launcher to strip it.
-10. Define terminal acceptance checks in the prompt.
-11. Resolve this skill's directory and run the run's canonical entry point by absolute path in the foreground. For Claude (POSIX, Node.js 22.15+/23.11+ or any later line):
+11. Define terminal acceptance checks in the prompt.
+12. Resolve this skill's directory and run the run's canonical entry point by absolute path in the foreground. For Claude (POSIX, Node.js 22.15+/23.11+ or any later line):
 
 ```bash
 node /absolute/path/to/acp-discord-orchestrator/scripts/claude-acp-launcher.mjs --config /absolute/private/run.json
@@ -119,8 +124,8 @@ The guard is a permission-layer contract, not an operating-system sandbox. It re
 
 Route normalized `started`, `activity`, `progress`, `permission_rejected`, and `terminal` events to the current conversation according to the caller's local reporting policy. Normalized events never carry the control conversation ID or the start message ID; the caller already holds both.
 
-Keep personal channel IDs, operator identity, watchdog language and cadence, model fallback policy, and organization-specific Git workflow outside this public skill.
+The watchdog cadence, control-conversation routing, and public message templates are fixed by the generic `acp-reporting-v1` reporting contract in [references/runtime-contract.md](references/runtime-contract.md); only the bounded free-text slots inside those templates vary per run. Keep personal channel IDs, operator identity, model fallback policy, and organization-specific Git workflow outside this public skill.
 
 ## Fail closed
 
-Stop without fallback when the start-receipt gate, environment preflight, runtime discovery, capability checks, permission inspection, event/result identity, response storage, or terminal mapping is uncertain. Do not recover by creating an official ACP thread or launching untracked ACPX.
+Stop without fallback when the start-receipt gate, reporting contract, environment preflight, runtime discovery, capability checks, permission inspection, event/result identity, response storage, or terminal mapping is uncertain. Do not recover by creating an official ACP thread or launching untracked ACPX.

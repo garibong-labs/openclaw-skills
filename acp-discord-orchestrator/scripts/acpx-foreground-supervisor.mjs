@@ -3,6 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import {
+  AcpReportingContractError,
+  validateAcpReportingContract
+} from "./acp-reporting-contract.mjs";
+
 export const SCHEMA_VERSION = "acp-discord-orchestrator.v1";
 export const EXIT_CODES = Object.freeze({
   completed: 0,
@@ -673,10 +678,37 @@ export function loadSupervisorConfig(configPath) {
     allowKinds.add(value);
   }
 
+  const model = raw.model === undefined
+    ? undefined
+    : assertIdentifier(raw.model, "invalid_model", 256);
+
+  // Mandatory reporting bundle, validated last so every structural field it
+  // binds to (model, lifecycle receipt) is already trusted, and before any
+  // runtime import, probe, or adapter startup can occur. The context receipt
+  // uses the raw deliveredAt spelling: the contract compares it byte-for-byte
+  // against the caller-attested lifecycle receipt.
+  let reporting;
+  try {
+    reporting = validateAcpReportingContract(raw.reporting, {
+      model,
+      controlConversationId: lifecycle.controlConversationId,
+      lifecycleStartReceipt: {
+        conversationId: lifecycle.startReceipt.conversationId,
+        messageId: lifecycle.startReceipt.messageId,
+        deliveredAt: raw.lifecycle.startReceipt.deliveredAt
+      }
+    });
+  } catch (error) {
+    if (error instanceof AcpReportingContractError) {
+      fail(error.code);
+    }
+    throw error;
+  }
+
   return {
     agent,
     auth,
-    model: raw.model === undefined ? undefined : assertIdentifier(raw.model, "invalid_model", 256),
+    model,
     cwd,
     sessionKey: assertString(raw.sessionKey, "invalid_session_key", 256),
     promptText,
@@ -686,6 +718,7 @@ export function loadSupervisorConfig(configPath) {
     progressMs,
     allowKinds,
     lifecycle,
+    reporting,
     requiredEnv,
     forbiddenEnv,
     maxResponseBytes: raw.maxResponseBytes === undefined
