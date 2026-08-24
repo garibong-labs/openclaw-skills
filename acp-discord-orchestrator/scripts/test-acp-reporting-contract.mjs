@@ -104,14 +104,15 @@ function buildPayloadMessage(report) {
 
 function buildReporting({
   roundIndex = 1,
+  model = CONTEXT.model,
   repository = REPO,
   branch = BRANCH,
   issueBullet = null,
   reportLines = null,
   timeoutSeconds = 45,
 } = {}) {
-  const startMessage = buildStartMessage({ roundIndex, repository, branch });
-  const lines = reportLines ?? buildReportLines({ roundIndex, repository, branch, issueBullet });
+  const startMessage = buildStartMessage({ roundIndex, model, repository, branch });
+  const lines = reportLines ?? buildReportLines({ roundIndex, model, repository, branch, issueBullet });
   return {
     schemaVersion: 'acp-reporting-v1',
     roundIndex,
@@ -500,4 +501,256 @@ test('missing or empty 실행 상태 metadata is rejected', () => {
   const asSection = buildReportLines();
   asSection[6] = '🔁 **실행 상태**';
   expectRejected(buildReporting({ reportLines: asSection }), 'invalid_reporting_report');
+});
+
+// Invisible characters, addressed by code point so the test source stays free
+// of raw control bytes.
+const NEL = String.fromCharCode(0x85); // C1 next line
+const CSI = String.fromCharCode(0x9b); // C1 control sequence introducer
+const ESC = String.fromCharCode(0x1b);
+const BEL = String.fromCharCode(0x07);
+const LS = String.fromCharCode(0x2028); // line separator
+const ZWSP = String.fromCharCode(0x200b);
+const ZWJ = String.fromCharCode(0x200d);
+
+test('metadata containing forbidden-pattern words is legal; free-text slots are not', () => {
+  // Repository/branch/model are bound by their own validators, never by the
+  // free-text denylist, so ordinary names stay possible.
+  const metadataCases = [
+    { branch: 'fix/routing' },
+    { branch: 'feat/cron-schedule' },
+    { branch: 'chore/no-op-cleanup' },
+    { repository: 'snapshot-tool' },
+    { repository: 'grep-utils' },
+  ];
+  for (const overrides of metadataCases) {
+    const reporting = buildReporting(overrides);
+    const normalized = validateAcpReportingContract(reporting, CONTEXT);
+    assert.equal(normalized.branch, reporting.branch);
+    assert.equal(normalized.repository, reporting.repository);
+  }
+  const model = 'snapshot-router-model';
+  const withModel = buildReporting({ model });
+  validateAcpReportingContract(withModel, { ...CONTEXT, model });
+
+  // The same words inside a report free-text slot keep failing closed.
+  const bulletLines = buildReportLines();
+  bulletLines[9] = '- 라우팅 스냅샷 정리';
+  expectRejected(buildReporting({ reportLines: bulletLines }), 'invalid_reporting_forbidden_content');
+});
+
+test('start message free-text bullets are screened for forbidden content', () => {
+  const screen = (index, bullet) => {
+    const reporting = buildReporting();
+    const lines = reporting.startMessage.split('\n');
+    lines[index] = bullet;
+    const message = lines.join('\n');
+    reporting.startMessage = message;
+    reporting.startReceipt.message = message;
+    expectRejected(reporting, 'invalid_reporting_forbidden_content');
+  };
+  screen(6, '- git status 출력을 정리');
+  screen(6, '- 세션 JSON에서 상태 확인');
+  screen(12, '- /Users/anyone/repo 정리');
+  screen(12, '- 스스로 판단해서 처리');
+});
+
+test('C1 controls and U+2028/U+2029 are rejected like C0 controls', () => {
+  const startNel = buildReporting();
+  const nelMessage = startNel.startMessage.replace('- 없음', `- 없${NEL}음`);
+  startNel.startMessage = nelMessage;
+  startNel.startReceipt.message = nelMessage;
+  expectRejected(startNel, 'invalid_reporting_start_message');
+
+  const reportLs = buildReportLines();
+  reportLs[9] = `- 결과${LS}한 줄`;
+  expectRejected(buildReporting({ reportLines: reportLs }), 'invalid_reporting_watchdog_message');
+
+  const branchNel = buildReporting();
+  branchNel.branch = `fix/a${NEL}b`;
+  expectRejected(branchNel, 'invalid_reporting_branch');
+
+  const idCsi = buildReporting();
+  idCsi.watchdog.id = `id${CSI}31m`;
+  expectRejected(idCsi, 'invalid_reporting_watchdog');
+
+  const modelNel = { ...CONTEXT, model: `bad${NEL}model` };
+  expectContractError(
+    () => validateAcpReportingContract(buildReporting(), modelNel),
+    'invalid_reporting_context'
+  );
+});
+
+test('zero-width-only free text is rejected as visually empty', () => {
+  const startZw = buildReporting();
+  const zwMessage = startZw.startMessage.replace('- 없음', `- ${ZWSP}${ZWJ}`);
+  startZw.startMessage = zwMessage;
+  startZw.startReceipt.message = zwMessage;
+  expectRejected(startZw, 'invalid_reporting_start_message');
+
+  const bulletZw = buildReportLines();
+  bulletZw[9] = `- ${ZWSP}`;
+  expectRejected(buildReporting({ reportLines: bulletZw }), 'invalid_reporting_report');
+
+  const stateZw = buildReportLines({ executionState: ZWSP });
+  expectRejected(buildReporting({ reportLines: stateZw }), 'invalid_reporting_report');
+
+  // A joiner inside an emoji sequence next to visible text stays legal.
+  const emoji = buildReportLines();
+  emoji[9] = `- 👩${ZWJ}💻 검증 진행`;
+  validateAcpReportingContract(buildReporting({ reportLines: emoji }), CONTEXT);
+});
+
+test('normalized output is built from validated locals, not re-read getters', () => {
+  const swapAfterFirstRead = (target, key, validValue, evilValue) => {
+    let reads = 0;
+    Object.defineProperty(target, key, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? validValue : evilValue;
+      },
+    });
+  };
+
+  const messageSwap = buildReporting();
+  const validMessage = messageSwap.watchdog.payload.message;
+  swapAfterFirstRead(messageSwap.watchdog.payload, 'message', validMessage, 'git status /Users/evil');
+  const normalizedMessage = validateAcpReportingContract(messageSwap, CONTEXT);
+  assert.equal(normalizedMessage.watchdog.payload.message, validMessage);
+
+  const startSwap = buildReporting();
+  const validStart = startSwap.startMessage;
+  swapAfterFirstRead(startSwap, 'startMessage', validStart, '자유 형식 보고');
+  const normalizedStart = validateAcpReportingContract(startSwap, CONTEXT);
+  assert.equal(normalizedStart.startMessage, validStart);
+  assert.equal(normalizedStart.startReceipt.message, validStart);
+
+  const timeoutSwap = buildReporting();
+  swapAfterFirstRead(timeoutSwap.watchdog.payload, 'timeoutSeconds', 45, 999999);
+  assert.equal(validateAcpReportingContract(timeoutSwap, CONTEXT).watchdog.payload.timeoutSeconds, 45);
+
+  const idSwap = buildReporting();
+  swapAfterFirstRead(idSwap.watchdog, 'id', 'acp-watchdog-round-1', 'evil id');
+  assert.equal(validateAcpReportingContract(idSwap, CONTEXT).watchdog.id, 'acp-watchdog-round-1');
+
+  const toolsSwap = buildReporting();
+  swapAfterFirstRead(toolsSwap.watchdog.payload, 'toolsAllow', [], { length: 0 });
+  assert.deepEqual(validateAcpReportingContract(toolsSwap, CONTEXT).watchdog.payload.toolsAllow, []);
+});
+
+test('context lifecycle receipt must belong to the control conversation', () => {
+  const foreign = {
+    ...CONTEXT,
+    lifecycleStartReceipt: {
+      ...CONTEXT.lifecycleStartReceipt,
+      conversationId: OTHER_CHANNEL,
+    },
+  };
+  expectContractError(
+    () => validateAcpReportingContract(buildReporting(), foreign),
+    'invalid_reporting_context'
+  );
+});
+
+test('unknown-key diagnostics never echo control or ANSI characters', () => {
+  const reporting = buildReporting();
+  reporting[`${ESC}[31mevil${BEL}key`] = 1;
+  let caught;
+  try {
+    validateAcpReportingContract(reporting, CONTEXT);
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof AcpReportingContractError);
+  assert.equal(caught.code, 'invalid_reporting_unknown_key');
+  assert.equal(caught.message.includes(ESC), false);
+  assert.equal(caught.message.includes(BEL), false);
+  assert.ok(caught.message.includes('?'));
+});
+
+test('identifier and model bounds match the supervisor bounds', () => {
+  // 32-digit identifiers (the supervisor's DISCORD_ID bound) are accepted.
+  const id32 = '9'.repeat(32);
+  const message32 = '8'.repeat(32);
+  const context32 = {
+    model: CONTEXT.model,
+    controlConversationId: id32,
+    lifecycleStartReceipt: {
+      conversationId: id32,
+      messageId: message32,
+      deliveredAt: CONTEXT.lifecycleStartReceipt.deliveredAt,
+    },
+  };
+  const reporting32 = buildReporting();
+  reporting32.startDestination = id32;
+  reporting32.watchdogDestination = id32;
+  reporting32.terminalDestination = id32;
+  reporting32.startReceipt.conversationId = id32;
+  reporting32.startReceipt.messageId = message32;
+  reporting32.watchdog.delivery.to = `channel:${id32}`;
+  validateAcpReportingContract(reporting32, context32);
+
+  // 33 digits are out of bounds.
+  const context33 = {
+    ...context32,
+    controlConversationId: '9'.repeat(33),
+    lifecycleStartReceipt: {
+      ...context32.lifecycleStartReceipt,
+      conversationId: '9'.repeat(33),
+    },
+  };
+  expectContractError(
+    () => validateAcpReportingContract(reporting32, context33),
+    'invalid_reporting_context'
+  );
+
+  // Model length matches the supervisor's 256-character invalid_model bound.
+  const model256 = 'm'.repeat(256);
+  validateAcpReportingContract(
+    buildReporting({ model: model256 }),
+    { ...CONTEXT, model: model256 }
+  );
+  const model257 = 'm'.repeat(257);
+  expectContractError(
+    () => validateAcpReportingContract(buildReporting({ model: model257 }), { ...CONTEXT, model: model257 }),
+    'invalid_reporting_context'
+  );
+
+  // deliveredAt matches the supervisor's 40-character lifecycle bound.
+  const longDeliveredAt = '2'.repeat(41);
+  const longContext = {
+    ...CONTEXT,
+    lifecycleStartReceipt: {
+      ...CONTEXT.lifecycleStartReceipt,
+      deliveredAt: longDeliveredAt,
+    },
+  };
+  expectContractError(
+    () => validateAcpReportingContract(buildReporting(), longContext),
+    'invalid_reporting_context'
+  );
+});
+
+test('omitted context model binds the templates to the runtime-default label', () => {
+  const noModelContext = { ...CONTEXT };
+  delete noModelContext.model;
+
+  const labeled = buildReporting({ model: 'runtime-default' });
+  const normalized = validateAcpReportingContract(labeled, noModelContext);
+  assert.ok(normalized.startMessage.includes('`runtime-default`'));
+
+  // Without a pinned model, a template claiming a concrete model must not
+  // pass: the identity line no longer matches the expected label.
+  expectContractError(
+    () => validateAcpReportingContract(buildReporting(), noModelContext),
+    'invalid_reporting_start_message'
+  );
+
+  // A present-but-invalid model is still rejected, not treated as omitted.
+  expectContractError(
+    () => validateAcpReportingContract(labeled, { ...noModelContext, model: 42 }),
+    'invalid_reporting_context'
+  );
 });

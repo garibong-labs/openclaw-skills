@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
+  ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL,
   AcpReportingContractError,
   validateAcpReportingContract
 } from "./acp-reporting-contract.mjs";
@@ -338,14 +339,20 @@ function parseLifecycleContract(value) {
     fail("invalid_max_start_receipt_age_ms");
   }
 
+  // The original deliveredAt spelling is kept alongside its parsed instant:
+  // the reporting contract binds the attested start message to the receipt by
+  // byte-for-byte spelling, both at load time and in the in-memory
+  // runReportingPreflight backstop.
+  const deliveredAt = value.startReceipt.deliveredAt;
   return {
     controlConversationId,
     maxStartReceiptAgeMs,
     startReceipt: {
       conversationId,
       messageId,
+      deliveredAt,
       deliveredAtMs: parseDeliveredAt(
-        value.startReceipt.deliveredAt,
+        deliveredAt,
         "invalid_start_receipt_delivered_at"
       )
     }
@@ -383,6 +390,43 @@ export function runStartReceiptPreflight(config, nowMs) {
   if (ageMs > lifecycle.maxStartReceiptAgeMs) {
     fail("start_receipt_stale");
   }
+}
+
+// Maps a contract rejection onto the supervisor's bounded fail() codes so the
+// stable invalid_reporting_* code is the whole diagnostic; anything else
+// (a programming error) propagates unchanged.
+function assertReportingContract(reporting, context) {
+  try {
+    return validateAcpReportingContract(reporting, context);
+  } catch (error) {
+    if (error instanceof AcpReportingContractError) {
+      fail(error.code);
+    }
+    throw error;
+  }
+}
+
+// In-memory backstop mirroring runStartReceiptPreflight: a config assembled
+// without loadSupervisorConfig must still carry a reporting bundle satisfying
+// the full pure acp-reporting-v1 contract, and it must fail closed with the
+// same bounded invalid_reporting_* codes before any runtime module import,
+// probe, or adapter startup.
+export function runReportingPreflight(config) {
+  const lifecycle = isPlainObject(config.lifecycle) ? config.lifecycle : undefined;
+  const receipt = lifecycle && isPlainObject(lifecycle.startReceipt)
+    ? lifecycle.startReceipt
+    : undefined;
+  assertReportingContract(config.reporting, {
+    model: config.model,
+    controlConversationId: lifecycle ? lifecycle.controlConversationId : undefined,
+    lifecycleStartReceipt: receipt
+      ? {
+          conversationId: receipt.conversationId,
+          messageId: receipt.messageId,
+          deliveredAt: receipt.deliveredAt
+        }
+      : undefined
+  });
 }
 
 export function runEnvironmentPreflight(config, env) {
@@ -685,25 +729,17 @@ export function loadSupervisorConfig(configPath) {
   // Mandatory reporting bundle, validated last so every structural field it
   // binds to (model, lifecycle receipt) is already trusted, and before any
   // runtime import, probe, or adapter startup can occur. The context receipt
-  // uses the raw deliveredAt spelling: the contract compares it byte-for-byte
-  // against the caller-attested lifecycle receipt.
-  let reporting;
-  try {
-    reporting = validateAcpReportingContract(raw.reporting, {
-      model,
-      controlConversationId: lifecycle.controlConversationId,
-      lifecycleStartReceipt: {
-        conversationId: lifecycle.startReceipt.conversationId,
-        messageId: lifecycle.startReceipt.messageId,
-        deliveredAt: raw.lifecycle.startReceipt.deliveredAt
-      }
-    });
-  } catch (error) {
-    if (error instanceof AcpReportingContractError) {
-      fail(error.code);
+  // uses the parsed lifecycle's original deliveredAt spelling: the contract
+  // compares it byte-for-byte against the caller-attested lifecycle receipt.
+  const reporting = assertReportingContract(raw.reporting, {
+    model,
+    controlConversationId: lifecycle.controlConversationId,
+    lifecycleStartReceipt: {
+      conversationId: lifecycle.startReceipt.conversationId,
+      messageId: lifecycle.startReceipt.messageId,
+      deliveredAt: lifecycle.startReceipt.deliveredAt
     }
-    throw error;
-  }
+  });
 
   return {
     agent,
@@ -1375,6 +1411,7 @@ export async function runSupervisor(config, dependencies = {}) {
 
   try {
     runStartReceiptPreflight(config, now());
+    runReportingPreflight(config);
     runClaudeSupervisorPreflight(config, environment, execArgv);
     runEnvironmentPreflight(config, environment);
     preparePrivateStateDirectory(config.stateDir);
@@ -1445,7 +1482,7 @@ export async function runSupervisor(config, dependencies = {}) {
 
     emit("started", {
       agent: config.agent,
-      model: config.model || "runtime-default",
+      model: config.model || ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL,
       sessionRef: safeSessionReference(config.sessionKey),
       runtimeVersion: safeRuntimeVersion(loaded.version),
       allowedToolKinds: [...config.allowKinds].sort()

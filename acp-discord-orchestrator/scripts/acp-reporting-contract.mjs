@@ -17,12 +17,21 @@ const MAX_REPOSITORY_LENGTH = 100;
 const MAX_BRANCH_LENGTH = 200;
 const MAX_WATCHDOG_ID_LENGTH = 200;
 const MAX_ROUND_INDEX = 1000;
-const MAX_MODEL_LENGTH = 200;
-const MAX_DELIVERED_AT_LENGTH = 100;
+// Context bounds mirror the supervisor's own config bounds so the pure
+// contract and the loader accept the same values: identifiers use the
+// supervisor's 1..32-digit DISCORD_ID shape, model the 256-character
+// invalid_model bound, and deliveredAt the 40-character lifecycle bound.
+const MAX_MODEL_LENGTH = 256;
+const MAX_DELIVERED_AT_LENGTH = 40;
 const WATCHDOG_EVERY_MS = 600000;
 const MAX_WATCHDOG_TIMEOUT_SECONDS = 60;
 
 export const ACP_REPORTING_SCHEMA_VERSION = 'acp-reporting-v1';
+
+// Label used on the ACP identity line when the run has no pinned model. The
+// supervisor emits the same label in its `started` event, so the public
+// message and the normalized event stream agree.
+export const ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL = 'runtime-default';
 
 export const ACP_REPORT_INSTRUCTION =
   '다음 구분자 사이의 메시지만 그대로 반환해. 앞말·뒷말·설명·코드펜스·바꿔쓰기·두 번째 메시지를 추가하지 마.';
@@ -81,19 +90,34 @@ function fail(code, message) {
   throw new AcpReportingContractError(code, message);
 }
 
-// All C0 controls plus DEL. The multi-line variant excludes LF (U+000A) so
-// legitimate newlines pass while CR and every other control character fail.
-const SINGLE_LINE_CONTROL_RE = /[\u0000-\u001F\u007F]/;
-const MULTILINE_CONTROL_RE = /[\u0000-\u0009\u000B-\u001F\u007F]/;
-const NO_WHITESPACE_OR_CONTROL_RE = /[\s\u0000-\u001F\u007F]/;
-const DECIMAL_ID_RE = /^[0-9]{1,25}$/;
+// All C0 controls, DEL, the C1 range (U+0080-U+009F, which carries NEL and
+// the raw ANSI CSI introducer), and the U+2028/U+2029 line separators that
+// many renderers treat as newlines. The multi-line variant excludes LF
+// (U+000A) so legitimate newlines pass while CR and every other line/control
+// character fails.
+const SINGLE_LINE_CONTROL_RE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/;
+const MULTILINE_CONTROL_RE = /[\u0000-\u0009\u000B-\u001F\u007F-\u009F\u2028\u2029]/;
+const NO_WHITESPACE_OR_CONTROL_RE = /[\s\u0000-\u001F\u007F-\u009F\u2028\u2029]/;
+// Zero-width and directionality format characters that render as nothing (or
+// only reorder surrounding text): a free-text slot made only of these is
+// visually empty. Emoji presentation selectors (U+FE0E/U+FE0F) are
+// deliberately absent -- they accompany visible emoji in the fixed headers.
+const INVISIBLE_FORMAT_RE =
+  /[\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/g;
+const DECIMAL_ID_RE = /^[0-9]{1,32}$/;
 const HHMM = '(?:[01][0-9]|2[0-3]):[0-5][0-9]';
 
-// Conservative, bounded forbidden-content list for the watchdog payload
-// message and rendered report. Each entry pairs a short label (safe to put in
-// error messages) with a case-insensitive pattern. Patterns are anchored on
-// word boundaries or Korean collocations so ordinary public words (ACP, 작업,
-// 진행, 상태, 라운드, …) never match on their own.
+// Conservative, bounded forbidden-content list for the FREE-TEXT SLOTS of the
+// start message and the rendered report (bullets, elapsed-time value, 실행
+// 상태 value). It is a tripwire for known operational patterns, not a
+// semantic filter: novel paraphrases are out of its scope, and the
+// exact-template layout checks remain the primary control. Metadata
+// (repository/branch/model lines) is bound by its own validators and is never
+// screened, so names that merely contain a denylisted word stay legal. Each
+// entry pairs a short label (safe to put in error messages) with a
+// case-insensitive pattern anchored on word boundaries or Korean collocations
+// so ordinary public words (ACP, 작업, 진행, 상태, 라운드, …) never match on
+// their own.
 const FORBIDDEN_CONTENT_PATTERNS = Object.freeze([
   ['session-json', /세션\s*json/iu],
   ['session-internals', /세션\s*(파일|핸들|경로|조회|검사)/u],
@@ -133,8 +157,13 @@ function isPlainObject(value) {
   return proto === Object.prototype || proto === null;
 }
 
+// Keys are attacker-controlled: bound the length and replace anything outside
+// printable ASCII and letters/digits, so a hostile key cannot smuggle raw
+// control bytes or ANSI escape sequences into a diagnostic message.
 function describeKey(key) {
-  return String(key).slice(0, 40);
+  return String(key)
+    .slice(0, 40)
+    .replace(/[^ -~\p{L}\p{N}]/gu, '?');
 }
 
 function assertExactKeys(value, keys, code, label) {
@@ -146,8 +175,14 @@ function assertExactKeys(value, keys, code, label) {
   }
 }
 
+// "Non-empty" means visibly non-empty: a slot filled only with zero-width or
+// directionality format characters renders as blank and is rejected.
+function hasVisibleText(text) {
+  return text.replace(INVISIBLE_FORMAT_RE, '').trim().length > 0;
+}
+
 function isBulletLine(line) {
-  return typeof line === 'string' && line.startsWith('- ') && line.slice(2).trim().length > 0;
+  return typeof line === 'string' && line.startsWith('- ') && hasVisibleText(line.slice(2));
 }
 
 function countOccurrences(haystack, needle) {
@@ -171,14 +206,23 @@ function deepFreeze(value) {
 function validateContext(context) {
   if (!isPlainObject(context)) fail('invalid_reporting_context', 'context must be a plain object');
   const { model, controlConversationId, lifecycleStartReceipt } = context;
-  if (
+  // `model` is optional in the supervisor config. A run without a pinned
+  // model identifies itself with the same fixed label the supervisor's
+  // `started` event emits, so the public templates and the event stream never
+  // disagree about the run's model.
+  let resolvedModel;
+  if (model === undefined) {
+    resolvedModel = ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL;
+  } else if (
     typeof model !== 'string' ||
     model.length === 0 ||
     model.length > MAX_MODEL_LENGTH ||
     SINGLE_LINE_CONTROL_RE.test(model) ||
     model.includes('`')
   ) {
-    fail('invalid_reporting_context', 'context.model must be a non-empty single-line model string');
+    fail('invalid_reporting_context', 'context.model must be omitted or a non-empty single-line model string');
+  } else {
+    resolvedModel = model;
   }
   if (typeof controlConversationId !== 'string' || !DECIMAL_ID_RE.test(controlConversationId)) {
     fail('invalid_reporting_context', 'context.controlConversationId must be a decimal Discord conversation id');
@@ -189,6 +233,11 @@ function validateContext(context) {
   const { conversationId, messageId, deliveredAt } = lifecycleStartReceipt;
   if (typeof conversationId !== 'string' || !DECIMAL_ID_RE.test(conversationId)) {
     fail('invalid_reporting_context', 'context.lifecycleStartReceipt.conversationId must be a decimal id');
+  }
+  // Same-conversation guarantee, enforced in the pure contract itself so a
+  // standalone caller cannot bind reporting to a receipt earned elsewhere.
+  if (conversationId !== controlConversationId) {
+    fail('invalid_reporting_context', 'context.lifecycleStartReceipt.conversationId must equal controlConversationId');
   }
   if (typeof messageId !== 'string' || !DECIMAL_ID_RE.test(messageId)) {
     fail('invalid_reporting_context', 'context.lifecycleStartReceipt.messageId must be a decimal id');
@@ -202,7 +251,7 @@ function validateContext(context) {
     fail('invalid_reporting_context', 'context.lifecycleStartReceipt.deliveredAt must be a non-empty single-line string');
   }
   return {
-    model,
+    model: resolvedModel,
     controlConversationId,
     lifecycleStartReceipt: { conversationId, messageId, deliveredAt },
   };
@@ -295,6 +344,12 @@ function validateStartMessage(startMessage, expected) {
   if (!isBulletLine(lines[12])) {
     fail('invalid_reporting_start_message', 'startMessage 외부 작업 section must contain exactly one non-empty bullet');
   }
+  // Screen the two free-text slots. Metadata lines are exact-matched against
+  // the already-validated model/repository/branch above and are deliberately
+  // NOT screened, so metadata that merely contains a denylisted word (branch
+  // "fix/routing", repository "snapshot-tool") stays legal.
+  assertNoForbiddenContent(lines[6], 'startMessage 범위 bullet');
+  assertNoForbiddenContent(lines[12], 'startMessage 외부 작업 bullet');
 }
 
 function assertNoForbiddenContent(text, label) {
@@ -336,20 +391,28 @@ function validateMiddleReport(report, expected) {
     fail('invalid_reporting_report', 'report line 5 must be the 라운드 line for this round with a valid <phaseIndex>/4 <phaseName> mapping');
   }
   const elapsedPrefix = '⏱️ **ACP 시간**: ';
-  if (!lines[5].startsWith(elapsedPrefix) || lines[5].slice(elapsedPrefix.length).trim().length === 0) {
+  if (!lines[5].startsWith(elapsedPrefix) || !hasVisibleText(lines[5].slice(elapsedPrefix.length))) {
     fail('invalid_reporting_report', 'report line 6 must be a non-empty ACP 시간 line');
   }
   const executionStatePrefix = '🔁 **실행 상태**: ';
-  if (!lines[6].startsWith(executionStatePrefix) || lines[6].slice(executionStatePrefix.length).trim().length === 0) {
+  if (!lines[6].startsWith(executionStatePrefix) || !hasVisibleText(lines[6].slice(executionStatePrefix.length))) {
     fail('invalid_reporting_report', 'report line 7 must be a non-empty 실행 상태 metadata line');
   }
   expectLine(7, '', 'blank');
+  // Free-text slots to screen for forbidden operational content. Metadata
+  // lines (identity, repository/branch, 라운드) are exact-matched against
+  // validated values above and are deliberately not screened.
+  const freeTextSlots = [
+    [5, 'report ACP 시간 line'],
+    [6, 'report 실행 상태 line'],
+  ];
   for (let i = 0; i < ACP_REPORT_SECTION_HEADERS.length; i += 1) {
     const base = 8 + i * 3;
     expectLine(base, ACP_REPORT_SECTION_HEADERS[i], `the ${ACP_REPORT_SECTION_HEADERS[i]} section header`);
     if (!isBulletLine(lines[base + 1])) {
       fail('invalid_reporting_report', `report section ${ACP_REPORT_SECTION_HEADERS[i]} must contain exactly one non-empty bullet`);
     }
+    freeTextSlots.push([base + 1, `report ${ACP_REPORT_SECTION_HEADERS[i]} bullet`]);
     if (i < ACP_REPORT_SECTION_HEADERS.length - 1) {
       expectLine(base + 2, '', 'blank');
     }
@@ -360,6 +423,10 @@ function validateMiddleReport(report, expected) {
     if (!isBulletLine(lines[21])) {
       fail('invalid_reporting_report', `report section ${ACP_REPORT_ISSUE_HEADER} must contain exactly one non-empty bullet`);
     }
+    freeTextSlots.push([21, `report ${ACP_REPORT_ISSUE_HEADER} bullet`]);
+  }
+  for (const [index, label] of freeTextSlots) {
+    assertNoForbiddenContent(lines[index], label);
   }
 }
 
@@ -391,11 +458,16 @@ function validateWatchdogMessage(message, expected) {
     fail('invalid_reporting_watchdog_message', 'watchdog payload message must end with the end delimiter and no suffix');
   }
   const report = message.slice(prefix.length, message.length - suffix.length);
-  assertNoForbiddenContent(message, 'watchdog payload message');
+  // Forbidden-content screening happens inside validateMiddleReport, on the
+  // report's free-text slots only: everything outside the report is the fixed
+  // instruction/delimiter frame already exact-matched above.
   validateMiddleReport(report, expected);
-  return report;
 }
 
+// Validates the watchdog snapshot and returns the validated variable parts
+// ({ id, timeoutSeconds, message }) as locals captured at validation time, so
+// the caller normalizes exactly what was checked: a getter-backed property
+// cannot return one value to the validator and another to the normalizer.
 function validateWatchdog(watchdog, expected) {
   if (!isPlainObject(watchdog)) {
     fail('invalid_reporting_watchdog', 'watchdog must be a plain object');
@@ -452,22 +524,34 @@ function validateWatchdog(watchdog, expected) {
     fail('invalid_reporting_watchdog_payload', 'watchdog.payload must be a plain object');
   }
   assertExactKeys(payload, ['kind', 'toolsAllow', 'timeoutSeconds', 'message'], 'invalid_reporting_watchdog_payload', 'watchdog.payload');
-  if (payload.kind !== 'agentTurn') {
+  // Read each untrusted property exactly once into a local before checking it.
+  const { kind, toolsAllow, timeoutSeconds, message } = payload;
+  if (kind !== 'agentTurn') {
     fail('invalid_reporting_watchdog_payload', 'watchdog.payload.kind must be exactly "agentTurn"');
   }
-  if (!Array.isArray(payload.toolsAllow) || payload.toolsAllow.length !== 0) {
+  if (!Array.isArray(toolsAllow) || toolsAllow.length !== 0) {
     fail('invalid_reporting_watchdog_payload', 'watchdog.payload.toolsAllow must be present and exactly []');
   }
   if (
-    !Number.isInteger(payload.timeoutSeconds) ||
-    payload.timeoutSeconds < 1 ||
-    payload.timeoutSeconds > MAX_WATCHDOG_TIMEOUT_SECONDS
+    !Number.isInteger(timeoutSeconds) ||
+    timeoutSeconds < 1 ||
+    timeoutSeconds > MAX_WATCHDOG_TIMEOUT_SECONDS
   ) {
     fail('invalid_reporting_watchdog_payload', `watchdog.payload.timeoutSeconds must be a positive integer of at most ${MAX_WATCHDOG_TIMEOUT_SECONDS}`);
   }
-  validateWatchdogMessage(payload.message, expected);
+  validateWatchdogMessage(message, expected);
+  return { id, timeoutSeconds, message };
 }
 
+// Attestation redundancy in this schema is intentional, not derivable:
+// startReceipt.{conversationId,messageId,deliveredAt} re-state the lifecycle
+// receipt, startReceipt.message re-states startMessage, watchdog.roundIndex
+// re-states roundIndex, and the three destinations re-state the control
+// conversation. Each field attests an independently prepared artifact or
+// route (the message actually delivered, the watchdog actually registered,
+// the routes actually configured), and the validator's equality checks are
+// the point: deriving these fields would turn "prove the artifacts agree"
+// into "assume they agree". Keep them explicit.
 const TOP_LEVEL_KEYS = Object.freeze([
   'schemaVersion',
   'roundIndex',
@@ -484,9 +568,17 @@ const TOP_LEVEL_KEYS = Object.freeze([
 /**
  * Validate a reporting bundle against the acp-reporting-v1 contract.
  *
+ * Every untrusted property is read exactly once into a local before it is
+ * checked, and the normalized copy is built only from those validated locals
+ * and from contract constants — never by re-reading the input. A hostile
+ * getter therefore cannot pass validation with one value and place another in
+ * the normalized output.
+ *
  * @param {unknown} reporting — the untrusted reporting bundle
- * @param {{ model: string, controlConversationId: string,
+ * @param {{ model?: string, controlConversationId: string,
  *           lifecycleStartReceipt: { conversationId: string, messageId: string, deliveredAt: string } }} context
+ *   — `model` may be omitted; the templates must then use the literal
+ *   `runtime-default` label on the ACP identity lines
  * @returns {object} a deep-frozen normalized copy of the validated bundle
  * @throws {AcpReportingContractError} with a stable `invalid_reporting_*` code
  */
@@ -503,7 +595,7 @@ export function validateAcpReportingContract(reporting, context) {
   if (reporting.schemaVersion !== ACP_REPORTING_SCHEMA_VERSION) {
     fail('invalid_reporting_schema_version', `schemaVersion must be exactly "${ACP_REPORTING_SCHEMA_VERSION}"`);
   }
-  const { roundIndex } = reporting;
+  const { roundIndex, startMessage } = reporting;
   if (!Number.isInteger(roundIndex) || roundIndex < 1 || roundIndex > MAX_ROUND_INDEX) {
     fail('invalid_reporting_round_index', `roundIndex must be a positive integer of at most ${MAX_ROUND_INDEX}`);
   }
@@ -516,7 +608,7 @@ export function validateAcpReportingContract(reporting, context) {
     model: ctx.model,
     controlConversationId: ctx.controlConversationId,
   };
-  validateStartMessage(reporting.startMessage, expected);
+  validateStartMessage(startMessage, expected);
   for (const key of ['startDestination', 'watchdogDestination', 'terminalDestination']) {
     if (reporting[key] !== ctx.controlConversationId) {
       fail('invalid_reporting_destination', `${key} must be exactly the control conversation id`);
@@ -537,16 +629,16 @@ export function validateAcpReportingContract(reporting, context) {
   if (receipt.deliveredAt !== lifecycle.deliveredAt) {
     fail('invalid_reporting_start_receipt', 'startReceipt.deliveredAt does not match the lifecycle receipt');
   }
-  if (receipt.message !== reporting.startMessage) {
+  if (receipt.message !== startMessage) {
     fail('invalid_reporting_start_receipt', 'startReceipt.message does not match startMessage');
   }
-  validateWatchdog(reporting.watchdog, expected);
+  const watchdog = validateWatchdog(reporting.watchdog, expected);
   return deepFreeze({
     schemaVersion: ACP_REPORTING_SCHEMA_VERSION,
     roundIndex,
     repository,
     branch,
-    startMessage: reporting.startMessage,
+    startMessage,
     startDestination: ctx.controlConversationId,
     watchdogDestination: ctx.controlConversationId,
     terminalDestination: ctx.controlConversationId,
@@ -554,10 +646,10 @@ export function validateAcpReportingContract(reporting, context) {
       conversationId: lifecycle.conversationId,
       messageId: lifecycle.messageId,
       deliveredAt: lifecycle.deliveredAt,
-      message: reporting.startMessage,
+      message: startMessage,
     },
     watchdog: {
-      id: reporting.watchdog.id,
+      id: watchdog.id,
       roundIndex,
       enabled: false,
       sessionTarget: 'isolated',
@@ -567,8 +659,8 @@ export function validateAcpReportingContract(reporting, context) {
       payload: {
         kind: 'agentTurn',
         toolsAllow: [],
-        timeoutSeconds: reporting.watchdog.payload.timeoutSeconds,
-        message: reporting.watchdog.payload.message,
+        timeoutSeconds: watchdog.timeoutSeconds,
+        message: watchdog.message,
       },
     },
   });

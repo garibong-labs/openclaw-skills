@@ -24,14 +24,20 @@ import {
   main,
   normalizeRuntimeEvent,
   runClaudeSupervisorPreflight,
+  runReportingPreflight,
   runStartReceiptPreflight,
   runSupervisor,
   validateClaudeAuthEnvFile,
   validateRuntimeModuleExports
 } from "./acpx-foreground-supervisor.mjs";
+import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 
 const CONTROL_CONVERSATION_ID = "100000000000000001";
 const START_MESSAGE_ID = "100000000000000002";
+// Fixed spelling used by parsed (in-memory) lifecycle fixtures; the reporting
+// contract binds by spelling while freshness uses deliveredAtMs, so the two
+// are independent in fixtures.
+const PARSED_DELIVERED_AT = "2026-08-22T09:30:00.000Z";
 
 function rawLifecycle(overrides = {}, receiptOverrides = {}) {
   return {
@@ -54,6 +60,7 @@ function parsedLifecycle(overrides = {}, receiptOverrides = {}) {
     startReceipt: {
       conversationId: CONTROL_CONVERSATION_ID,
       messageId: START_MESSAGE_ID,
+      deliveredAt: PARSED_DELIVERED_AT,
       deliveredAtMs: Date.now(),
       ...receiptOverrides
     },
@@ -61,92 +68,20 @@ function parsedLifecycle(overrides = {}, receiptOverrides = {}) {
   };
 }
 
-const REPORT_REPOSITORY = "openclaw-skills";
-const REPORT_BRANCH = "fix/acp-reporting-fail-closed-guard";
-const REPORT_INSTRUCTION =
-  "다음 구분자 사이의 메시지만 그대로 반환해. 앞말·뒷말·설명·코드펜스·바꿔쓰기·두 번째 메시지를 추가하지 마.";
-
-// One reusable acp-reporting-v1 bundle bound to a raw lifecycle fixture: a
-// round-1 start message for the fixture model/repository/branch, matching
-// destinations and receipt, and one disabled tool-less 10-minute public
-// watchdog whose payload carries the exact 19-line report layout. Reads the
+// One reusable acp-reporting-v1 bundle bound to a raw or parsed lifecycle
+// fixture, delegating to the shared integration fixture builder. Reads the
 // lifecycle defensively so deliberately malformed lifecycle fixtures still
 // serialize (they fail on lifecycle before reporting is ever validated).
-function validReporting(lifecycle = rawLifecycle(), { model = "test-model", roundIndex = 1 } = {}) {
+function validReporting(lifecycle = rawLifecycle(), options = {}) {
   const receipt = (lifecycle && lifecycle.startReceipt) || {};
-  const controlConversationId =
-    (lifecycle && lifecycle.controlConversationId) ?? CONTROL_CONVERSATION_ID;
-  const startMessage = [
-    "🚀 **ACP 작업 시작 · 18:30 KST**",
-    "",
-    "🤖 **ACP**: Claude Code · `" + model + "`",
-    "📍 **작업**: `" + REPORT_REPOSITORY + "` · `" + REPORT_BRANCH + "`",
-    "",
-    "🎯 **범위**",
-    "- 감독 통합 검증",
-    "",
-    "🕒 **중간 보고**",
-    "- ACP 실행 10분 이상일 때만 시작",
-    "",
-    "🔒 **외부 작업**",
-    "- 없음"
-  ].join("\n");
-  const report = [
-    "🔄 **ACP 중간 보고 · 18:45 KST**",
-    "",
-    "🤖 **ACP**: Claude Code · `" + model + "`",
-    "📍 **작업**: `" + REPORT_REPOSITORY + "` · `" + REPORT_BRANCH + "`",
-    "🔢 **라운드**: " + String(roundIndex) + " · 2/4 구현",
-    "⏱️ **ACP 시간**: 12분 경과",
-    "🔁 **실행 상태**: 감독 통합 검증이 계속되는 중",
-    "",
-    "✅ **새 결과**",
-    "- 통합 픽스처 준비 완료",
-    "",
-    "🛠️ **ACP 진행 중**",
-    "- 감독 통합 테스트 작성",
-    "",
-    "🧪 **ACP 자체 검증**",
-    "- 단위 테스트 통과 확인",
-    "",
-    "⏭️ **ACP 다음**",
-    "- 통합 검증 마무리"
-  ].join("\n");
-  return {
-    schemaVersion: "acp-reporting-v1",
-    roundIndex,
-    repository: REPORT_REPOSITORY,
-    branch: REPORT_BRANCH,
-    startMessage,
-    startDestination: controlConversationId,
-    watchdogDestination: controlConversationId,
-    terminalDestination: controlConversationId,
-    startReceipt: {
-      conversationId: receipt.conversationId ?? CONTROL_CONVERSATION_ID,
-      messageId: receipt.messageId ?? START_MESSAGE_ID,
-      deliveredAt: receipt.deliveredAt ?? "2026-08-24T09:30:00.000Z",
-      message: startMessage
-    },
-    watchdog: {
-      id: "acp-watchdog-round-" + String(roundIndex),
-      roundIndex,
-      enabled: false,
-      sessionTarget: "isolated",
-      schedule: { kind: "every", everyMs: 600000 },
-      delivery: {
-        mode: "announce",
-        channel: "discord",
-        to: "channel:" + controlConversationId
-      },
-      deleteAfterRun: false,
-      payload: {
-        kind: "agentTurn",
-        toolsAllow: [],
-        timeoutSeconds: 45,
-        message: REPORT_INSTRUCTION + "\n\n---BEGIN ACP REPORT---\n" + report + "\n---END ACP REPORT---"
-      }
-    }
-  };
+  return buildValidReporting({
+    controlConversationId:
+      (lifecycle && lifecycle.controlConversationId) ?? CONTROL_CONVERSATION_ID,
+    receiptConversationId: receipt.conversationId ?? CONTROL_CONVERSATION_ID,
+    messageId: receipt.messageId ?? START_MESSAGE_ID,
+    deliveredAt: receipt.deliveredAt ?? PARSED_DELIVERED_AT,
+    ...options
+  });
 }
 
 function deferred() {
@@ -160,6 +95,9 @@ function deferred() {
 }
 
 function makeConfig(root, overrides = {}) {
+  // Reporting must bind to whatever lifecycle the caller overrides with, so
+  // the default bundle is derived from the effective lifecycle fixture.
+  const lifecycle = "lifecycle" in overrides ? overrides.lifecycle : parsedLifecycle();
   return {
     agent: "test-agent",
     model: "test-model",
@@ -171,7 +109,8 @@ function makeConfig(root, overrides = {}) {
     timeoutMs: 30000,
     progressMs: 0,
     allowKinds: new Set(["read", "search", "think", "edit", "execute"]),
-    lifecycle: parsedLifecycle(),
+    lifecycle,
+    reporting: validReporting(lifecycle),
     maxResponseBytes: 1024 * 1024,
     runtimeModule: root,
     ...overrides
@@ -1012,6 +951,7 @@ test("start-receipt config shape fails closed with exact codes", () => {
     startReceipt: {
       conversationId: CONTROL_CONVERSATION_ID,
       messageId: START_MESSAGE_ID,
+      deliveredAt: "2026-08-22T09:30:00.000Z",
       deliveredAtMs: Date.parse("2026-08-22T09:30:00.000Z")
     }
   });
@@ -1227,6 +1167,165 @@ test("malformed reporting fails closed before any runtime module access", async 
   assert.equal(valid.reporting.startDestination, CONTROL_CONVERSATION_ID);
   assert.equal(Object.isFrozen(valid.reporting), true);
   assert.equal(Object.isFrozen(valid.reporting.watchdog.payload), true);
+});
+
+test("in-memory reporting preflight backstop fails closed before runtime access", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-backstop-"));
+
+  // Direct unit surface: a valid in-memory config passes, and bundles or
+  // contexts a caller tampered with after (or instead of) loading keep the
+  // module's stable bounded codes.
+  runReportingPreflight(makeConfig(root));
+  assert.throws(
+    () => runReportingPreflight(makeConfig(root, { reporting: undefined })),
+    { message: "invalid_reporting_root", code: "invalid_reporting_root" }
+  );
+  assert.throws(
+    () => runReportingPreflight(makeConfig(root, { lifecycle: undefined })),
+    { message: "invalid_reporting_context", code: "invalid_reporting_context" }
+  );
+  assert.throws(
+    () => runReportingPreflight(makeConfig(root, { model: 42 })),
+    { message: "invalid_reporting_context", code: "invalid_reporting_context" }
+  );
+  const rerouted = makeConfig(root);
+  rerouted.reporting = { ...rerouted.reporting, terminalDestination: "999888777666555444" };
+  assert.throws(
+    () => runReportingPreflight(rerouted),
+    { message: "invalid_reporting_destination", code: "invalid_reporting_destination" }
+  );
+
+  // Through runSupervisor: the failure is emitted as a bounded
+  // supervisor_error and the injected runtime module is never constructed.
+  const { module, state } = makeRuntimeModule({});
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(root, { reporting: undefined }), {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  assert.equal(emitted.at(-1).type, "supervisor_error");
+  assert.equal(emitted.at(-1).code, "invalid_reporting_root");
+  assert.equal(state.runtimeOptions, undefined);
+  assert.equal(fs.existsSync(path.join(root, "state")), false);
+});
+
+test("optional model keeps the reporting contract consistent end to end", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-no-model-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
+  const writeCase = (name, extra) => {
+    const file = path.join(root, name + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent: "test-agent",
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile: path.join(root, "response-" + name + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: root,
+      timeoutMs: 30000,
+      lifecycle,
+      allowKinds: ["read"],
+      ...extra
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  // A config without model loads when the templates use the runtime-default
+  // label, and the normalized bundle keeps that label on the identity lines.
+  const loaded = loadSupervisorConfig(writeCase("no-model", {
+    reporting: validReporting(lifecycle, { model: "runtime-default" })
+  }));
+  assert.equal(loaded.model, undefined);
+  assert.match(loaded.reporting.startMessage, /`runtime-default`/);
+
+  // Without model, templates claiming a concrete model are a mismatch, not a
+  // silent pass: the identity line no longer matches the expected label.
+  assert.throws(
+    () => loadSupervisorConfig(writeCase("no-model-mismatch", {
+      reporting: validReporting(lifecycle, { model: "test-model" })
+    })),
+    { message: "invalid_reporting_start_message", code: "invalid_reporting_start_message" }
+  );
+
+  // The started event and the reporting templates agree on the label.
+  const memRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-no-model-mem-"));
+  const memLifecycle = parsedLifecycle();
+  const { module } = makeRuntimeModule({
+    events: [{ type: "text_delta", stream: "output", text: "ok" }]
+  });
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(memRoot, {
+    model: undefined,
+    lifecycle: memLifecycle,
+    reporting: validReporting(memLifecycle, { model: "runtime-default" })
+  }), {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.completed);
+  const started = emitted.find((event) => event.type === "started");
+  assert.equal(started.model, "runtime-default");
+});
+
+test("metadata containing forbidden-pattern words loads while free-text slots stay screened", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-metadata-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
+  const writeCase = (name, reporting) => {
+    const file = path.join(root, name + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent: "test-agent",
+      model: "test-model",
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile: path.join(root, "response-" + name + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: root,
+      timeoutMs: 30000,
+      lifecycle,
+      allowKinds: ["read"],
+      reporting
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  // Ordinary repository/branch names that merely contain denylisted words are
+  // legal metadata through the full loader path.
+  const cases = [
+    ["fix-routing", { branch: "fix/routing" }],
+    ["cron-schedule", { branch: "feat/cron-schedule" }],
+    ["snapshot-tool", { repository: "snapshot-tool" }]
+  ];
+  for (const [name, overrides] of cases) {
+    const loaded = loadSupervisorConfig(
+      writeCase(name, validReporting(lifecycle, overrides))
+    );
+    if (overrides.branch) {
+      assert.equal(loaded.reporting.branch, overrides.branch, name);
+    }
+    if (overrides.repository) {
+      assert.equal(loaded.reporting.repository, overrides.repository, name);
+    }
+  }
+
+  // The same words in a free-text slot still fail closed.
+  assert.throws(
+    () => loadSupervisorConfig(writeCase("screened-bullet", validReporting(lifecycle, {
+      scopeBullet: "- 스케줄러 cron 상태 점검"
+    }))),
+    { message: "invalid_reporting_forbidden_content", code: "invalid_reporting_forbidden_content" }
+  );
 });
 
 test("fresh same-conversation start receipt reaches the runtime", async () => {
