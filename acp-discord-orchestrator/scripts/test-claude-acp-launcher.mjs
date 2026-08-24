@@ -11,12 +11,15 @@ import {
   main,
   runLauncherEnvironmentPreflight
 } from "./claude-acp-launcher.mjs";
+import { ACP_REPORTING_ERROR_CODES } from "./acp-reporting-contract.mjs";
+import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 import {
   CLAUDE_AUTH_KIND,
   CLAUDE_FORBIDDEN_ENV,
   CLAUDE_INJECTION_ENV,
   CLAUDE_OAUTH_TOKEN_ENV,
-  EXIT_CODES
+  EXIT_CODES,
+  loadSupervisorConfig
 } from "./acpx-foreground-supervisor.mjs";
 
 const LAUNCHER_PATH = fileURLToPath(new URL("./claude-acp-launcher.mjs", import.meta.url));
@@ -90,10 +93,26 @@ function makeMockRuntimePackage(root) {
   return runtimeDir;
 }
 
+const CONTROL_CONVERSATION_ID = "100000000000000001";
+const START_MESSAGE_ID = "100000000000000002";
+
+// Deterministic acp-reporting-v1 bundle from the shared integration fixture,
+// bound to the launcher lifecycle fixture. Launcher fixtures need this to
+// pass the mandatory reporting config gate and reach auth/exec behavior.
+function validReporting({
+  controlConversationId = CONTROL_CONVERSATION_ID,
+  messageId = START_MESSAGE_ID,
+  deliveredAt,
+  model = "test-model"
+}) {
+  return buildValidReporting({ controlConversationId, messageId, deliveredAt, model });
+}
+
 function writeClaudeRunConfig(root, overrides = {}) {
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "perform the bounded test task", { mode: 0o600 });
   const configFile = path.join(root, "run.json");
+  const deliveredAt = new Date().toISOString();
   fs.writeFileSync(configFile, JSON.stringify({
     agent: "claude",
     model: "test-model",
@@ -106,14 +125,15 @@ function writeClaudeRunConfig(root, overrides = {}) {
     timeoutMs: 30000,
     progressMs: 0,
     lifecycle: {
-      controlConversationId: "100000000000000001",
+      controlConversationId: CONTROL_CONVERSATION_ID,
       maxStartReceiptAgeMs: 300000,
       startReceipt: {
-        conversationId: "100000000000000001",
-        messageId: "100000000000000002",
-        deliveredAt: new Date().toISOString()
+        conversationId: CONTROL_CONVERSATION_ID,
+        messageId: START_MESSAGE_ID,
+        deliveredAt
       }
     },
+    reporting: validReporting({ deliveredAt }),
     allowKinds: ["read", "execute"],
     ...overrides
   }), { mode: 0o600 });
@@ -460,9 +480,89 @@ test("public docs and template describe the canonical claude route", () => {
   assert.equal(template.agent, "claude");
   assert.equal(template.auth.kind, CLAUDE_AUTH_KIND);
   assert.match(template.auth.envFile, /^\/absolute\//);
+
+  // Both public docs must describe the mandatory fail-closed reporting gate,
+  // and the runtime contract must document every stable reporting error code
+  // the validator can produce.
+  for (const doc of [skill, contract]) {
+    assert.match(doc, /acp-reporting-v1/);
+    assert.match(doc, /invalid_reporting_/);
+  }
+  assert.match(contract, /^## Reporting contract$/m);
+  for (const code of ACP_REPORTING_ERROR_CODES) {
+    assert.ok(contract.includes(code), `runtime contract must document ${code}`);
+  }
+
   const serialized = skill + contract + JSON.stringify(template);
   assert.doesNotMatch(serialized, /sk-ant-/);
   assert.doesNotMatch(serialized, /\/Users\/[a-z]/);
+});
+
+test("substituted public template loads through the real supervisor loader", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-template-load-"));
+  const promptFile = path.join(root, "prompt.txt");
+  fs.writeFileSync(promptFile, "perform the bounded template task", { mode: 0o600 });
+  const templateText = fs.readFileSync(
+    new URL("../templates/supervisor-config.json", import.meta.url),
+    "utf8"
+  );
+
+  // Every caller-substituted placeholder must be present, then bound, so the
+  // loaded config exercises the loader's full reporting context wiring —
+  // model, repository, branch, receipt, and destinations — not just IDs.
+  const placeholders = [
+    "MODEL_ID",
+    "CONTROL_CONVERSATION_ID",
+    "START_MESSAGE_ID",
+    "START_MESSAGE_DELIVERED_AT_ISO_8601",
+    "REPOSITORY_BASENAME",
+    "BRANCH_NAME"
+  ];
+  for (const placeholder of placeholders) {
+    assert.ok(templateText.includes(placeholder), `template must ship ${placeholder}`);
+  }
+  const deliveredAt = "2026-08-24T09:30:00.530000+00:00";
+  const bound = templateText
+    .replaceAll("MODEL_ID", "test-model")
+    .replaceAll("CONTROL_CONVERSATION_ID", CONTROL_CONVERSATION_ID)
+    .replaceAll("START_MESSAGE_ID", START_MESSAGE_ID)
+    .replaceAll("START_MESSAGE_DELIVERED_AT_ISO_8601", deliveredAt)
+    .replaceAll("REPOSITORY_BASENAME", "openclaw-skills")
+    .replaceAll("BRANCH_NAME", "fix/acp-reporting-fail-closed-guard")
+    .replaceAll("/absolute/path/to/workspace", root)
+    .replaceAll("/absolute/private/path/prompt.txt", promptFile)
+    .replaceAll("/absolute/private/path/response.txt", path.join(root, "response.txt"))
+    .replaceAll("/absolute/private/path/acpx-state", path.join(root, "acpx-state"));
+  for (const placeholder of placeholders) {
+    assert.equal(bound.includes(placeholder), false, `${placeholder} must be bound`);
+  }
+
+  const configFile = path.join(root, "template-run.json");
+  fs.writeFileSync(configFile, bound, { mode: 0o600 });
+  const loaded = loadSupervisorConfig(configFile);
+
+  assert.equal(loaded.agent, "claude");
+  assert.equal(loaded.model, "test-model");
+  assert.equal(loaded.lifecycle.controlConversationId, CONTROL_CONVERSATION_ID);
+  assert.equal(loaded.lifecycle.startReceipt.deliveredAt, deliveredAt);
+  assert.equal(Object.isFrozen(loaded.reporting), true);
+  assert.equal(loaded.reporting.roundIndex, 1);
+  assert.equal(loaded.reporting.repository, "openclaw-skills");
+  assert.equal(loaded.reporting.branch, "fix/acp-reporting-fail-closed-guard");
+  assert.equal(loaded.reporting.startMessage.split("\n").length, 13);
+  assert.equal(loaded.reporting.startDestination, CONTROL_CONVERSATION_ID);
+  assert.equal(loaded.reporting.watchdogDestination, CONTROL_CONVERSATION_ID);
+  assert.equal(loaded.reporting.terminalDestination, CONTROL_CONVERSATION_ID);
+  assert.equal(loaded.reporting.startReceipt.messageId, START_MESSAGE_ID);
+  assert.equal(loaded.reporting.startReceipt.deliveredAt, deliveredAt);
+  assert.equal(loaded.reporting.watchdog.enabled, false);
+  assert.equal(loaded.reporting.watchdog.sessionTarget, "isolated");
+  assert.deepEqual(loaded.reporting.watchdog.schedule, { kind: "every", everyMs: 600000 });
+  assert.deepEqual(loaded.reporting.watchdog.payload.toolsAllow, []);
+  assert.equal(
+    loaded.reporting.watchdog.delivery.to,
+    "channel:" + CONTROL_CONVERSATION_ID
+  );
 });
 
 test("launcher rejects a non-canonical claude spelling as invalid config", POSIX_ONLY, async () => {

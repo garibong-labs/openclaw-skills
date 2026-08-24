@@ -6,7 +6,24 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { buildValidReporting } from "../acp-discord-orchestrator/scripts/acp-reporting-test-fixture.mjs";
+
 const SUPERVISOR_ERROR_EXIT = 22;
+
+const CONTROL_CONVERSATION_ID = "100000000000000001";
+const START_MESSAGE_ID = "100000000000000002";
+
+// Deterministic acp-reporting-v1 bundle from the shared integration fixture,
+// bound to this test's lifecycle receipt so the config passes the mandatory
+// reporting gate and reaches turn execution.
+function validReporting(deliveredAt, model = "test-model") {
+  return buildValidReporting({
+    controlConversationId: CONTROL_CONVERSATION_ID,
+    messageId: START_MESSAGE_ID,
+    deliveredAt,
+    model
+  });
+}
 
 test("CLI exits with the mapped code despite a leaked runtime handle", {
   timeout: 5000
@@ -39,6 +56,7 @@ export function createAcpRuntime() {
 }
 `, { mode: 0o600 });
   fs.writeFileSync(promptFile, "bounded no-op", { mode: 0o600 });
+  const deliveredAt = new Date().toISOString();
   fs.writeFileSync(configFile, JSON.stringify({
     agent: "test-agent",
     model: "test-model",
@@ -50,14 +68,15 @@ export function createAcpRuntime() {
     timeoutMs: 1000,
     progressMs: 0,
     lifecycle: {
-      controlConversationId: "100000000000000001",
+      controlConversationId: CONTROL_CONVERSATION_ID,
       maxStartReceiptAgeMs: 60000,
       startReceipt: {
-        conversationId: "100000000000000001",
-        messageId: "100000000000000002",
-        deliveredAt: new Date().toISOString()
+        conversationId: CONTROL_CONVERSATION_ID,
+        messageId: START_MESSAGE_ID,
+        deliveredAt
       }
     },
+    reporting: validReporting(deliveredAt),
     allowKinds: ["read"],
     runtimeModule: runtimeFile
   }), { mode: 0o600 });

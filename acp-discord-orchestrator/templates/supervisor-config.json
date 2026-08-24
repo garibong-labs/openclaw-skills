@@ -23,6 +23,44 @@
       "deliveredAt": "START_MESSAGE_DELIVERED_AT_ISO_8601"
     }
   },
+  "reporting": {
+    "schemaVersion": "acp-reporting-v1",
+    "roundIndex": 1,
+    "repository": "REPOSITORY_BASENAME",
+    "branch": "BRANCH_NAME",
+    "startMessage": "🚀 **ACP 작업 시작 · 18:30 KST**\n\n🤖 **ACP**: Claude Code · `MODEL_ID`\n📍 **작업**: `REPOSITORY_BASENAME` · `BRANCH_NAME`\n\n🎯 **범위**\n- 이번 라운드 작업 범위 한 줄\n\n🕒 **중간 보고**\n- ACP 실행 10분 이상일 때만 시작\n\n🔒 **외부 작업**\n- 없음",
+    "startDestination": "CONTROL_CONVERSATION_ID",
+    "watchdogDestination": "CONTROL_CONVERSATION_ID",
+    "terminalDestination": "CONTROL_CONVERSATION_ID",
+    "startReceipt": {
+      "conversationId": "CONTROL_CONVERSATION_ID",
+      "messageId": "START_MESSAGE_ID",
+      "deliveredAt": "START_MESSAGE_DELIVERED_AT_ISO_8601",
+      "message": "🚀 **ACP 작업 시작 · 18:30 KST**\n\n🤖 **ACP**: Claude Code · `MODEL_ID`\n📍 **작업**: `REPOSITORY_BASENAME` · `BRANCH_NAME`\n\n🎯 **범위**\n- 이번 라운드 작업 범위 한 줄\n\n🕒 **중간 보고**\n- ACP 실행 10분 이상일 때만 시작\n\n🔒 **외부 작업**\n- 없음"
+    },
+    "watchdog": {
+      "id": "acp-watchdog-round-1",
+      "roundIndex": 1,
+      "enabled": false,
+      "sessionTarget": "isolated",
+      "schedule": {
+        "kind": "every",
+        "everyMs": 600000
+      },
+      "delivery": {
+        "mode": "announce",
+        "channel": "discord",
+        "to": "channel:CONTROL_CONVERSATION_ID"
+      },
+      "deleteAfterRun": false,
+      "payload": {
+        "kind": "agentTurn",
+        "toolsAllow": [],
+        "timeoutSeconds": 45,
+        "message": "다음 구분자 사이의 메시지만 그대로 반환해. 앞말·뒷말·설명·코드펜스·바꿔쓰기·두 번째 메시지를 추가하지 마.\n\n---BEGIN ACP REPORT---\n🔄 **ACP 중간 보고 · 18:45 KST**\n\n🤖 **ACP**: Claude Code · `MODEL_ID`\n📍 **작업**: `REPOSITORY_BASENAME` · `BRANCH_NAME`\n🔢 **라운드**: 1 · 2/4 구현\n⏱️ **ACP 시간**: 12분 경과\n🔁 **실행 상태**: 범위 내 작업이 계속되는 중\n\n✅ **새 결과**\n- 완료된 결과 한 줄\n\n🛠️ **ACP 진행 중**\n- 진행 중인 작업 한 줄\n\n🧪 **ACP 자체 검증**\n- 자체 검증 결과 한 줄\n\n⏭️ **ACP 다음**\n- 다음 단계 한 줄\n---END ACP REPORT---"
+      }
+    }
+  },
   "requiredEnv": [],
   "forbiddenEnv": [],
   "allowKinds": [

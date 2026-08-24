@@ -24,14 +24,20 @@ import {
   main,
   normalizeRuntimeEvent,
   runClaudeSupervisorPreflight,
+  runReportingPreflight,
   runStartReceiptPreflight,
   runSupervisor,
   validateClaudeAuthEnvFile,
   validateRuntimeModuleExports
 } from "./acpx-foreground-supervisor.mjs";
+import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 
 const CONTROL_CONVERSATION_ID = "100000000000000001";
 const START_MESSAGE_ID = "100000000000000002";
+// Fixed spelling used by parsed (in-memory) lifecycle fixtures; the reporting
+// contract binds by spelling while freshness uses deliveredAtMs, so the two
+// are independent in fixtures.
+const PARSED_DELIVERED_AT = "2026-08-22T09:30:00.000Z";
 
 function rawLifecycle(overrides = {}, receiptOverrides = {}) {
   return {
@@ -54,11 +60,28 @@ function parsedLifecycle(overrides = {}, receiptOverrides = {}) {
     startReceipt: {
       conversationId: CONTROL_CONVERSATION_ID,
       messageId: START_MESSAGE_ID,
+      deliveredAt: PARSED_DELIVERED_AT,
       deliveredAtMs: Date.now(),
       ...receiptOverrides
     },
     ...overrides
   };
+}
+
+// One reusable acp-reporting-v1 bundle bound to a raw or parsed lifecycle
+// fixture, delegating to the shared integration fixture builder. Reads the
+// lifecycle defensively so deliberately malformed lifecycle fixtures still
+// serialize (they fail on lifecycle before reporting is ever validated).
+function validReporting(lifecycle = rawLifecycle(), options = {}) {
+  const receipt = (lifecycle && lifecycle.startReceipt) || {};
+  return buildValidReporting({
+    controlConversationId:
+      (lifecycle && lifecycle.controlConversationId) ?? CONTROL_CONVERSATION_ID,
+    receiptConversationId: receipt.conversationId ?? CONTROL_CONVERSATION_ID,
+    messageId: receipt.messageId ?? START_MESSAGE_ID,
+    deliveredAt: receipt.deliveredAt ?? PARSED_DELIVERED_AT,
+    ...options
+  });
 }
 
 function deferred() {
@@ -72,6 +95,9 @@ function deferred() {
 }
 
 function makeConfig(root, overrides = {}) {
+  // Reporting must bind to whatever lifecycle the caller overrides with, so
+  // the default bundle is derived from the effective lifecycle fixture.
+  const lifecycle = "lifecycle" in overrides ? overrides.lifecycle : parsedLifecycle();
   return {
     agent: "test-agent",
     model: "test-model",
@@ -83,7 +109,8 @@ function makeConfig(root, overrides = {}) {
     timeoutMs: 30000,
     progressMs: 0,
     allowKinds: new Set(["read", "search", "think", "edit", "execute"]),
-    lifecycle: parsedLifecycle(),
+    lifecycle,
+    reporting: validReporting(lifecycle),
     maxResponseBytes: 1024 * 1024,
     runtimeModule: root,
     ...overrides
@@ -624,6 +651,7 @@ test("config requires a timeout and rejects the unclassified other kind", () => 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-config-required-"));
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
   const base = {
     agent: "test-agent",
     model: "test-model",
@@ -633,7 +661,8 @@ test("config requires a timeout and rejects the unclassified other kind", () => 
     responseFile: path.join(root, "response.txt"),
     stateDir: path.join(root, "state"),
     runtimeModule: root,
-    lifecycle: rawLifecycle(),
+    lifecycle,
+    reporting: validReporting(lifecycle),
     allowKinds: ["read"]
   };
 
@@ -660,6 +689,7 @@ test("environment contract config shape fails closed with exact codes", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-env-config-"));
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
   const base = {
     agent: "test-agent",
     model: "test-model",
@@ -670,7 +700,8 @@ test("environment contract config shape fails closed with exact codes", () => {
     stateDir: path.join(root, "state"),
     runtimeModule: root,
     timeoutMs: 30000,
-    lifecycle: rawLifecycle(),
+    lifecycle,
+    reporting: validReporting(lifecycle),
     allowKinds: ["read"]
   };
   const writeCase = (name, extra) => {
@@ -869,7 +900,11 @@ test("start-receipt config shape fails closed with exact codes", () => {
   };
   const writeCase = (name, lifecycle) => {
     const file = path.join(root, name + ".json");
-    fs.writeFileSync(file, JSON.stringify({ ...base, lifecycle }), { mode: 0o600 });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ ...base, lifecycle, reporting: validReporting(lifecycle) }),
+      { mode: 0o600 }
+    );
     return file;
   };
 
@@ -916,6 +951,7 @@ test("start-receipt config shape fails closed with exact codes", () => {
     startReceipt: {
       conversationId: CONTROL_CONVERSATION_ID,
       messageId: START_MESSAGE_ID,
+      deliveredAt: "2026-08-22T09:30:00.000Z",
       deliveredAtMs: Date.parse("2026-08-22T09:30:00.000Z")
     }
   });
@@ -938,8 +974,10 @@ test("delivered-at accepts Discord's native instant within a bounded fraction", 
   const responseFile = path.join(root, "response.txt");
   const writeCase = (name, deliveredAt) => {
     const file = path.join(root, name + ".json");
+    const lifecycle = rawLifecycle({}, { deliveredAt });
     fs.writeFileSync(file, JSON.stringify({
       agent: "test-agent",
+      model: "test-model",
       cwd: root,
       sessionKey: "test-session",
       promptFile: prompt,
@@ -948,7 +986,8 @@ test("delivered-at accepts Discord's native instant within a bounded fraction", 
       runtimeModule: root,
       timeoutMs: 30000,
       allowKinds: ["read"],
-      lifecycle: rawLifecycle({}, { deliveredAt })
+      lifecycle,
+      reporting: validReporting(lifecycle)
     }), { mode: 0o600 });
     return file;
   };
@@ -1030,6 +1069,263 @@ test("invalid start receipt retains the invalid-config CLI mapping", async () =>
   assert.equal(emitted.type, "supervisor_error");
   assert.equal(emitted.code, "invalid_start_receipt_conversation_mismatch");
   assert.equal(fs.existsSync(path.join(root, "state")), false);
+});
+
+test("malformed reporting fails closed before any runtime module access", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-gate-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+
+  // A real runtime module that records every stage of access: static import,
+  // probe, and adapter construction each leave a sentinel file behind.
+  const sentinelFile = path.join(root, "runtime-touched.txt");
+  const runtimeFile = path.join(root, "runtime.mjs");
+  fs.writeFileSync(runtimeFile, [
+    'import fs from "node:fs";',
+    `fs.writeFileSync(${JSON.stringify(sentinelFile)}, "imported");`,
+    "export function createRuntimeStore() { return {}; }",
+    "export function createAgentRegistry() { return {}; }",
+    "export function createAcpRuntime() {",
+    `  fs.writeFileSync(${JSON.stringify(sentinelFile)}, "adapter-started");`,
+    "  return {",
+    "    async probeAvailability() {",
+    `      fs.writeFileSync(${JSON.stringify(sentinelFile)}, "probed");`,
+    "    },",
+    "    async ensureSession() { return {}; },",
+    "    startTurn() { return {}; },",
+    "    async close() {}",
+    "  };",
+    "}"
+  ].join("\n"), { mode: 0o600 });
+
+  const lifecycle = rawLifecycle();
+  const writeCase = (name, reporting) => {
+    const file = path.join(root, name + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent: "test-agent",
+      model: "test-model",
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile: path.join(root, "response-" + name + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: runtimeFile,
+      timeoutMs: 30000,
+      lifecycle,
+      allowKinds: ["read"],
+      ...(reporting === undefined ? {} : { reporting })
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  // Absent reporting is invalid config, not a pass-through.
+  assert.throws(
+    () => loadSupervisorConfig(writeCase("absent", undefined)),
+    { message: "invalid_reporting_root", code: "invalid_reporting_root" }
+  );
+
+  // Malformed reporting keeps the module's stable bounded code.
+  const misrouted = {
+    ...validReporting(lifecycle),
+    startDestination: "999888777666555444"
+  };
+  assert.throws(
+    () => loadSupervisorConfig(writeCase("misrouted", misrouted)),
+    { message: "invalid_reporting_destination", code: "invalid_reporting_destination" }
+  );
+
+  // The CLI layer maps the same failure to the invalid-config exit while
+  // preserving the code.
+  const writes = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    writes.push(String(chunk));
+    return true;
+  };
+  let exitCode;
+  try {
+    exitCode = await main(["--config", writeCase("misrouted-cli", misrouted)]);
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(exitCode, EXIT_CODES.invalidConfig);
+  const emitted = JSON.parse(writes.join("").trim());
+  assert.equal(emitted.type, "supervisor_error");
+  assert.equal(emitted.code, "invalid_reporting_destination");
+
+  // The runtime module was never imported, probed, or started, and no
+  // supervisor side effects happened.
+  assert.equal(fs.existsSync(sentinelFile), false);
+  assert.equal(fs.existsSync(path.join(root, "state")), false);
+  assert.equal(fs.existsSync(path.join(root, "response-misrouted-cli.txt")), false);
+
+  // A valid bundle still loads, with the normalized frozen result stored on
+  // the supervisor config.
+  const valid = loadSupervisorConfig(writeCase("valid", validReporting(lifecycle)));
+  assert.equal(valid.reporting.schemaVersion, "acp-reporting-v1");
+  assert.equal(valid.reporting.startReceipt.deliveredAt, lifecycle.startReceipt.deliveredAt);
+  assert.equal(valid.reporting.startDestination, CONTROL_CONVERSATION_ID);
+  assert.equal(Object.isFrozen(valid.reporting), true);
+  assert.equal(Object.isFrozen(valid.reporting.watchdog.payload), true);
+});
+
+test("in-memory reporting preflight backstop fails closed before runtime access", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-backstop-"));
+
+  // Direct unit surface: a valid in-memory config passes, and bundles or
+  // contexts a caller tampered with after (or instead of) loading keep the
+  // module's stable bounded codes.
+  runReportingPreflight(makeConfig(root));
+  assert.throws(
+    () => runReportingPreflight(makeConfig(root, { reporting: undefined })),
+    { message: "invalid_reporting_root", code: "invalid_reporting_root" }
+  );
+  assert.throws(
+    () => runReportingPreflight(makeConfig(root, { lifecycle: undefined })),
+    { message: "invalid_reporting_context", code: "invalid_reporting_context" }
+  );
+  assert.throws(
+    () => runReportingPreflight(makeConfig(root, { model: 42 })),
+    { message: "invalid_reporting_context", code: "invalid_reporting_context" }
+  );
+  const rerouted = makeConfig(root);
+  rerouted.reporting = { ...rerouted.reporting, terminalDestination: "999888777666555444" };
+  assert.throws(
+    () => runReportingPreflight(rerouted),
+    { message: "invalid_reporting_destination", code: "invalid_reporting_destination" }
+  );
+
+  // Through runSupervisor: the failure is emitted as a bounded
+  // supervisor_error and the injected runtime module is never constructed.
+  const { module, state } = makeRuntimeModule({});
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(root, { reporting: undefined }), {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  assert.equal(emitted.at(-1).type, "supervisor_error");
+  assert.equal(emitted.at(-1).code, "invalid_reporting_root");
+  assert.equal(state.runtimeOptions, undefined);
+  assert.equal(fs.existsSync(path.join(root, "state")), false);
+});
+
+test("optional model keeps the reporting contract consistent end to end", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-no-model-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
+  const writeCase = (name, extra) => {
+    const file = path.join(root, name + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent: "test-agent",
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile: path.join(root, "response-" + name + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: root,
+      timeoutMs: 30000,
+      lifecycle,
+      allowKinds: ["read"],
+      ...extra
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  // A config without model loads when the templates use the runtime-default
+  // label, and the normalized bundle keeps that label on the identity lines.
+  const loaded = loadSupervisorConfig(writeCase("no-model", {
+    reporting: validReporting(lifecycle, { model: "runtime-default" })
+  }));
+  assert.equal(loaded.model, undefined);
+  assert.match(loaded.reporting.startMessage, /`runtime-default`/);
+
+  // Without model, templates claiming a concrete model are a mismatch, not a
+  // silent pass: the identity line no longer matches the expected label.
+  assert.throws(
+    () => loadSupervisorConfig(writeCase("no-model-mismatch", {
+      reporting: validReporting(lifecycle, { model: "test-model" })
+    })),
+    { message: "invalid_reporting_start_message", code: "invalid_reporting_start_message" }
+  );
+
+  // The started event and the reporting templates agree on the label.
+  const memRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-no-model-mem-"));
+  const memLifecycle = parsedLifecycle();
+  const { module } = makeRuntimeModule({
+    events: [{ type: "text_delta", stream: "output", text: "ok" }]
+  });
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(memRoot, {
+    model: undefined,
+    lifecycle: memLifecycle,
+    reporting: validReporting(memLifecycle, { model: "runtime-default" })
+  }), {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.completed);
+  const started = emitted.find((event) => event.type === "started");
+  assert.equal(started.model, "runtime-default");
+});
+
+test("metadata containing forbidden-pattern words loads while free-text slots stay screened", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-metadata-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
+  const writeCase = (name, reporting) => {
+    const file = path.join(root, name + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent: "test-agent",
+      model: "test-model",
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile: path.join(root, "response-" + name + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: root,
+      timeoutMs: 30000,
+      lifecycle,
+      allowKinds: ["read"],
+      reporting
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  // Ordinary repository/branch names that merely contain denylisted words are
+  // legal metadata through the full loader path.
+  const cases = [
+    ["fix-routing", { branch: "fix/routing" }],
+    ["cron-schedule", { branch: "feat/cron-schedule" }],
+    ["snapshot-tool", { repository: "snapshot-tool" }]
+  ];
+  for (const [name, overrides] of cases) {
+    const loaded = loadSupervisorConfig(
+      writeCase(name, validReporting(lifecycle, overrides))
+    );
+    if (overrides.branch) {
+      assert.equal(loaded.reporting.branch, overrides.branch, name);
+    }
+    if (overrides.repository) {
+      assert.equal(loaded.reporting.repository, overrides.repository, name);
+    }
+  }
+
+  // The same words in a free-text slot still fail closed.
+  assert.throws(
+    () => loadSupervisorConfig(writeCase("screened-bullet", validReporting(lifecycle, {
+      scopeBullet: "- 스케줄러 cron 상태 점검"
+    }))),
+    { message: "invalid_reporting_forbidden_content", code: "invalid_reporting_forbidden_content" }
+  );
 });
 
 test("fresh same-conversation start receipt reaches the runtime", async () => {
@@ -1467,6 +1763,7 @@ test("claude config requires the exact setup-token auth profile", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-auth-config-"));
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
   const base = {
     agent: "claude",
     model: "test-model",
@@ -1476,7 +1773,8 @@ test("claude config requires the exact setup-token auth profile", () => {
     stateDir: path.join(root, "state"),
     runtimeModule: root,
     timeoutMs: 30000,
-    lifecycle: rawLifecycle(),
+    lifecycle,
+    reporting: validReporting(lifecycle),
     allowKinds: ["read"]
   };
   let caseIndex = 0;
