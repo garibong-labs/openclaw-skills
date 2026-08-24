@@ -1562,6 +1562,141 @@ test("optional model keeps the reporting contract consistent end to end", async 
   assert.equal(started.model, "runtime-default");
 });
 
+test("model grammar accepts ACPX bracketed reasoning-selection IDs and fails closed on malformed brackets", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-model-grammar-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
+  const writeCase = (name, extra) => {
+    const file = path.join(root, name + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent: "codex",
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile: path.join(root, "response-" + name + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: root,
+      timeoutMs: 30000,
+      lifecycle,
+      allowKinds: ["read"],
+      ...extra
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  // Plain identifier-grammar model IDs stay accepted unchanged, and ACPX
+  // adapter-advertised bracketed IDs — reasoning selection inside the model
+  // ID itself — load with the complete string intact, including the
+  // 256-character boundary. The reporting bundle binds to the same complete
+  // string, so identity lines carry the bracketed ID verbatim.
+  const valid = [
+    ["plain", "test-model"],
+    ["plain-dotted", "gpt-5.2"],
+    ["bracket-low", "gpt-5.6-sol[low]"],
+    ["bracket-high", "gpt-5.2[high]"],
+    ["bracket-duration", "claude-fable-5[1m]"],
+    ["bracket-max-length", "m".repeat(250) + "[high]"]
+  ];
+  for (const [name, model] of valid) {
+    const loaded = loadSupervisorConfig(writeCase(name, {
+      model,
+      reporting: validReporting(lifecycle, { model })
+    }));
+    assert.equal(loaded.model, model, name);
+    assert.ok(loaded.reporting.startMessage.includes("`" + model + "`"), name);
+  }
+
+  // Malformed bracket forms fail closed with the stable invalid_model code:
+  // empty suffix, unmatched or nested brackets, repeated suffixes, trailing
+  // characters, a suffix-only value, whitespace, controls, backticks,
+  // unrelated punctuation, and the over-length boundary.
+  const invalid = [
+    ["empty-suffix", "gpt-5.2[]"],
+    ["unmatched-open", "gpt-5.2[high"],
+    ["unmatched-close", "gpt-5.2]high"],
+    ["close-before-open", "gpt-5.2]high["],
+    ["nested", "gpt-5.2[[high]]"],
+    ["double-suffix", "gpt-5.2[low][high]"],
+    ["trailing-after-close", "gpt-5.2[high]x"],
+    ["suffix-only", "[high]"],
+    ["inner-whitespace", "gpt-5.2[hi gh]"],
+    ["outer-whitespace", "gpt-5.2 [high]"],
+    ["inner-punctuation", "gpt-5.2[high;]"],
+    ["inner-hyphen", "gpt-5.2[extra-high]"],
+    ["backtick", "gpt-5.2[`high`]"],
+    ["control", "gpt-5.2[high]\n"],
+    ["over-length", "m".repeat(251) + "[high]"]
+  ];
+  for (const [name, model] of invalid) {
+    assert.throws(
+      () => loadSupervisorConfig(writeCase(name, {
+        model,
+        reporting: validReporting(lifecycle, { model })
+      })),
+      { message: "invalid_model", code: "invalid_model" },
+      name
+    );
+  }
+
+  // The generic identifier grammar was not relaxed: a bracketed agent name is
+  // still rejected before the closed-set gate or any other validation runs.
+  assert.throws(
+    () => loadSupervisorConfig(writeCase("bracketed-agent", {
+      agent: "codex[high]",
+      model: "test-model",
+      reporting: validReporting(lifecycle)
+    })),
+    { message: "invalid_agent", code: "invalid_agent" }
+  );
+});
+
+test("bracketed model ID reaches the runtime session options unchanged", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-model-passthrough-"));
+  const model = "gpt-5.6-sol[low]";
+  const lifecycle = parsedLifecycle();
+  const { module, state } = makeRuntimeModule({
+    events: [{ type: "text_delta", stream: "output", text: "bounded result" }]
+  });
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(root, {
+    model,
+    lifecycle,
+    reporting: validReporting(lifecycle, { model })
+  }), {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.completed);
+  // The complete bracketed string is what ACPX receives and what the
+  // normalized started event reports — no stripping, splitting, or rewriting
+  // into a separate thinking option anywhere in between.
+  assert.equal(state.ensureInput.sessionOptions.model, model);
+  const started = emitted.find((event) => event.type === "started");
+  assert.equal(started.model, model);
+  assert.equal(emitted.at(-1).type, "terminal");
+  assert.equal(emitted.at(-1).status, "completed");
+});
+
+test("public docs describe the bracketed model-ID grammar", () => {
+  const skill = fs.readFileSync(new URL("../SKILL.md", import.meta.url), "utf8");
+  const contract = fs.readFileSync(
+    new URL("../references/runtime-contract.md", import.meta.url),
+    "utf8"
+  );
+
+  for (const doc of [skill, contract]) {
+    assert.match(doc, /gpt-5\.2\[high\]/);
+    assert.match(doc, /gpt-5\.6-sol\[low\]/);
+    assert.match(doc, /invalid_model/);
+  }
+  assert.match(contract, /claude-fable-5\[1m\]/);
+  assert.match(contract, /sessionOptions\.model/);
+});
+
 test("metadata containing forbidden-pattern words loads while free-text slots stay screened", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-metadata-"));
   const prompt = path.join(root, "prompt.txt");

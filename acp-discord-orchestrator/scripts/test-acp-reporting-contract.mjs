@@ -792,6 +792,30 @@ test('codex v2 bundle passes with the closed Codex label', () => {
   assert.ok(Object.isFrozen(normalized));
 });
 
+test('bracketed adapter-advertised model IDs bind the identity lines verbatim', () => {
+  // ACPX advertises Codex reasoning selection inside the model ID itself
+  // (for example gpt-5.6-sol[low]); the contract treats the complete
+  // bracketed string as the model and exact-matches it on every identity
+  // line, unchanged.
+  const model = 'gpt-5.6-sol[low]';
+  const context = { ...CODEX_CONTEXT, model };
+  const reporting = buildReporting({ agent: 'codex', model });
+  const normalized = validateAcpReportingContract(reporting, context);
+  assert.deepEqual(normalized, reporting);
+  assert.ok(normalized.startMessage.includes('🤖 **ACP**: Codex · `gpt-5.6-sol[low]`'));
+  assert.ok(normalized.watchdog.payload.message.includes('🤖 **ACP**: Codex · `gpt-5.6-sol[low]`'));
+
+  // A template claiming a different reasoning suffix than the validated
+  // model is an identity-line mismatch, not a silent pass.
+  expectContractError(
+    () => validateAcpReportingContract(
+      buildReporting({ agent: 'codex', model: 'gpt-5.6-sol[high]' }),
+      context
+    ),
+    'invalid_reporting_start_message'
+  );
+});
+
 test('legacy claude v1 bundle stays valid during the bounded migration', () => {
   const reporting = buildReporting({ schemaVersion: 'acp-reporting-v1' });
   assert.equal('agent' in reporting, false);

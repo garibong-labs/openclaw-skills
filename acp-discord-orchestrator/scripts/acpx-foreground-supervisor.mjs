@@ -248,6 +248,23 @@ function assertIdentifier(value, code, maxLength) {
   return checked;
 }
 
+// Model IDs are the identifier grammar plus at most one bounded bracket
+// suffix at the very end. ACPX 0.11.2+ adapters advertise Codex reasoning
+// selection inside the model ID itself — `gpt-5.2[high]`, `gpt-5.6-sol[low]`,
+// `claude-fable-5[1m]` — so the complete bracketed string is the model ID and
+// must reach sessionOptions.model unchanged; it is not a separate thinking
+// option. The suffix is one non-empty alphanumeric run in matched square
+// brackets; an empty suffix, unmatched or nested brackets, a second suffix,
+// or any character after the closing bracket fails closed. Agent names and
+// every other identifier keep the strict bracket-free grammar above.
+function assertModelId(value, code, maxLength) {
+  const checked = assertString(value, code, maxLength);
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.:/@+-]*(\[[a-zA-Z0-9]+\])?$/.test(checked)) {
+    fail(code);
+  }
+  return checked;
+}
+
 function assertPositiveInteger(value, code, options = {}) {
   const allowZero = options.allowZero === true;
   if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1)) {
@@ -782,7 +799,7 @@ export function loadSupervisorConfig(configPath) {
 
   const model = raw.model === undefined
     ? undefined
-    : assertIdentifier(raw.model, "invalid_model", 256);
+    : assertModelId(raw.model, "invalid_model", 256);
 
   // Mandatory reporting bundle, validated last so every structural field it
   // binds to (agent, model, lifecycle receipt) is already trusted, and before
