@@ -9,13 +9,17 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   ACP_AGENT_PRESENTATIONS,
+  ACP_BASELINE_ENV_CONTRACT,
+  ACP_INJECTION_ENV,
   ACP_SUPPORTED_AGENTS,
   CLAUDE_AUTH_KIND,
   CLAUDE_FORBIDDEN_ENV,
   CLAUDE_IMPLICIT_ENV_CONTRACT,
   CLAUDE_INJECTION_ENV,
   CLAUDE_OAUTH_TOKEN_ENV,
+  CLAUDE_PROVIDER_INJECTION_ENV,
   EXIT_CODES,
+  assertCanonicalSupportedAgent,
   buildPermissionHandler,
   classifyPermissionRequest,
   containsDetachedShell,
@@ -2234,9 +2238,10 @@ test("non-canonical claude spellings cannot bypass the claude gates", POSIX_ONLY
   }
 
   // In-memory configs: a normalized-to-claude spelling reaching the
-  // supervisor without the canonical value gets the Claude gate, not the
-  // generic path — previously "Claude" skipped auth, argv proof, and the
-  // credential contract entirely and still resolved to Claude in ACPX.
+  // supervisor without the canonical value fails the centralized closed-set
+  // gate with the same stable loader code — previously "Claude" skipped
+  // auth, argv proof, and the credential contract entirely and still
+  // resolved to Claude in ACPX.
   for (const agent of ["Claude", " claude "]) {
     const caseRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-case-mem-"));
     const config = makeConfig(caseRoot, {
@@ -2253,10 +2258,12 @@ test("non-canonical claude spellings cannot bypass the claude gates", POSIX_ONLY
       }
     });
     assert.equal(exitCode, EXIT_CODES.supervisorError, agent);
-    assert.equal(emitted.at(-1).code, "claude_agent_not_canonical", agent);
+    assert.equal(emitted.at(-1).code, "invalid_agent_not_canonical", agent);
     assert.equal(fs.existsSync(config.stateDir), false, agent);
   }
 
+  // The exported Claude route guard keeps its own non-canonical rejection as
+  // defense in depth when invoked directly, behind the centralized gate.
   assert.throws(
     () => runClaudeSupervisorPreflight({ agent: "Claude" }, {}, []),
     { code: "claude_agent_not_canonical" }
@@ -2436,12 +2443,13 @@ test("loader binds reporting to the canonical agent for both supported agents", 
     { message: "invalid_reporting_agent", code: "invalid_reporting_agent" }
   );
 
-  // An agent outside the closed mapping is rejected as invalid config before
-  // any runtime import, regardless of what its bundle claims.
+  // An agent outside the closed mapping is rejected as invalid config with
+  // its own stable code before any runtime import, regardless of what its
+  // bundle claims.
   for (const agent of ["test-agent", "gemini", "claude-code"]) {
     assert.throws(
       () => loadSupervisorConfig(writeCase({ agent })),
-      { message: "invalid_reporting_agent", code: "invalid_reporting_agent" },
+      { message: "invalid_agent_unsupported", code: "invalid_agent_unsupported" },
       agent
     );
   }
@@ -2460,7 +2468,7 @@ test("loader binds reporting to the canonical agent for both supported agents", 
   assert.equal(fs.existsSync(path.join(root, "state")), false);
 });
 
-test("unsupported agent fails the in-memory backstop before runtime access", async () => {
+test("unsupported agent fails the in-memory gate before runtime access", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-agent-backstop-"));
   const { module, state } = makeRuntimeModule();
   const emitted = [];
@@ -2473,12 +2481,13 @@ test("unsupported agent fails the in-memory backstop before runtime access", asy
   });
   assert.equal(exitCode, EXIT_CODES.supervisorError);
   assert.equal(emitted.at(-1).type, "supervisor_error");
-  assert.equal(emitted.at(-1).code, "invalid_reporting_agent");
+  assert.equal(emitted.at(-1).code, "invalid_agent_unsupported");
   assert.equal(state.runtimeOptions, undefined);
   assert.equal(fs.existsSync(path.join(root, "state")), false);
 
-  // Direct unit surface: the backstop rejects the unsupported agent even
-  // though the bundle itself is a valid codex bundle.
+  // Direct unit surface: the pure reporting contract keeps its own
+  // contract-level boundary code when the backstop is invoked standalone,
+  // even though the bundle itself is a valid codex bundle.
   assert.throws(
     () => runReportingPreflight(makeConfig(root, { agent: "gemini" })),
     { message: "invalid_reporting_agent", code: "invalid_reporting_agent" }
@@ -2487,7 +2496,9 @@ test("unsupported agent fails the in-memory backstop before runtime access", asy
 
 test("non-canonical codex spelling fails closed in memory", async () => {
   // "Codex" reaches ACPX's codex adapter after trim/lowercase normalization,
-  // so an in-memory config using it must not pass the reporting agent gate.
+  // so an in-memory config using it must fail the centralized closed-set
+  // gate with the same stable code the loader uses — symmetric with the
+  // non-canonical Claude spellings above.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-case-"));
   const { module, state } = makeRuntimeModule();
   const emitted = [];
@@ -2499,8 +2510,246 @@ test("non-canonical codex spelling fails closed in memory", async () => {
     }
   });
   assert.equal(exitCode, EXIT_CODES.supervisorError);
-  assert.equal(emitted.at(-1).code, "invalid_reporting_agent");
+  assert.equal(emitted.at(-1).code, "invalid_agent_not_canonical");
   assert.equal(state.runtimeOptions, undefined);
+});
+
+test("centralized agent gate accepts only canonical supported spellings", () => {
+  assert.equal(assertCanonicalSupportedAgent("claude"), "claude");
+  assert.equal(assertCanonicalSupportedAgent("codex"), "codex");
+  // A spelling that ACPX would normalize to a supported agent, but is not
+  // the exact canonical lowercase value, is symmetric between claude and
+  // codex: one stable code, no per-agent asymmetry.
+  for (const agent of ["Claude", "CLAUDE", " claude ", "Codex", "CODEX", "cOdEx", "codex "]) {
+    assert.throws(
+      () => assertCanonicalSupportedAgent(agent),
+      { message: "invalid_agent_not_canonical", code: "invalid_agent_not_canonical" },
+      JSON.stringify(agent)
+    );
+  }
+  // Anything outside the closed set — including non-strings — fails with its
+  // own stable explicit code.
+  for (const agent of ["gemini", "claude-code", "test-agent", "", 7, undefined, null]) {
+    assert.throws(
+      () => assertCanonicalSupportedAgent(agent),
+      { message: "invalid_agent_unsupported", code: "invalid_agent_unsupported" },
+      String(agent)
+    );
+  }
+});
+
+test("agent gate precedes unrelated filesystem access in the loader", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-agent-early-"));
+  // Every later filesystem field points at a missing path: reaching any of
+  // them would surface a different code (or a raw ENOENT), so the stable
+  // agent codes prove the closed-set gate ran before cwd, prompt, response,
+  // state-dir, or runtime-module I/O.
+  let caseIndex = 0;
+  const writeCase = (agent) => {
+    caseIndex += 1;
+    const file = path.join(root, "case-" + String(caseIndex) + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent,
+      cwd: path.join(root, "missing-cwd"),
+      sessionKey: "test-session",
+      promptFile: path.join(root, "missing-prompt.txt"),
+      responseFile: path.join(root, "response-" + String(caseIndex) + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: path.join(root, "missing-runtime"),
+      timeoutMs: 30000,
+      lifecycle: rawLifecycle(),
+      allowKinds: ["read"],
+      reporting: validReporting()
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  assert.throws(
+    () => loadSupervisorConfig(writeCase("gemini")),
+    { message: "invalid_agent_unsupported", code: "invalid_agent_unsupported" }
+  );
+  for (const agent of ["Claude", "Codex"]) {
+    assert.throws(
+      () => loadSupervisorConfig(writeCase(agent)),
+      { message: "invalid_agent_not_canonical", code: "invalid_agent_not_canonical" },
+      agent
+    );
+  }
+
+  // The unsupported-agent code keeps the invalid-config CLI exit mapping.
+  const writes = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    writes.push(String(chunk));
+    return true;
+  };
+  let exitCode;
+  try {
+    exitCode = await main(["--config", writeCase("gemini")]);
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(exitCode, EXIT_CODES.invalidConfig);
+  const emitted = JSON.parse(writes.join("").trim());
+  assert.equal(emitted.type, "supervisor_error");
+  assert.equal(emitted.code, "invalid_agent_unsupported");
+});
+
+test("provider-neutral injection baseline is implicitly forbidden for codex", async () => {
+  // The baseline is exactly the agent-neutral process-integrity set: Node
+  // module/preload selectors, dynamic-linker preload/library selectors, and
+  // the proxy selectors in both letter cases. No Anthropic-specific selector
+  // belongs to it.
+  assert.deepEqual([...ACP_INJECTION_ENV], [
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_REPL_EXTERNAL_MODULE",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy"
+  ]);
+  assert.ok(Object.isFrozen(ACP_INJECTION_ENV));
+  assert.ok(Object.isFrozen(ACP_BASELINE_ENV_CONTRACT));
+  assert.deepEqual([...ACP_BASELINE_ENV_CONTRACT.requiredEnv], []);
+  assert.deepEqual(
+    [...ACP_BASELINE_ENV_CONTRACT.forbiddenEnv],
+    [...ACP_INJECTION_ENV]
+  );
+
+  // Every baseline variable is rejected for a codex run with empty caller
+  // env arrays, before any runtime module import, without value disclosure.
+  for (const name of ACP_INJECTION_ENV) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-baseline-codex-"));
+    const config = makeConfig(root, {
+      requiredEnv: [],
+      forbiddenEnv: [],
+      runtimeModule: path.join(root, "missing-runtime")
+    });
+    const emitted = [];
+    const exitCode = await runSupervisor(config, {
+      bindSignals: false,
+      env: { [name]: "INJECTED_SECRET_VALUE" },
+      writeEvent(event) {
+        emitted.push(event);
+      }
+    });
+    assert.equal(exitCode, EXIT_CODES.supervisorError, name);
+    assert.equal(emitted.at(-1).type, "supervisor_error", name);
+    assert.equal(emitted.at(-1).code, "forbidden_env_present:" + name, name);
+    assert.equal(fs.existsSync(config.stateDir), false, name);
+    assert.equal(
+      JSON.stringify(emitted).includes("INJECTED_SECRET_VALUE"),
+      false,
+      name
+    );
+  }
+
+  // Empty values cannot inject anything: with every baseline variable
+  // present but empty, a codex run still completes.
+  const okRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-baseline-empty-"));
+  const { module, state } = makeRuntimeModule();
+  const emitted = [];
+  const exitCode = await runSupervisor(makeConfig(okRoot), {
+    runtimeModule: module,
+    bindSignals: false,
+    env: Object.fromEntries(ACP_INJECTION_ENV.map((name) => [name, ""])),
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.completed);
+  assert.ok(state.runtimeOptions);
+  assert.equal(emitted.at(-1).type, "terminal");
+});
+
+test("caller cannot require an implicitly forbidden baseline variable", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-baseline-overlap-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
+  let caseIndex = 0;
+  const writeCase = (extra) => {
+    caseIndex += 1;
+    const file = path.join(root, "case-" + String(caseIndex) + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent: "codex",
+      model: "test-model",
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile: path.join(root, "response-" + String(caseIndex) + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: root,
+      timeoutMs: 30000,
+      lifecycle,
+      reporting: validReporting(lifecycle),
+      allowKinds: ["read"],
+      ...extra
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  // Baseline overlap is judged case-insensitively for the non-Claude path,
+  // matching the contract's portable case-insensitive name identity.
+  for (const name of ["NODE_OPTIONS", "node_options", "Node_Options", "LD_PRELOAD", "Ld_Preload", "HTTP_PROXY", "http_proxy", "Dyld_Insert_Libraries"]) {
+    assert.throws(
+      () => loadSupervisorConfig(writeCase({ requiredEnv: [name] })),
+      { message: "invalid_env_contract_overlap", code: "invalid_env_contract_overlap" },
+      name
+    );
+  }
+
+  // Restating a baseline variable as forbidden is consistent, not
+  // contradictory, and Anthropic-specific selectors are Claude-layered, not
+  // baseline: a codex run may still require them through the generic
+  // contract.
+  const consistent = loadSupervisorConfig(writeCase({
+    forbiddenEnv: ["NODE_OPTIONS"],
+    requiredEnv: ["ANTHROPIC_BASE_URL"]
+  }));
+  assert.deepEqual(consistent.forbiddenEnv, ["NODE_OPTIONS"]);
+  assert.deepEqual(consistent.requiredEnv, ["ANTHROPIC_BASE_URL"]);
+});
+
+test("claude keeps the superset of baseline plus anthropic-specific selectors", () => {
+  assert.deepEqual([...CLAUDE_PROVIDER_INJECTION_ENV], [
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CONFIG_DIR"
+  ]);
+  // The Claude injection set is exactly the agent-neutral baseline plus the
+  // Anthropic-specific layer — nothing dropped, nothing else added.
+  assert.deepEqual(
+    [...CLAUDE_INJECTION_ENV],
+    [...ACP_INJECTION_ENV, ...CLAUDE_PROVIDER_INJECTION_ENV]
+  );
+  for (const name of CLAUDE_PROVIDER_INJECTION_ENV) {
+    assert.equal(ACP_INJECTION_ENV.includes(name), false, name);
+  }
+  // The automatic Claude credential contract forbids the whole superset on
+  // top of its credential selectors, and still requires only the setup
+  // token.
+  for (const name of [...ACP_INJECTION_ENV, ...CLAUDE_PROVIDER_INJECTION_ENV, ...CLAUDE_FORBIDDEN_ENV]) {
+    assert.ok(CLAUDE_IMPLICIT_ENV_CONTRACT.forbiddenEnv.includes(name), name);
+  }
+  assert.deepEqual([...CLAUDE_IMPLICIT_ENV_CONTRACT.requiredEnv], [CLAUDE_OAUTH_TOKEN_ENV]);
+  assert.ok(Object.isFrozen(CLAUDE_PROVIDER_INJECTION_ENV));
+  assert.ok(Object.isFrozen(CLAUDE_INJECTION_ENV));
 });
 
 test("codex run completes end to end with the codex identity", async () => {

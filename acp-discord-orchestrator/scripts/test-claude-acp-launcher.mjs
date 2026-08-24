@@ -256,9 +256,10 @@ test("launcher CLI usage and config-shape errors keep exit 64", POSIX_ONLY, asyn
   );
   assert.equal(agentSink.events.at(-1).code, "launcher_agent_not_claude");
 
-  // An agent outside the closed presentation mapping never loads at all: the
-  // reporting contract rejects it during config loading, before the
-  // launcher's own agent gate.
+  // An agent outside the closed supported set never loads at all: the
+  // loader's early closed-set gate rejects it with its stable explicit code
+  // before any unrelated filesystem access and before the launcher's own
+  // agent gate.
   const unsupportedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-launcher-unsupported-"));
   makeAuthEnvFile(unsupportedRoot);
   const unsupportedConfig = writeClaudeRunConfig(unsupportedRoot, { agent: "test-agent" });
@@ -267,7 +268,7 @@ test("launcher CLI usage and config-shape errors keep exit 64", POSIX_ONLY, asyn
     await main(["--config", unsupportedConfig], { env: {}, writeEvent: unsupportedSink.writeEvent }),
     EXIT_CODES.invalidConfig
   );
-  assert.equal(unsupportedSink.events.at(-1).code, "invalid_reporting_agent");
+  assert.equal(unsupportedSink.events.at(-1).code, "invalid_agent_unsupported");
 
   const missingAuthRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-launcher-noauth-"));
   const missingAuthConfig = writeClaudeRunConfig(missingAuthRoot);
@@ -536,9 +537,43 @@ test("public docs and template describe the canonical claude route", () => {
     assert.ok(contract.includes(code), `runtime contract must document ${code}`);
   }
 
+  // The early closed-set agent gate and the agent-neutral process-integrity
+  // environment baseline are documented with their stable codes.
+  for (const code of [
+    "invalid_agent_unsupported",
+    "invalid_agent_not_canonical",
+    "invalid_env_contract_overlap"
+  ]) {
+    assert.ok(contract.includes(code), `runtime contract must document ${code}`);
+  }
+  assert.match(contract, /process-integrity/);
+  assert.match(skill, /process-integrity/);
+
   const serialized = skill + contract + JSON.stringify(template) + JSON.stringify(claudeProfile);
   assert.doesNotMatch(serialized, /sk-ant-/);
   assert.doesNotMatch(serialized, /\/Users\/[a-z]/);
+});
+
+test("template substitution counts match the documented guidance", () => {
+  const templateText = fs.readFileSync(
+    new URL("../templates/supervisor-config.json", import.meta.url),
+    "utf8"
+  );
+  const skill = fs.readFileSync(new URL("../SKILL.md", import.meta.url), "utf8");
+
+  // "AGENT_DISPLAY_NAME" does not contain "AGENT_NAME" as a contiguous
+  // substring, so the two counts are independent of each other.
+  assert.equal("AGENT_DISPLAY_NAME".includes("AGENT_NAME"), false);
+  // AGENT_NAME: the config `agent` and the reporting bundle's `agent`
+  // attestation. AGENT_DISPLAY_NAME: the start message, its byte-identical
+  // receipt copy, and the watchdog report identity line.
+  assert.equal(templateText.split("AGENT_NAME").length - 1, 2);
+  assert.equal(templateText.split("AGENT_DISPLAY_NAME").length - 1, 3);
+
+  // The operator instructions state the exact occurrence counts, so a
+  // template change that adds or removes a placeholder must update both.
+  assert.match(skill, /`AGENT_NAME` appears exactly twice/);
+  assert.match(skill, /`AGENT_DISPLAY_NAME` appears exactly three times/);
 });
 
 test("substituted public template loads through the real supervisor loader", () => {
