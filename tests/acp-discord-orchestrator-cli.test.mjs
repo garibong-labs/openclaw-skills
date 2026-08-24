@@ -13,11 +13,12 @@ const SUPERVISOR_ERROR_EXIT = 22;
 const CONTROL_CONVERSATION_ID = "100000000000000001";
 const START_MESSAGE_ID = "100000000000000002";
 
-// Deterministic acp-reporting-v1 bundle from the shared integration fixture,
-// bound to this test's lifecycle receipt so the config passes the mandatory
-// reporting gate and reaches turn execution.
+// Deterministic codex acp-reporting-v2 bundle from the shared integration
+// fixture, bound to this test's lifecycle receipt so the config passes the
+// mandatory reporting gate and reaches turn execution.
 function validReporting(deliveredAt, model = "test-model") {
   return buildValidReporting({
+    agent: "codex",
     controlConversationId: CONTROL_CONVERSATION_ID,
     messageId: START_MESSAGE_ID,
     deliveredAt,
@@ -58,7 +59,7 @@ export function createAcpRuntime() {
   fs.writeFileSync(promptFile, "bounded no-op", { mode: 0o600 });
   const deliveredAt = new Date().toISOString();
   fs.writeFileSync(configFile, JSON.stringify({
-    agent: "test-agent",
+    agent: "codex",
     model: "test-model",
     cwd: root,
     sessionKey: "cli-exit-test",

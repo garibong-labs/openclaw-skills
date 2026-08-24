@@ -13,6 +13,7 @@ const BRANCH = 'fix/acp-reporting-fail-closed-guard';
 const OTHER_CHANNEL = '999888777666555444';
 
 const CONTEXT = {
+  agent: 'claude',
   model: 'claude-fable-5',
   controlConversationId: '123456789012345678',
   lifecycleStartReceipt: {
@@ -21,6 +22,11 @@ const CONTEXT = {
     deliveredAt: '2026-08-24T09:30:00.000Z',
   },
 };
+const CODEX_CONTEXT = { ...CONTEXT, agent: 'codex', model: 'gpt-5-codex' };
+
+// The closed presentation mapping, written out as literals so a mapping drift
+// in the module fails these tests.
+const AGENT_LABELS = { claude: 'Claude Code', codex: 'Codex' };
 
 // Templates are intentionally written out as literals here (not imported from
 // the module) so a template drift in the module fails these tests.
@@ -31,6 +37,7 @@ const END = '---END ACP REPORT---';
 
 function buildStartMessage({
   roundIndex = 1,
+  label = AGENT_LABELS.claude,
   model = CONTEXT.model,
   repository = REPO,
   branch = BRANCH,
@@ -43,7 +50,7 @@ function buildStartMessage({
   return [
     title,
     '',
-    `🤖 **ACP**: Claude Code · \`${model}\``,
+    `🤖 **ACP**: ${label} · \`${model}\``,
     `📍 **작업**: \`${repository}\` · \`${branch}\``,
     '',
     '🎯 **범위**',
@@ -63,6 +70,7 @@ function buildReportLines({
   roundIndex = 1,
   phaseIndex = 2,
   phaseName = null,
+  label = AGENT_LABELS.claude,
   model = CONTEXT.model,
   repository = REPO,
   branch = BRANCH,
@@ -74,7 +82,7 @@ function buildReportLines({
   const lines = [
     `🔄 **ACP 중간 보고 · ${time} KST**`,
     '',
-    `🤖 **ACP**: Claude Code · \`${model}\``,
+    `🤖 **ACP**: ${label} · \`${model}\``,
     `📍 **작업**: \`${repository}\` · \`${branch}\``,
     `🔢 **라운드**: ${roundIndex} · ${phaseIndex}/4 ${phaseName ?? PHASES[phaseIndex]}`,
     `⏱️ **ACP 시간**: ${elapsed}`,
@@ -104,6 +112,9 @@ function buildPayloadMessage(report) {
 
 function buildReporting({
   roundIndex = 1,
+  agent = 'claude',
+  schemaVersion = 'acp-reporting-v2',
+  label = AGENT_LABELS[agent] ?? String(agent),
   model = CONTEXT.model,
   repository = REPO,
   branch = BRANCH,
@@ -111,10 +122,11 @@ function buildReporting({
   reportLines = null,
   timeoutSeconds = 45,
 } = {}) {
-  const startMessage = buildStartMessage({ roundIndex, model, repository, branch });
-  const lines = reportLines ?? buildReportLines({ roundIndex, model, repository, branch, issueBullet });
+  const startMessage = buildStartMessage({ roundIndex, label, model, repository, branch });
+  const lines = reportLines ?? buildReportLines({ roundIndex, label, model, repository, branch, issueBullet });
   return {
-    schemaVersion: 'acp-reporting-v1',
+    schemaVersion,
+    ...(schemaVersion === 'acp-reporting-v2' ? { agent } : {}),
     roundIndex,
     repository,
     branch,
@@ -290,9 +302,11 @@ test('start receipt content and lifecycle mismatches are rejected', () => {
 });
 
 test('schemaVersion, roundIndex, repository, and branch are validated', () => {
-  const badSchema = buildReporting();
-  badSchema.schemaVersion = 'acp-reporting-v2';
-  expectRejected(badSchema, 'invalid_reporting_schema_version');
+  for (const badVersion of ['acp-reporting-v3', 'acp-reporting', 'v2', 1, undefined]) {
+    const reporting = buildReporting();
+    reporting.schemaVersion = badVersion;
+    expectRejected(reporting, 'invalid_reporting_schema_version');
+  }
 
   for (const badRound of [0, -1, 2.5, '1']) {
     const reporting = buildReporting();
@@ -675,6 +689,7 @@ test('identifier and model bounds match the supervisor bounds', () => {
   const id32 = '9'.repeat(32);
   const message32 = '8'.repeat(32);
   const context32 = {
+    agent: CONTEXT.agent,
     model: CONTEXT.model,
     controlConversationId: id32,
     lifecycleStartReceipt: {
@@ -753,4 +768,132 @@ test('omitted context model binds the templates to the runtime-default label', (
     () => validateAcpReportingContract(labeled, { ...noModelContext, model: 42 }),
     'invalid_reporting_context'
   );
+});
+
+test('claude v2 bundle passes and carries the agent attestation', () => {
+  const reporting = buildReporting();
+  assert.equal(reporting.schemaVersion, 'acp-reporting-v2');
+  assert.equal(reporting.agent, 'claude');
+  const normalized = validateAcpReportingContract(reporting, CONTEXT);
+  assert.deepEqual(normalized, reporting);
+  assert.equal(normalized.agent, 'claude');
+  assert.equal(normalized.schemaVersion, 'acp-reporting-v2');
+  assert.ok(normalized.startMessage.includes('🤖 **ACP**: Claude Code · '));
+});
+
+test('codex v2 bundle passes with the closed Codex label', () => {
+  const reporting = buildReporting({ agent: 'codex', model: CODEX_CONTEXT.model });
+  const normalized = validateAcpReportingContract(reporting, CODEX_CONTEXT);
+  assert.deepEqual(normalized, reporting);
+  assert.equal(normalized.agent, 'codex');
+  assert.ok(normalized.startMessage.includes('🤖 **ACP**: Codex · `gpt-5-codex`'));
+  assert.ok(normalized.watchdog.payload.message.includes('🤖 **ACP**: Codex · `gpt-5-codex`'));
+  assert.equal(normalized.startMessage.includes('Claude Code'), false);
+  assert.ok(Object.isFrozen(normalized));
+});
+
+test('legacy claude v1 bundle stays valid during the bounded migration', () => {
+  const reporting = buildReporting({ schemaVersion: 'acp-reporting-v1' });
+  assert.equal('agent' in reporting, false);
+  const normalized = validateAcpReportingContract(reporting, CONTEXT);
+  assert.deepEqual(normalized, reporting);
+  assert.equal(normalized.schemaVersion, 'acp-reporting-v1');
+  assert.equal('agent' in normalized, false);
+});
+
+test('v1 bundle is rejected for codex', () => {
+  // A v1 bundle has no agent attestation and predates the presentation
+  // mapping, so it is bounded to canonical Claude: Codex must present v2.
+  const reporting = buildReporting({
+    agent: 'codex',
+    schemaVersion: 'acp-reporting-v1',
+    model: CODEX_CONTEXT.model,
+  });
+  expectRejected(reporting, 'invalid_reporting_schema_version', CODEX_CONTEXT);
+
+  // Even a v1 bundle whose templates already claim the Codex label is
+  // rejected on the version, before any template content is compared.
+  const labeled = buildReporting({
+    agent: 'claude',
+    schemaVersion: 'acp-reporting-v1',
+    label: AGENT_LABELS.codex,
+    model: CODEX_CONTEXT.model,
+  });
+  expectRejected(labeled, 'invalid_reporting_schema_version', CODEX_CONTEXT);
+});
+
+test('v1 bundle carrying the v2 agent key is rejected as unknown', () => {
+  const reporting = buildReporting({ schemaVersion: 'acp-reporting-v1' });
+  reporting.agent = 'claude';
+  expectRejected(reporting, 'invalid_reporting_unknown_key');
+});
+
+test('v2 agent attestation must equal the canonical config agent', () => {
+  // Bundle claims claude while the run is codex — and the reverse.
+  const claudeBundle = buildReporting();
+  expectRejected(claudeBundle, 'invalid_reporting_agent', CODEX_CONTEXT);
+
+  const codexBundle = buildReporting({ agent: 'codex', model: CODEX_CONTEXT.model });
+  expectRejected(codexBundle, 'invalid_reporting_agent');
+
+  // A v2 bundle without the attestation is rejected, not defaulted.
+  const missing = buildReporting();
+  delete missing.agent;
+  expectRejected(missing, 'invalid_reporting_agent');
+
+  // A non-canonical attestation spelling never equals the canonical agent.
+  const spelled = buildReporting();
+  spelled.agent = 'Claude';
+  expectRejected(spelled, 'invalid_reporting_agent');
+});
+
+test('spoofed harness labels are rejected for both agents', () => {
+  // A codex run whose templates present as Claude Code fails on the exact
+  // identity line, and the same in reverse: the label is bound to the
+  // canonical config agent through the closed mapping, never caller-chosen.
+  const codexAsClaude = buildReporting({
+    agent: 'codex',
+    label: AGENT_LABELS.claude,
+    model: CODEX_CONTEXT.model,
+  });
+  expectRejected(codexAsClaude, 'invalid_reporting_start_message', CODEX_CONTEXT);
+
+  const claudeAsCodex = buildReporting({ label: AGENT_LABELS.codex });
+  expectRejected(claudeAsCodex, 'invalid_reporting_start_message');
+
+  // An invented label fails even when the agent attestation is truthful.
+  const invented = buildReporting({ label: 'Claude Codex Ultra' });
+  expectRejected(invented, 'invalid_reporting_start_message');
+
+  // A spoofed label only inside the watchdog report (start message honest)
+  // still fails, on the report identity line.
+  const reportOnly = buildReporting({
+    reportLines: buildReportLines({ label: AGENT_LABELS.codex }),
+  });
+  expectRejected(reportOnly, 'invalid_reporting_report');
+});
+
+test('unsupported and non-canonical context agents are rejected first', () => {
+  const reporting = buildReporting();
+  const rejectedAgents = [
+    'gemini',
+    'test-agent',
+    '',
+    undefined,
+    42,
+    null,
+    'Claude',
+    ' claude ',
+    'CLAUDE',
+    'Codex',
+    ' codex ',
+    'CODEX',
+    'constructor',
+  ];
+  for (const agent of rejectedAgents) {
+    expectContractError(
+      () => validateAcpReportingContract(reporting, { ...CONTEXT, agent }),
+      'invalid_reporting_agent'
+    );
+  }
 });

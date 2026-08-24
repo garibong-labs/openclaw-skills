@@ -5,9 +5,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL,
+  ACP_SUPPORTED_AGENTS,
   AcpReportingContractError,
   validateAcpReportingContract
 } from "./acp-reporting-contract.mjs";
+
+export { ACP_AGENT_PRESENTATIONS, ACP_SUPPORTED_AGENTS } from "./acp-reporting-contract.mjs";
 
 export const SCHEMA_VERSION = "acp-discord-orchestrator.v1";
 export const EXIT_CODES = Object.freeze({
@@ -30,11 +33,13 @@ export const CLAUDE_FORBIDDEN_ENV = Object.freeze([
   "CLAUDE_CODE_USE_VERTEX",
   "CLAUDE_CODE_USE_FOUNDRY"
 ]);
-// Variables that can preload code into, redirect, or reconfigure the
-// token-bearing supervisor process. NODE_OPTIONS-injected flags never appear
-// in process.execArgv, so the exec-argv proof cannot see them; they are
-// rejected as environment state instead.
-export const CLAUDE_INJECTION_ENV = Object.freeze([
+// Agent-neutral ACP process-integrity baseline: variables that can preload
+// code into, redirect the module resolution of, or reroute the traffic of
+// the supervisor process itself, independent of which provider the agent
+// talks to. NODE_OPTIONS-injected flags never appear in process.execArgv, so
+// the exec-argv proof cannot see them; they are rejected as environment
+// state instead.
+export const ACP_INJECTION_ENV = Object.freeze([
   // Node.js process injection and module-resolution redirection
   "NODE_OPTIONS",
   "NODE_PATH",
@@ -46,15 +51,7 @@ export const CLAUDE_INJECTION_ENV = Object.freeze([
   "DYLD_INSERT_LIBRARIES",
   "DYLD_LIBRARY_PATH",
   "DYLD_FRAMEWORK_PATH",
-  // Anthropic endpoint, header, and config-directory selectors
-  "ANTHROPIC_BASE_URL",
-  "ANTHROPIC_BEDROCK_BASE_URL",
-  "ANTHROPIC_VERTEX_BASE_URL",
-  "ANTHROPIC_CUSTOM_HEADERS",
-  "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-  "CLAUDE_CODE_SKIP_VERTEX_AUTH",
-  "CLAUDE_CONFIG_DIR",
-  // Proxy selectors that would route token-bearing traffic; POSIX
+  // Proxy selectors that would route credential-bearing traffic; POSIX
   // environments are case-sensitive, so both spellings are listed.
   "HTTP_PROXY",
   "HTTPS_PROXY",
@@ -64,6 +61,29 @@ export const CLAUDE_INJECTION_ENV = Object.freeze([
   "https_proxy",
   "all_proxy",
   "no_proxy"
+]);
+// The process-integrity contract enforced automatically for every supported
+// agent, independent of the caller-declared requiredEnv/forbiddenEnv arrays.
+export const ACP_BASELINE_ENV_CONTRACT = Object.freeze({
+  requiredEnv: Object.freeze([]),
+  forbiddenEnv: ACP_INJECTION_ENV
+});
+// Anthropic/Claude-specific endpoint, header, and config-directory selectors,
+// layered on top of the agent-neutral baseline for Claude runs only.
+export const CLAUDE_PROVIDER_INJECTION_ENV = Object.freeze([
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_BEDROCK_BASE_URL",
+  "ANTHROPIC_VERTEX_BASE_URL",
+  "ANTHROPIC_CUSTOM_HEADERS",
+  "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+  "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+  "CLAUDE_CONFIG_DIR"
+]);
+// Full injection-capable set for the token-bearing Claude supervisor: the
+// agent-neutral baseline plus the Anthropic-specific selectors.
+export const CLAUDE_INJECTION_ENV = Object.freeze([
+  ...ACP_INJECTION_ENV,
+  ...CLAUDE_PROVIDER_INJECTION_ENV
 ]);
 // The credential contract enforced automatically for every Claude run,
 // independent of the caller-declared requiredEnv/forbiddenEnv arrays.
@@ -166,6 +186,27 @@ export function fail(code) {
 // Claude credential contract.
 export function isClaudeAgent(value) {
   return typeof value === "string" && value.trim().toLowerCase() === CLAUDE_AGENT;
+}
+
+// Centralized closed-set agent gate, shared by the config loader and the
+// in-memory runSupervisor path so both surface the same stable codes for
+// every supported agent. ACPX trims and lowercases agent names, so "Claude"
+// or " codex " would still resolve to a supported adapter while bypassing
+// every exact-match gate: a spelling that normalizes to a supported agent
+// but is not the exact canonical lowercase value fails
+// invalid_agent_not_canonical, and anything outside the closed set fails
+// invalid_agent_unsupported.
+export function assertCanonicalSupportedAgent(value) {
+  const normalized = typeof value === "string"
+    ? value.trim().toLowerCase()
+    : undefined;
+  if (normalized === undefined || !ACP_SUPPORTED_AGENTS.includes(normalized)) {
+    fail("invalid_agent_unsupported");
+  }
+  if (value !== normalized) {
+    fail("invalid_agent_not_canonical");
+  }
+  return value;
 }
 
 // Realpath-safe CLI entry guard. import.meta.url of an ESM main entry is
@@ -408,15 +449,17 @@ function assertReportingContract(reporting, context) {
 
 // In-memory backstop mirroring runStartReceiptPreflight: a config assembled
 // without loadSupervisorConfig must still carry a reporting bundle satisfying
-// the full pure acp-reporting-v1 contract, and it must fail closed with the
-// same bounded invalid_reporting_* codes before any runtime module import,
-// probe, or adapter startup.
+// the full pure reporting contract (acp-reporting-v2, or v1 for the bounded
+// canonical-Claude migration), bound to the canonical config agent, and it
+// must fail closed with the same bounded invalid_reporting_* codes before any
+// runtime module import, probe, or adapter startup.
 export function runReportingPreflight(config) {
   const lifecycle = isPlainObject(config.lifecycle) ? config.lifecycle : undefined;
   const receipt = lifecycle && isPlainObject(lifecycle.startReceipt)
     ? lifecycle.startReceipt
     : undefined;
   assertReportingContract(config.reporting, {
+    agent: config.agent,
     model: config.model,
     controlConversationId: lifecycle ? lifecycle.controlConversationId : undefined,
     lifecycleStartReceipt: receipt
@@ -569,6 +612,9 @@ export function runClaudeSupervisorPreflight(config, env, execArgv) {
   }
   // A spelling that ACPX would normalize to "claude" but is not the exact
   // canonical value gets the Claude gate, not a pass into the generic path.
+  // runSupervisor's centralized closed-set gate already rejects it with
+  // invalid_agent_not_canonical; this branch keeps the guard fail-closed as
+  // defense in depth when it is invoked directly.
   if (config.agent !== CLAUDE_AGENT) {
     fail("claude_agent_not_canonical");
   }
@@ -638,12 +684,11 @@ export function loadSupervisorConfig(configPath) {
   }
 
   const agent = assertIdentifier(raw.agent, "invalid_agent", 128);
-  // ACPX trims and lowercases agent names, so "Claude" would still resolve to
-  // the Claude adapter while bypassing every agent === "claude" gate. Only the
-  // canonical spelling is accepted.
-  if (isClaudeAgent(agent) && agent !== CLAUDE_AGENT) {
-    fail("invalid_agent_not_canonical");
-  }
+  // The closed supported set is enforced before any other filesystem access
+  // or config parsing: an unsupported or non-canonical agent never reaches
+  // the cwd/prompt/response probes, the auth parser, or the reporting
+  // contract, and fails with the same stable code on every path.
+  assertCanonicalSupportedAgent(agent);
   let auth;
   if (agent === CLAUDE_AGENT) {
     auth = parseClaudeAuthProfile(raw.auth);
@@ -688,24 +733,29 @@ export function loadSupervisorConfig(configPath) {
       fail("invalid_env_contract_overlap");
     }
   }
-  if (agent === CLAUDE_AGENT) {
-    // The Claude credential contract is enforced automatically at run time;
-    // a caller-declared contract that contradicts it is invalid config.
-    const implicitForbidden = new Set(
-      CLAUDE_IMPLICIT_ENV_CONTRACT.forbiddenEnv.map((name) => name.toUpperCase())
-    );
-    const implicitRequired = new Set(
-      CLAUDE_IMPLICIT_ENV_CONTRACT.requiredEnv.map((name) => name.toUpperCase())
-    );
-    for (const name of requiredEnv) {
-      if (implicitForbidden.has(name.toUpperCase())) {
-        fail("invalid_env_contract_overlap");
-      }
+  // An implicit environment contract is enforced automatically at run time
+  // for every supported agent — the agent-neutral process-integrity baseline,
+  // widened to the full Claude credential contract for agent "claude" — so a
+  // caller-declared contract that contradicts it is invalid config: requiring
+  // an implicitly forbidden variable (or forbidding an implicitly required
+  // one) under any letter case fails invalid_env_contract_overlap.
+  const implicitContract = agent === CLAUDE_AGENT
+    ? CLAUDE_IMPLICIT_ENV_CONTRACT
+    : ACP_BASELINE_ENV_CONTRACT;
+  const implicitForbidden = new Set(
+    implicitContract.forbiddenEnv.map((name) => name.toUpperCase())
+  );
+  const implicitRequired = new Set(
+    implicitContract.requiredEnv.map((name) => name.toUpperCase())
+  );
+  for (const name of requiredEnv) {
+    if (implicitForbidden.has(name.toUpperCase())) {
+      fail("invalid_env_contract_overlap");
     }
-    for (const name of forbiddenEnv) {
-      if (implicitRequired.has(name.toUpperCase())) {
-        fail("invalid_env_contract_overlap");
-      }
+  }
+  for (const name of forbiddenEnv) {
+    if (implicitRequired.has(name.toUpperCase())) {
+      fail("invalid_env_contract_overlap");
     }
   }
 
@@ -727,11 +777,16 @@ export function loadSupervisorConfig(configPath) {
     : assertIdentifier(raw.model, "invalid_model", 256);
 
   // Mandatory reporting bundle, validated last so every structural field it
-  // binds to (model, lifecycle receipt) is already trusted, and before any
-  // runtime import, probe, or adapter startup can occur. The context receipt
-  // uses the parsed lifecycle's original deliveredAt spelling: the contract
-  // compares it byte-for-byte against the caller-attested lifecycle receipt.
+  // binds to (agent, model, lifecycle receipt) is already trusted, and before
+  // any runtime import, probe, or adapter startup can occur. Binding the
+  // canonical agent here is what makes the public harness label unforgeable:
+  // the contract derives the label from its closed mapping and this agent,
+  // and rejects an unsupported agent with invalid_reporting_agent. The
+  // context receipt uses the parsed lifecycle's original deliveredAt
+  // spelling: the contract compares it byte-for-byte against the
+  // caller-attested lifecycle receipt.
   const reporting = assertReportingContract(raw.reporting, {
+    agent,
     model,
     controlConversationId: lifecycle.controlConversationId,
     lifecycleStartReceipt: {
@@ -1410,9 +1465,19 @@ export async function runSupervisor(config, dependencies = {}) {
     : process.execArgv;
 
   try {
+    // The closed-set agent gate runs first so a config assembled in memory
+    // carries the same stable canonical error semantics as the loader for
+    // every supported agent — no order-dependent asymmetry between the
+    // Claude route guard and the reporting backstop.
+    assertCanonicalSupportedAgent(config.agent);
     runStartReceiptPreflight(config, now());
-    runReportingPreflight(config);
+    // Agent-neutral process-integrity baseline, enforced for every supported
+    // agent before any runtime module import — even when the caller-declared
+    // requiredEnv/forbiddenEnv arrays are empty. The Claude route guard then
+    // layers the provider-specific credential contract on top.
+    runEnvironmentPreflight(ACP_BASELINE_ENV_CONTRACT, environment);
     runClaudeSupervisorPreflight(config, environment, execArgv);
+    runReportingPreflight(config);
     runEnvironmentPreflight(config, environment);
     preparePrivateStateDirectory(config.stateDir);
     if (fs.existsSync(config.responseFile)) {
