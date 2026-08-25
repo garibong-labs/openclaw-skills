@@ -91,7 +91,11 @@ export function createAcpRuntime() {
     "--config",
     configFile
   ], {
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    // Canonical codex runs require the operator-injected executable path
+    // before any runtime surface; the test's own node binary satisfies the
+    // absolute-regular-executable contract.
+    env: { ...process.env, CODEX_PATH: process.execPath }
   });
   let stdout = "";
   let stderr = "";

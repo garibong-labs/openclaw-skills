@@ -20,6 +20,8 @@ import {
   CLAUDE_OAUTH_TOKEN_ENV,
   CLAUDE_PROVIDER_INJECTION_ENV,
   CODEX_DEFAULT_MODEL,
+  CODEX_IMPLICIT_ENV_CONTRACT,
+  CODEX_PATH_ENV,
   EXIT_CODES,
   assertCanonicalSupportedAgent,
   buildPermissionHandler,
@@ -28,19 +30,29 @@ import {
   discoverRuntimeLocation,
   isClaudeAgent,
   isCliEntry,
+  isCodexAgent,
   isUnsupportedSessionCloseCleanupError,
   loadSupervisorConfig,
   main,
   normalizeRuntimeEvent,
   resolveConfiguredModel,
   runClaudeSupervisorPreflight,
+  runCodexSupervisorPreflight,
   runReportingPreflight,
   runStartReceiptPreflight,
   runSupervisor,
   validateClaudeAuthEnvFile,
+  validateCodexExecutablePath,
   validateRuntimeModuleExports
 } from "./acpx-foreground-supervisor.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
+
+// Canonical codex runs require the operator-injected CODEX_PATH before any
+// runtime surface. Tests that omit the env dependency inherit process.env, so
+// the suite injects the contract the way an operator would; the test
+// process's own node binary is an absolute, existing, executable regular
+// file.
+process.env[CODEX_PATH_ENV] = process.execPath;
 
 const CONTROL_CONVERSATION_ID = "100000000000000001";
 const START_MESSAGE_ID = "100000000000000002";
@@ -1091,6 +1103,7 @@ test("satisfied environment contract reaches the runtime without value disclosur
     runtimeModule: module,
     bindSignals: false,
     env: {
+      [CODEX_PATH_ENV]: process.execPath,
       ACP_TEST_REQUIRED_TOKEN: "REQUIRED_SECRET_VALUE",
       ACP_TEST_FORBIDDEN_TOKEN: ""
     },
@@ -1106,8 +1119,14 @@ test("satisfied environment contract reaches the runtime without value disclosur
 
 test("missing and empty required variables fail closed before adapter creation", async () => {
   for (const [env, code] of [
-    [{}, "required_env_missing:ACP_TEST_REQUIRED_TOKEN"],
-    [{ ACP_TEST_REQUIRED_TOKEN: "" }, "required_env_empty:ACP_TEST_REQUIRED_TOKEN"]
+    [
+      { [CODEX_PATH_ENV]: process.execPath },
+      "required_env_missing:ACP_TEST_REQUIRED_TOKEN"
+    ],
+    [
+      { [CODEX_PATH_ENV]: process.execPath, ACP_TEST_REQUIRED_TOKEN: "" },
+      "required_env_empty:ACP_TEST_REQUIRED_TOKEN"
+    ]
   ]) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-env-required-"));
     const { module, state } = makeRuntimeModule();
@@ -1139,7 +1158,10 @@ test("non-empty forbidden variable fails closed without value disclosure", async
   }), {
     runtimeModule: module,
     bindSignals: false,
-    env: { ACP_TEST_FORBIDDEN_TOKEN: "FORBIDDEN_SECRET_VALUE" },
+    env: {
+      [CODEX_PATH_ENV]: process.execPath,
+      ACP_TEST_FORBIDDEN_TOKEN: "FORBIDDEN_SECRET_VALUE"
+    },
     writeEvent(event) {
       emitted.push(event);
     }
@@ -1159,7 +1181,7 @@ test("failed environment preflight precedes dynamic runtime loading and probing"
     runtimeModule: path.join(root, "missing-runtime")
   }), {
     bindSignals: false,
-    env: {},
+    env: { [CODEX_PATH_ENV]: process.execPath },
     writeEvent(event) {
       emitted.push(event);
     }
@@ -2882,7 +2904,10 @@ test("non-claude agents keep the generic environment contract without argv proof
   }), {
     runtimeModule: module,
     bindSignals: false,
-    env: { ACP_TEST_REQUIRED_TOKEN: "present" },
+    env: {
+      [CODEX_PATH_ENV]: process.execPath,
+      ACP_TEST_REQUIRED_TOKEN: "present"
+    },
     execArgv: [],
     writeEvent(event) {
       emitted.push(event);
@@ -3355,7 +3380,10 @@ test("provider-neutral injection baseline is implicitly forbidden for codex", as
   const exitCode = await runSupervisor(makeConfig(okRoot), {
     runtimeModule: module,
     bindSignals: false,
-    env: Object.fromEntries(ACP_INJECTION_ENV.map((name) => [name, ""])),
+    env: {
+      ...Object.fromEntries(ACP_INJECTION_ENV.map((name) => [name, ""])),
+      [CODEX_PATH_ENV]: process.execPath
+    },
     writeEvent(event) {
       emitted.push(event);
     }
@@ -3442,6 +3470,212 @@ test("claude keeps the superset of baseline plus anthropic-specific selectors", 
   assert.deepEqual([...CLAUDE_IMPLICIT_ENV_CONTRACT.requiredEnv], [CLAUDE_OAUTH_TOKEN_ENV]);
   assert.ok(Object.isFrozen(CLAUDE_PROVIDER_INJECTION_ENV));
   assert.ok(Object.isFrozen(CLAUDE_INJECTION_ENV));
+});
+
+test("codex implicit contract requires an operator-injected CODEX_PATH", async () => {
+  assert.equal(CODEX_PATH_ENV, "CODEX_PATH");
+  assert.ok(Object.isFrozen(CODEX_IMPLICIT_ENV_CONTRACT));
+  assert.deepEqual([...CODEX_IMPLICIT_ENV_CONTRACT.requiredEnv], [CODEX_PATH_ENV]);
+  // The shared injection baseline is preserved, not replaced: the Codex
+  // contract forbids exactly the agent-neutral set.
+  assert.deepEqual(
+    [...CODEX_IMPLICIT_ENV_CONTRACT.forbiddenEnv],
+    [...ACP_INJECTION_ENV]
+  );
+  // Claude non-regression: the Claude contract neither requires nor forbids
+  // the Codex executable path.
+  assert.equal(CLAUDE_IMPLICIT_ENV_CONTRACT.requiredEnv.includes(CODEX_PATH_ENV), false);
+  assert.equal(CLAUDE_IMPLICIT_ENV_CONTRACT.forbiddenEnv.includes(CODEX_PATH_ENV), false);
+
+  assert.equal(isCodexAgent("codex"), true);
+  assert.equal(isCodexAgent("Codex"), true);
+  assert.equal(isCodexAgent(" codex "), true);
+  assert.equal(isCodexAgent("codex-x"), false);
+  assert.equal(isCodexAgent(7), false);
+
+  // The exported Codex route guard is inert for other agents, keeps its own
+  // non-canonical rejection as defense in depth, and enforces the implicit
+  // contract even when the caller-declared arrays are empty.
+  assert.equal(runCodexSupervisorPreflight({ agent: "claude" }, {}), undefined);
+  assert.throws(
+    () => runCodexSupervisorPreflight(
+      { agent: "Codex" },
+      { [CODEX_PATH_ENV]: process.execPath }
+    ),
+    { message: "codex_agent_not_canonical", code: "codex_agent_not_canonical" }
+  );
+
+  // In-memory runs: missing and empty keep the sanitized generic
+  // required-env codes, fail before any runtime module access or state
+  // directory creation, and disclose no value.
+  for (const [env, code] of [
+    [{}, "required_env_missing:" + CODEX_PATH_ENV],
+    [{ [CODEX_PATH_ENV]: "" }, "required_env_empty:" + CODEX_PATH_ENV]
+  ]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-path-req-"));
+    const { module, state } = makeRuntimeModule();
+    const config = makeConfig(root);
+    const emitted = [];
+    const exitCode = await runSupervisor(config, {
+      runtimeModule: module,
+      bindSignals: false,
+      env,
+      writeEvent(event) {
+        emitted.push(event);
+      }
+    });
+    assert.equal(exitCode, EXIT_CODES.supervisorError, code);
+    assert.equal(emitted.at(-1).type, "supervisor_error", code);
+    assert.equal(emitted.at(-1).code, code);
+    assert.equal(state.runtimeOptions, undefined, code);
+    assert.equal(fs.existsSync(config.stateDir), false, code);
+  }
+
+  // The implicit Codex contract precedes the caller-declared generic
+  // contract, exactly like the implicit Claude contract.
+  const orderRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-path-order-"));
+  const orderEmitted = [];
+  const orderExit = await runSupervisor(makeConfig(orderRoot, {
+    requiredEnv: ["ACP_TEST_REQUIRED_TOKEN"],
+    runtimeModule: path.join(orderRoot, "missing-runtime")
+  }), {
+    bindSignals: false,
+    env: {},
+    writeEvent(event) {
+      orderEmitted.push(event);
+    }
+  });
+  assert.equal(orderExit, EXIT_CODES.supervisorError);
+  assert.equal(orderEmitted.at(-1).code, "required_env_missing:" + CODEX_PATH_ENV);
+});
+
+test("codex path validation fails closed on shape, existence, type, and executability", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-path-shape-"));
+  const nonExecutable = path.join(root, "codex-non-exec");
+  fs.writeFileSync(nonExecutable, "#!/bin/sh\n", { mode: 0o600 });
+  const cases = [
+    ["bin/codex", "codex_path_not_absolute"],
+    [path.join(root, "missing-codex"), "codex_path_missing"],
+    [root, "codex_path_not_regular"],
+    [nonExecutable, "codex_path_not_executable"]
+  ];
+  for (const [value, code] of cases) {
+    assert.throws(
+      () => validateCodexExecutablePath(value),
+      { message: code, code },
+      code
+    );
+  }
+  // Non-string and over-length values are invalid shape, not a crash.
+  for (const value of [undefined, 7, "", "/" + "a".repeat(4096)]) {
+    assert.throws(
+      () => validateCodexExecutablePath(value),
+      { code: "codex_path_not_absolute" }
+    );
+  }
+
+  // Through runSupervisor: each class is a bounded supervisor_error emitted
+  // before the runtime module is ever touched, and the rejected path value is
+  // never echoed or hashed into events.
+  for (const [value, code] of cases) {
+    const caseRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-path-case-"));
+    const config = makeConfig(caseRoot, {
+      runtimeModule: path.join(caseRoot, "missing-runtime")
+    });
+    const emitted = [];
+    const exitCode = await runSupervisor(config, {
+      bindSignals: false,
+      env: { [CODEX_PATH_ENV]: value },
+      writeEvent(event) {
+        emitted.push(event);
+      }
+    });
+    assert.equal(exitCode, EXIT_CODES.supervisorError, code);
+    assert.equal(emitted.at(-1).type, "supervisor_error", code);
+    assert.equal(emitted.at(-1).code, code);
+    assert.equal(fs.existsSync(config.stateDir), false, code);
+    assert.equal(JSON.stringify(emitted).includes(value), false, code);
+  }
+});
+
+test("codex symlink entrypoint stays valid and reaches the runtime", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-path-symlink-"));
+  // A Homebrew-style bin symlink to a regular executable target is a valid
+  // entrypoint: resolution follows the link instead of rejecting it.
+  const link = path.join(root, "codex-link");
+  fs.symlinkSync(process.execPath, link);
+  validateCodexExecutablePath(link);
+
+  const { module, state } = makeRuntimeModule({
+    events: [{ type: "text_delta", stream: "output", text: "bounded result" }]
+  });
+  const config = makeConfig(root);
+  const emitted = [];
+  const exitCode = await runSupervisor(config, {
+    runtimeModule: module,
+    bindSignals: false,
+    env: { [CODEX_PATH_ENV]: link },
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.completed);
+  assert.ok(state.runtimeOptions);
+  assert.equal(JSON.stringify(emitted).includes(link), false);
+});
+
+test("codex config cannot forbid the implicitly required CODEX_PATH", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-path-overlap-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
+  let caseIndex = 0;
+  const writeCase = (extra) => {
+    caseIndex += 1;
+    const file = path.join(root, "case-" + String(caseIndex) + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent: "codex",
+      model: "test-model",
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile: path.join(root, "response-" + String(caseIndex) + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: root,
+      timeoutMs: 30000,
+      lifecycle,
+      reporting: validReporting(lifecycle),
+      allowKinds: ["read"],
+      ...extra
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  // Forbidding the implicitly required executable path contradicts the
+  // Codex contract under any letter case and fails config loading.
+  for (const name of ["CODEX_PATH", "codex_path", "Codex_Path"]) {
+    assert.throws(
+      () => loadSupervisorConfig(writeCase({ forbiddenEnv: [name] })),
+      { message: "invalid_env_contract_overlap", code: "invalid_env_contract_overlap" },
+      name
+    );
+  }
+
+  // Restating CODEX_PATH as required is consistent, not contradictory.
+  const consistent = loadSupervisorConfig(writeCase({
+    requiredEnv: ["CODEX_PATH"]
+  }));
+  assert.deepEqual(consistent.requiredEnv, ["CODEX_PATH"]);
+
+  // Claude non-regression: the Codex contract is codex-scoped, so a claude
+  // config declaring CODEX_PATH forbidden keeps the generic semantics.
+  const claudeFile = writeCase({
+    agent: "claude",
+    auth: { kind: CLAUDE_AUTH_KIND, envFile: "/private/claude-acp-oauth.env" },
+    reporting: validReporting(lifecycle, { agent: "claude" }),
+    forbiddenEnv: ["CODEX_PATH"]
+  });
+  assert.deepEqual(loadSupervisorConfig(claudeFile).forbiddenEnv, ["CODEX_PATH"]);
 });
 
 test("codex run completes end to end with the codex identity", async () => {
