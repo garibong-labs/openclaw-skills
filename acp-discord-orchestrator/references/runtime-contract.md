@@ -16,6 +16,7 @@ This reference defines the compatibility and evidence boundary for the direct AC
 - [Event identity](#event-identity)
 - [Evidence boundary](#evidence-boundary)
 - [Stable exits](#stable-exits)
+- [Host activation and lifecycle ledger](#host-activation-and-lifecycle-ledger)
 - [Process liveness](#process-liveness)
 - [Host wait boundaries](#host-wait-boundaries)
 - [Cancellation](#cancellation)
@@ -46,11 +47,11 @@ Fail closed on incompatible capability changes. Never fall back to another ACP r
 
 ## Private input and output
 
-Pass only one command-line value: an absolute private config-file path.
+Pass only one command-line value: an absolute private config-file path. After launch, the only accepted stdin control is one bounded host-activation record described in [Host activation and lifecycle ledger](#host-activation-and-lifecycle-ledger); it carries the exact tracked host-process handle and is never emitted publicly.
 
 The config points to a separate private prompt file and a response-file path that must not exist yet. Reject config or prompt symlinks. On POSIX systems, config and prompt files must have no group or world permissions. Require an existing state directory to be a real directory with owner-only permissions; do not repair broad permissions by changing them.
 
-The supervisor writes the model response to the response file with owner-only permissions. Raw response text is not included in normalized progress events.
+The supervisor writes the model response to the response file with owner-only permissions. Raw response text is not included in normalized progress events. The owner-only state directory also receives one `supervisor-<runId>.lifecycle.json` ledger for the run; it contains host tracking evidence and must never be copied into a public watchdog payload.
 
 ## Config fields
 
@@ -61,7 +62,7 @@ Required:
 - `sessionKey`: unique task identity
 - `promptFile`: absolute existing private file
 - `responseFile`: absolute new private file
-- `stateDir`: absolute private runtime state directory
+- `stateDir`: absolute private runtime state directory; before runtime loading the supervisor creates one owner-only host lifecycle ledger beneath this directory
 - `runtimeModule`: absolute ACPX package root or runtime module file
 - `allowKinds`: non-empty tool-kind allowlist that excludes the unclassified `other` kind
 - `timeoutMs`: positive turn deadline independent of watchdog cadence; the template ships a two-hour emergency ceiling, configurable per run
@@ -206,7 +207,7 @@ Normalize event payloads. Allow only bounded protocol-token forms for tags, tool
 
 A timer-driven progress event is a snapshot. `evidenceAgeMs` exposes the age of the last actual ACP event so consumers do not mislabel an old snapshot as fresh activity.
 
-Only the matching turn `result` determines terminal state. A successfully emitted `terminal` or `supervisor_error` event closes normalized output; no later ACP activity is delivered. Terminal events omit the working-directory name and response fingerprint.
+`activation_required` and `activation_confirmed` are host-control events, not ACP activity evidence. They contain no process handle. Only the matching turn `result` determines ACP terminal state. A successfully emitted `terminal` or `supervisor_error` event closes normalized output; no later ACP activity is delivered. Terminal events omit the working-directory name and response fingerprint.
 
 ## Stable exits
 
@@ -224,11 +225,31 @@ After `main()` resolves, the CLI bounds stdout/stderr flushing and then exits wi
 
 Do not collapse cancellation or failure into success.
 
+## Host activation and lifecycle ledger
+
+The supervisor starts in `activation_required` and creates its owner-private lifecycle ledger before importing ACPX. It must not load the runtime module, probe the adapter, call `ensureSession`, or call `startTurn` until the tracked host exec has returned an exact non-empty process handle and the caller writes one newline-terminated activation record through that same handle's stdin:
+
+```json
+{"schemaVersion":"acp-host-activation.v1","processHandle":"<exact-host-handle>"}
+```
+
+The record is bounded to 512 bytes, has exactly those two keys, and accepts only a 1–128 character process-handle token composed of alphanumerics plus `. _ : -`. The default activation deadline is 15 seconds. EOF, timeout, stream error, malformed JSON, unknown keys, a wrong schema, or an invalid handle fails closed before runtime import with `activation_eof`, `activation_timeout`, `activation_input_error`, `activation_invalid`, or `activation_invalid_process_handle` and exit 22. The handle value is stored only in the private ledger and is never included in normalized events.
+
+The ledger schema is `acp-host-lifecycle.v1`. It records the supervisor run/request IDs, exact process handle, activation time, latest durably sampled normalized event, terminal intent, and expected mapped exit. High-rate `activity` events are persisted at most once per second; control, progress, started, permission, terminal, and supervisor-error events flush immediately. A terminal event is still not a confirmed host exit: the ledger remains `terminal_intent` with exit reconciliation pending.
+
+After the exact tracked handle returns its process exit, the caller writes an owner-private JSON input containing `ledgerFile`, the same `processHandle`, `outcome: "exited"`, and the mapped `exitCode`, then runs:
+
+```bash
+node /absolute/path/to/acp-discord-orchestrator/scripts/acp-lifecycle-reconcile-cli.mjs --input /absolute/private/reconcile.json
+```
+
+The reconciliation CLI requires a private non-symlink input file, verifies handle and exit-code equality against the ledger, and then records `exit_reconciled`. When the exact handle is dead and no terminal intent exists, the caller instead supplies `outcome: "tracking_lost"` with no exit code; the ledger records the stable `tracking_lost` fault. A terminal intent cannot be rewritten as tracking loss, a missing terminal cannot be reconciled as success, and a mismatched handle or exit code fails closed. `tracking_lost` never authorizes automatic success or automatic relaunch.
+
 ## Process liveness
 
 Session existence, adapter process existence, supervisor process existence, child-shell existence, and Discord typing state do not prove that the ACP turn is still active.
 
-Their disappearance also does not replace the exact turn result.
+Their disappearance also does not replace the exact turn result. `active + dead exact handle + no terminal intent` is a `tracking_lost` control-plane fault, not ACP success, failure, or cancellation.
 
 ## Host wait boundaries
 
@@ -239,13 +260,14 @@ The caller contract is:
 - start the supervisor through one tracked foreground host exec;
 - bound the initial host wait to five seconds unless the process is already terminal;
 - retain the exact non-empty process handle the host reports for that run;
+- write the exact `acp-host-activation.v1` record through that same handle before any ACP runtime mutation;
 - poll only that handle, waiting 1, 2, 4, and then 5 seconds, capped at five seconds;
 - service steered control-surface input at each returned poll boundary and continue the same turn unless the message explicitly cancels or replaces it;
-- report completion only after both the matching normalized terminal event and the mapped process exit.
+- report completion only after both the matching normalized terminal event and the mapped process exit, followed by successful private-ledger reconciliation.
 
 One run has one handle. Do not open a second handle, PID search, transcript poll, broad process monitor, long shell sleep, long blocking exec or write wait, or nested wrapper for the same run.
 
-A returned poll is evidence about the host boundary only. It is not activity evidence, and it is never terminal evidence. Bounded host waits change when the caller regains control; they do not change the evidence boundary, the stable exits, or cancellation.
+A returned poll is evidence about the host boundary only. It is not activity evidence, and it is never terminal evidence. Bounded host waits change when the caller regains control; they do not change the evidence boundary, the stable exits, or cancellation. The owner must not end or yield the controlling turn while the retained handle is active. If a later poll reports a dead/missing handle without terminal intent, reconcile `tracking_lost` once and stop every active-reporting publisher.
 
 ## Cancellation
 
@@ -261,5 +283,5 @@ This contract does not:
 - guarantee containment of arbitrary foreground code that daemonizes internally;
 - leave the watchdog interval, destination routing, or public message templates caller-defined — the [Reporting contract](#reporting-contract) fixes them generically, and only the bounded free-text slots plus the actual (organization-private) channel identifiers vary per run;
 - prove that the attested start message or watchdog snapshot exists outside the config;
-- define host-specific stale-session detection or recovery;
+- discover or reconstruct a lost host handle from a PID, transcript, or process search;
 - make an official ACP child thread observable by the direct supervisor.

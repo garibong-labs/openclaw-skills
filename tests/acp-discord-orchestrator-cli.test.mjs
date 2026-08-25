@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { buildValidReporting } from "../acp-discord-orchestrator/scripts/acp-reporting-test-fixture.mjs";
 
 const SUPERVISOR_ERROR_EXIT = 22;
+const LIFECYCLE_SCHEMA_VERSION = "acp-host-lifecycle.v1";
 
 const CONTROL_CONVERSATION_ID = "100000000000000001";
 const START_MESSAGE_ID = "100000000000000002";
@@ -35,8 +36,11 @@ test("CLI exits with the mapped code despite a leaked runtime handle", {
   const responseFile = path.join(root, "response.txt");
   const configFile = path.join(root, "run.json");
   const stateDir = path.join(root, "state");
+  const importMarker = path.join(root, "runtime-imported");
 
   fs.writeFileSync(runtimeFile, `
+import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(importMarker)}, "imported");
 export function createRuntimeStore() { return {}; }
 export function createAgentRegistry() { return {}; }
 export function createAcpRuntime() {
@@ -91,7 +95,7 @@ export function createAcpRuntime() {
     "--config",
     configFile
   ], {
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
     // Canonical codex runs require the operator-injected executable path
     // before any runtime surface; the test's own node binary satisfies the
     // absolute-regular-executable contract.
@@ -105,6 +109,26 @@ export function createAcpRuntime() {
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
+
+  const activationRequired = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("activation gate was not emitted")), 1000);
+    const inspect = () => {
+      if (stdout.includes('"type":"activation_required"')) {
+        clearTimeout(timer);
+        child.stdout.off("data", inspect);
+        resolve();
+      }
+    };
+    child.stdout.on("data", inspect);
+    inspect();
+  });
+
+  await activationRequired;
+  assert.equal(fs.existsSync(importMarker), false);
+  child.stdin.end(JSON.stringify({
+    schemaVersion: "acp-host-activation.v1",
+    processHandle: "cli-session-42"
+  }) + "\n");
 
   const outcome = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -127,11 +151,123 @@ export function createAcpRuntime() {
   });
   assert.equal(stderr, "");
   assert.equal(fs.existsSync(responseFile), true);
+  assert.equal(fs.existsSync(importMarker), true);
   const events = stdout.trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(events[0].type, "activation_required");
+  assert.equal(events[1].type, "activation_confirmed");
   assert.equal(events.at(-1).type, "terminal");
   assert.equal(events.at(-1).status, "completed");
   assert.equal(events.at(-1).supervisorStatus, "degraded");
   assert.equal(events.at(-1).cleanupOk, false);
+});
+
+const LIFECYCLE_RECONCILE_CLI = fileURLToPath(new URL(
+  "../acp-discord-orchestrator/scripts/acp-lifecycle-reconcile-cli.mjs",
+  import.meta.url
+));
+
+function runLifecycleReconcileCli(inputFile) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      LIFECYCLE_RECONCILE_CLI,
+      "--input",
+      inputFile
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+function writeLifecycleLedger(root, overrides = {}) {
+  const timestamp = new Date().toISOString();
+  const ledgerFile = path.join(root, "supervisor-run-1.lifecycle.json");
+  fs.writeFileSync(ledgerFile, JSON.stringify({
+    schemaVersion: LIFECYCLE_SCHEMA_VERSION,
+    runId: "run-1",
+    requestId: "request-1",
+    processHandle: "cli-session-42",
+    state: "terminal_intent",
+    activatedAt: timestamp,
+    lastEvent: { type: "terminal", sequence: 4, timestamp },
+    terminalIntent: { type: "terminal", status: "completed" },
+    exitReconciliation: { status: "pending", expectedExitCode: 0 },
+    trackingFault: null,
+    updatedAt: timestamp,
+    ...overrides
+  }, null, 2) + "\n", { mode: 0o600 });
+  return ledgerFile;
+}
+
+test("lifecycle reconciliation CLI confirms mapped exit without exposing private input", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reconcile-cli-"));
+  const ledgerFile = writeLifecycleLedger(root);
+  const inputFile = path.join(root, "reconcile.json");
+  fs.writeFileSync(inputFile, JSON.stringify({
+    ledgerFile,
+    processHandle: "cli-session-42",
+    outcome: "exited",
+    exitCode: 0
+  }), { mode: 0o600 });
+
+  const outcome = await runLifecycleReconcileCli(inputFile);
+  assert.equal(outcome.code, 0);
+  assert.equal(outcome.stderr, "");
+  assert.deepEqual(JSON.parse(outcome.stdout), {
+    schemaVersion: LIFECYCLE_SCHEMA_VERSION,
+    type: "lifecycle_reconciled",
+    status: "exit_reconciled"
+  });
+  const ledger = JSON.parse(fs.readFileSync(ledgerFile, "utf8"));
+  assert.equal(ledger.exitReconciliation.status, "confirmed");
+  assert.equal(ledger.exitReconciliation.exitCode, 0);
+  assert.equal(outcome.stdout.includes(root), false);
+  assert.equal(outcome.stdout.includes("cli-session-42"), false);
+});
+
+test("lifecycle reconciliation CLI records tracking_lost and rejects mismatched handles", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reconcile-lost-"));
+  const ledgerFile = writeLifecycleLedger(root, {
+    state: "active",
+    lastEvent: {
+      type: "started",
+      sequence: 3,
+      timestamp: new Date().toISOString()
+    },
+    terminalIntent: null,
+    exitReconciliation: { status: "pending" }
+  });
+  const mismatchInput = path.join(root, "mismatch.json");
+  fs.writeFileSync(mismatchInput, JSON.stringify({
+    ledgerFile,
+    processHandle: "wrong-session",
+    outcome: "tracking_lost"
+  }), { mode: 0o600 });
+  const mismatch = await runLifecycleReconcileCli(mismatchInput);
+  assert.equal(mismatch.code, 64);
+  assert.equal(mismatch.stdout, "");
+  assert.equal(JSON.parse(mismatch.stderr).code, "lifecycle_handle_mismatch");
+  assert.equal(mismatch.stderr.includes(root), false);
+  assert.equal(mismatch.stderr.includes("wrong-session"), false);
+
+  const lostInput = path.join(root, "lost.json");
+  fs.writeFileSync(lostInput, JSON.stringify({
+    ledgerFile,
+    processHandle: "cli-session-42",
+    outcome: "tracking_lost"
+  }), { mode: 0o600 });
+  const lost = await runLifecycleReconcileCli(lostInput);
+  assert.equal(lost.code, 0);
+  assert.equal(JSON.parse(lost.stdout).status, "tracking_lost");
+  const ledger = JSON.parse(fs.readFileSync(ledgerFile, "utf8"));
+  assert.equal(ledger.trackingFault.code, "tracking_lost");
 });
 
 // ---------------------------------------------------------------------------
