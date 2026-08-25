@@ -1193,6 +1193,340 @@ export function containsDetachedShell(command) {
   return false;
 }
 
+function splitShellSegments(command) {
+  if (typeof command !== "string") {
+    return null;
+  }
+
+  const segments = [];
+  let words = [];
+  let token = "";
+  let tokenStarted = false;
+  let quote = null;
+  let escaped = false;
+
+  const pushToken = () => {
+    if (!tokenStarted) {
+      return;
+    }
+    words.push(token);
+    token = "";
+    tokenStarted = false;
+  };
+  const pushSegment = () => {
+    pushToken();
+    if (words.length > 0) {
+      segments.push(words);
+      words = [];
+    }
+  };
+
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (escaped) {
+      token += character;
+      tokenStarted = true;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaped = true;
+      tokenStarted = true;
+      continue;
+    }
+    if (quote !== null) {
+      if (character === quote) {
+        quote = null;
+      } else {
+        token += character;
+      }
+      tokenStarted = true;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      tokenStarted = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      pushToken();
+      if (character === "\n" || character === "\r") {
+        pushSegment();
+      }
+      continue;
+    }
+    if (";&|()".includes(character)) {
+      pushSegment();
+      continue;
+    }
+    token += character;
+    tokenStarted = true;
+  }
+
+  if (escaped || quote !== null) {
+    return null;
+  }
+  pushSegment();
+  return segments;
+}
+
+function commandBasename(value) {
+  if (typeof value !== "string" || value.length === 0) {
+    return "";
+  }
+  return value.replace(/\\/g, "/").split("/").at(-1).toLowerCase();
+}
+
+function isShellAssignment(value) {
+  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(value);
+}
+
+function gitCommandIsRemoteAction(words, gitIndex) {
+  let index = gitIndex + 1;
+  const optionsWithSeparateValue = new Set([
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--config-env"
+  ]);
+
+  while (index < words.length) {
+    const value = words[index];
+    if (value === "--") {
+      index += 1;
+      break;
+    }
+    if (value === "-c") {
+      const assignment = words[index + 1] || "";
+      if (/^alias\.[^=]+=/.test(assignment.toLowerCase())) {
+        return true;
+      }
+      index += 2;
+      continue;
+    }
+    if (/^-calias\.[^=]+=/i.test(value)) {
+      return true;
+    }
+    if (optionsWithSeparateValue.has(value)) {
+      index += 2;
+      continue;
+    }
+    if (value.startsWith("-")) {
+      index += 1;
+      continue;
+    }
+    break;
+  }
+
+  const subcommand = (words[index] || "").toLowerCase();
+  if (subcommand === "push" || subcommand === "send-pack") {
+    return true;
+  }
+  if (subcommand === "lfs") {
+    const lfsSubcommand = words.slice(index + 1).find((value) => !value.startsWith("-"));
+    return lfsSubcommand && lfsSubcommand.toLowerCase() === "push";
+  }
+  if (subcommand === "config") {
+    const configArgs = words.slice(index + 1);
+    const aliasIndex = configArgs.findIndex((value) => /^alias\.[^=]+(?:=|$)/i.test(value));
+    if (aliasIndex < 0) {
+      return false;
+    }
+    const readOnlyModes = new Set(["--get", "--get-all", "--get-regexp"]);
+    if (configArgs.some((value) => readOnlyModes.has(value))) {
+      return false;
+    }
+    return configArgs[aliasIndex].includes("=") || aliasIndex < configArgs.length - 1;
+  }
+  return false;
+}
+
+function segmentContainsRemoteVcsAction(words, depth) {
+  if (!Array.isArray(words) || words.length === 0 || depth > 4) {
+    return false;
+  }
+
+  let index = 0;
+  let gitConfigInjection = false;
+  while (index < words.length && isShellAssignment(words[index])) {
+    if (/^GIT_CONFIG_(?:COUNT|KEY_[0-9]+|VALUE_[0-9]+)=/i.test(words[index])) {
+      gitConfigInjection = true;
+    }
+    index += 1;
+  }
+  if (index >= words.length) {
+    return false;
+  }
+
+  let executable = commandBasename(words[index]);
+  if (executable === "env") {
+    index += 1;
+    while (index < words.length) {
+      const value = words[index];
+      if (value === "--") {
+        index += 1;
+        break;
+      }
+      if (value === "-u" || value === "--unset" || value === "-C" || value === "--chdir") {
+        index += 2;
+        continue;
+      }
+      if (value === "-S" || value === "--split-string") {
+        return containsRemoteVcsActionInternal(words[index + 1] || "", depth + 1);
+      }
+      if (value.startsWith("-") || isShellAssignment(value)) {
+        index += 1;
+        continue;
+      }
+      break;
+    }
+    return segmentContainsRemoteVcsAction(words.slice(index), depth + 1);
+  }
+  if (executable === "command") {
+    if (words.slice(index + 1).some((value) => value === "-v" || value === "-V")) {
+      return false;
+    }
+    index += 1;
+    while (words[index] === "--") {
+      index += 1;
+    }
+    return segmentContainsRemoteVcsAction(words.slice(index), depth + 1);
+  }
+  if (executable === "exec" || executable === "builtin") {
+    return segmentContainsRemoteVcsAction(words.slice(index + 1), depth + 1);
+  }
+  if (executable === "time" || executable === "nice" || executable === "stdbuf") {
+    const nestedIndex = words.findIndex((value, candidateIndex) =>
+      candidateIndex > index && !value.startsWith("-") && !/^[0-9]+$/.test(value)
+    );
+    return nestedIndex >= 0 && segmentContainsRemoteVcsAction(words.slice(nestedIndex), depth + 1);
+  }
+  if (executable === "timeout") {
+    let nestedIndex = index + 1;
+    while ((words[nestedIndex] || "").startsWith("-")) {
+      nestedIndex += 1;
+    }
+    if (nestedIndex < words.length) {
+      nestedIndex += 1;
+    }
+    return segmentContainsRemoteVcsAction(words.slice(nestedIndex), depth + 1);
+  }
+  if (executable === "sudo") {
+    index += 1;
+    const sudoOptionsWithValue = new Set(["-u", "-g", "-h", "-p", "-C", "-T", "-R", "-D"]);
+    while (index < words.length && words[index].startsWith("-")) {
+      if (sudoOptionsWithValue.has(words[index])) {
+        index += 2;
+      } else {
+        index += 1;
+      }
+    }
+    return segmentContainsRemoteVcsAction(words.slice(index), depth + 1);
+  }
+
+  executable = commandBasename(words[index]);
+  if (executable === "git" || executable === "git.exe") {
+    if (gitConfigInjection) {
+      return true;
+    }
+    for (let optionIndex = index + 1; optionIndex < words.length; optionIndex += 1) {
+      const option = words[optionIndex];
+      if (/^--config-env=alias\./i.test(option)) {
+        return true;
+      }
+      if (option === "--config-env" && /^alias\./i.test(words[optionIndex + 1] || "")) {
+        return true;
+      }
+    }
+    return gitCommandIsRemoteAction(words, index);
+  }
+  if (executable === "git-send-pack" || executable === "git-send-pack.exe") {
+    return true;
+  }
+  if (["gh", "gh.exe", "hub", "hub.exe", "glab", "glab.exe"].includes(executable)) {
+    return true;
+  }
+
+  if (["sh", "bash", "zsh", "dash", "ksh"].includes(executable)) {
+    for (let optionIndex = index + 1; optionIndex < words.length - 1; optionIndex += 1) {
+      const option = words[optionIndex];
+      if (/^-[A-Za-z]*c[A-Za-z]*$/.test(option)) {
+        return containsRemoteVcsActionInternal(words[optionIndex + 1], depth + 1);
+      }
+    }
+  }
+  if (executable === "eval") {
+    return containsRemoteVcsActionInternal(words.slice(index + 1).join(" "), depth + 1);
+  }
+  if (["if", "then", "else", "while", "until", "do", "!", "{"].includes(executable)) {
+    return segmentContainsRemoteVcsAction(words.slice(index + 1), depth + 1);
+  }
+  if (executable === "npx" || executable === "bunx") {
+    const nestedIndex = words.findIndex((value, candidateIndex) =>
+      candidateIndex > index && !value.startsWith("-")
+    );
+    return nestedIndex >= 0 && segmentContainsRemoteVcsAction(words.slice(nestedIndex), depth + 1);
+  }
+  if (
+    (executable === "pnpm" || executable === "yarn") &&
+    (words[index + 1] || "").toLowerCase() === "dlx"
+  ) {
+    let nestedIndex = index + 2;
+    while (words[nestedIndex] === "--" || (words[nestedIndex] || "").startsWith("-")) {
+      nestedIndex += 1;
+    }
+    return segmentContainsRemoteVcsAction(words.slice(nestedIndex), depth + 1);
+  }
+  if (
+    executable === "npm" &&
+    (words[index + 1] || "").toLowerCase() === "exec"
+  ) {
+    let nestedIndex = index + 2;
+    if (words[nestedIndex] === "-c" || words[nestedIndex] === "--call") {
+      return containsRemoteVcsActionInternal(words[nestedIndex + 1] || "", depth + 1);
+    }
+    while (words[nestedIndex] === "--" || (words[nestedIndex] || "").startsWith("-")) {
+      nestedIndex += 1;
+    }
+    return segmentContainsRemoteVcsAction(words.slice(nestedIndex), depth + 1);
+  }
+  if (executable === "xargs") {
+    const nestedIndex = words.findIndex((value, candidateIndex) => {
+      if (candidateIndex <= index) {
+        return false;
+      }
+      const basename = commandBasename(value);
+      return basename === "git" || basename === "gh" || basename === "hub" || basename === "glab";
+    });
+    return nestedIndex >= 0 && segmentContainsRemoteVcsAction(words.slice(nestedIndex), depth + 1);
+  }
+  if (executable === "find") {
+    const execIndex = words.findIndex((value) => value === "-exec" || value === "-execdir");
+    return execIndex >= 0 && segmentContainsRemoteVcsAction(words.slice(execIndex + 1), depth + 1);
+  }
+  return false;
+}
+
+function containsRemoteVcsActionInternal(command, depth) {
+  const segments = splitShellSegments(command);
+  if (segments === null) {
+    return false;
+  }
+  return segments.some((words) => segmentContainsRemoteVcsAction(words, depth));
+}
+
+// ACP implementation turns stop at a local commit. Direct remote Git writes
+// and repository-hosting CLIs belong to the owner-side verification handoff,
+// never to the ACP turn. This is an inspected-command guard rather than an OS
+// network sandbox; the operator prompt must also forbid delegating those
+// actions to an otherwise opaque script.
+export function containsRemoteVcsAction(command) {
+  return containsRemoteVcsActionInternal(command, 0);
+}
+
 export function classifyPermissionRequest(request, allowKinds) {
   const raw = request && request.raw;
   const toolCall = raw && raw.toolCall;
@@ -1220,6 +1554,9 @@ export function classifyPermissionRequest(request, allowKinds) {
   if (inspection.background) {
     return { allowed: false, reason: "background_flag", kind };
   }
+  if (kind === "execute" && inspection.commands.length === 0) {
+    return { allowed: false, reason: "uninspectable_input", kind };
+  }
   for (const command of inspection.commands) {
     if (containsNestedAgentRoute(command)) {
       return { allowed: false, reason: "nested_agent_route", kind };
@@ -1227,6 +1564,9 @@ export function classifyPermissionRequest(request, allowKinds) {
     if (containsDetachedShell(command)) {
       return { allowed: false, reason: "detached_shell", kind };
     }
+  }
+  if (containsRemoteVcsAction(inspection.commands.join(" "))) {
+    return { allowed: false, reason: "remote_vcs_action", kind };
   }
   return { allowed: true, reason: "foreground_once", kind };
 }
