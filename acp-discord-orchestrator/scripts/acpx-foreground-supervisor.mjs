@@ -141,6 +141,21 @@ export const CLAUDE_IMPLICIT_ENV_CONTRACT = Object.freeze({
   requiredEnv: Object.freeze([CLAUDE_OAUTH_TOKEN_ENV]),
   forbiddenEnv: Object.freeze([...CLAUDE_FORBIDDEN_ENV, ...CLAUDE_INJECTION_ENV])
 });
+// The operator-injected absolute path to the Codex executable. A Codex ACP
+// run that resolves its backend binary implicitly (for example a transient
+// npx-bundled install) can silently bind to a damaged installation, so every
+// canonical codex run requires this explicit injection.
+export const CODEX_PATH_ENV = "CODEX_PATH";
+// The executable-path contract enforced automatically for every canonical
+// codex run, layered on the same agent-neutral injection baseline every
+// supported agent gets — analogous to CLAUDE_IMPLICIT_ENV_CONTRACT for
+// Claude, and independent of the caller-declared requiredEnv/forbiddenEnv
+// arrays.
+export const CODEX_IMPLICIT_ENV_CONTRACT = Object.freeze({
+  requiredEnv: Object.freeze([CODEX_PATH_ENV]),
+  forbiddenEnv: ACP_INJECTION_ENV
+});
+const MAX_CODEX_PATH_LENGTH = 4096;
 const MAX_CLAUDE_ENV_FILE_BYTES = 4096;
 // Exactly one assignment with an optional final newline. The value charset
 // excludes quotes, whitespace, comments, and interpolation so the file cannot
@@ -236,6 +251,13 @@ export function fail(code) {
 // Claude credential contract.
 export function isClaudeAgent(value) {
   return typeof value === "string" && value.trim().toLowerCase() === CLAUDE_AGENT;
+}
+
+// Same ACPX normalization property for the codex adapter: any spelling that
+// normalizes to "codex" resolves to it and must receive the Codex
+// executable-path contract.
+export function isCodexAgent(value) {
+  return typeof value === "string" && value.trim().toLowerCase() === CODEX_AGENT;
 }
 
 // Centralized closed-set agent gate, shared by the config loader and the
@@ -722,6 +744,66 @@ export function runClaudeSupervisorPreflight(config, env, execArgv) {
   }
 }
 
+// Validates the injected Codex executable path without ever disclosing it:
+// every failure is a stable bounded code carrying no path, value, hash, or
+// length. The path must be absolute and bounded, resolve to an existing
+// regular file, and be executable. Resolution deliberately follows symlinks
+// (fs.statSync, not lstat) so a symlinked entrypoint such as a Homebrew
+// bin-link stays valid as long as its target is a regular executable file.
+export function validateCodexExecutablePath(value) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > MAX_CODEX_PATH_LENGTH ||
+    !path.isAbsolute(value)
+  ) {
+    fail("codex_path_not_absolute");
+  }
+  let stat;
+  try {
+    stat = fs.statSync(value);
+  } catch (error) {
+    const code = error && error.code;
+    fail(
+      code === "ENOENT" || code === "ENOTDIR"
+        ? "codex_path_missing"
+        : "codex_path_unreadable"
+    );
+  }
+  if (!stat.isFile()) {
+    fail("codex_path_not_regular");
+  }
+  try {
+    fs.accessSync(value, fs.constants.X_OK);
+  } catch {
+    fail("codex_path_not_executable");
+  }
+}
+
+// Supervisor-side Codex executable-path gate, the codex analogue of
+// runClaudeSupervisorPreflight: it runs before dynamic runtime import,
+// probing, or adapter startup, and re-asserts the implicit contract rather
+// than trusting a config object assembled in memory. For agent "codex" it
+// requires the operator-injected CODEX_PATH (keeping the sanitized
+// required_env_missing/required_env_empty codes) and then validates that the
+// injected value names a real executable, so a codex run can never fall back
+// to an implicitly resolved (for example transient npx-bundled) binary.
+export function runCodexSupervisorPreflight(config, env) {
+  if (!isCodexAgent(config.agent)) {
+    return;
+  }
+  // A spelling that ACPX would normalize to "codex" but is not the exact
+  // canonical value gets the Codex gate, not a pass into the generic path.
+  // runSupervisor's centralized closed-set gate already rejects it with
+  // invalid_agent_not_canonical; this branch keeps the guard fail-closed as
+  // defense in depth when it is invoked directly.
+  if (config.agent !== CODEX_AGENT) {
+    fail("codex_agent_not_canonical");
+  }
+  runEnvironmentPreflight(CODEX_IMPLICIT_ENV_CONTRACT, env);
+  validateCodexExecutablePath(env[CODEX_PATH_ENV]);
+}
+
 function parseClaudeAuthProfile(value) {
   if (!isPlainObject(value)) {
     fail("invalid_auth");
@@ -805,13 +887,16 @@ export function loadSupervisorConfig(configPath) {
   }
   // An implicit environment contract is enforced automatically at run time
   // for every supported agent — the agent-neutral process-integrity baseline,
-  // widened to the full Claude credential contract for agent "claude" — so a
+  // widened to the full Claude credential contract for agent "claude" and to
+  // the Codex executable-path contract for agent "codex" — so a
   // caller-declared contract that contradicts it is invalid config: requiring
   // an implicitly forbidden variable (or forbidding an implicitly required
   // one) under any letter case fails invalid_env_contract_overlap.
   const implicitContract = agent === CLAUDE_AGENT
     ? CLAUDE_IMPLICIT_ENV_CONTRACT
-    : ACP_BASELINE_ENV_CONTRACT;
+    : agent === CODEX_AGENT
+      ? CODEX_IMPLICIT_ENV_CONTRACT
+      : ACP_BASELINE_ENV_CONTRACT;
   const implicitForbidden = new Set(
     implicitContract.forbiddenEnv.map((name) => name.toUpperCase())
   );
@@ -1588,10 +1673,12 @@ export async function runSupervisor(config, dependencies = {}) {
     runStartReceiptPreflight(config, now());
     // Agent-neutral process-integrity baseline, enforced for every supported
     // agent before any runtime module import — even when the caller-declared
-    // requiredEnv/forbiddenEnv arrays are empty. The Claude route guard then
-    // layers the provider-specific credential contract on top.
+    // requiredEnv/forbiddenEnv arrays are empty. The agent-specific route
+    // guards then layer their contracts on top: the Claude credential
+    // contract for "claude", the Codex executable-path contract for "codex".
     runEnvironmentPreflight(ACP_BASELINE_ENV_CONTRACT, environment);
     runClaudeSupervisorPreflight(config, environment, execArgv);
+    runCodexSupervisorPreflight(config, environment);
     runReportingPreflight(config);
     runEnvironmentPreflight(config, environment);
     preparePrivateStateDirectory(config.stateDir);
