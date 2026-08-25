@@ -1762,6 +1762,138 @@ test("bracketed model ID reaches the runtime session options unchanged", async (
   assert.equal(emitted.at(-1).status, "completed");
 });
 
+test("claude openclaw provider-prefixed model fails closed before runtime access on both paths", async () => {
+  // Unit surface: the shared resolver rejects the OpenClaw provider/catalog
+  // namespace for canonical claude only, in any letter case, with one stable
+  // bounded code. Canonical adapter-advertised Claude IDs — including the
+  // bracketed ACPX form — pass through byte-for-byte, and slash-containing
+  // IDs for other agents are untouched.
+  for (const model of ["anthropic/claude-fable-5", "Anthropic/claude-opus-5", "anthropic/x"]) {
+    assert.throws(
+      () => resolveConfiguredModel("claude", model),
+      {
+        message: "invalid_model_openclaw_provider_key",
+        code: "invalid_model_openclaw_provider_key"
+      },
+      model
+    );
+  }
+  assert.equal(resolveConfiguredModel("claude", "claude-fable-5"), "claude-fable-5");
+  assert.equal(resolveConfiguredModel("claude", "claude-opus-5"), "claude-opus-5");
+  assert.equal(resolveConfiguredModel("claude", "claude-fable-5[1m]"), "claude-fable-5[1m]");
+  assert.equal(
+    resolveConfiguredModel("codex", "anthropic/claude-fable-5"),
+    "anthropic/claude-fable-5"
+  );
+  assert.equal(resolveConfiguredModel("codex", "openai/gpt-5.2"), "openai/gpt-5.2");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-provider-prefix-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
+  const writeCase = (name, extra) => {
+    const file = path.join(root, name + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent: "claude",
+      auth: { kind: CLAUDE_AUTH_KIND, envFile: "/private/claude-acp-oauth.env" },
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile: path.join(root, "response-" + name + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: root,
+      timeoutMs: 30000,
+      lifecycle,
+      allowKinds: ["read"],
+      ...extra
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  // On-disk path: the loader rejects the provider-prefixed key as invalid
+  // config, and main keeps the invalid-config exit mapping — a bounded
+  // supervisor_error on stdout and EXIT_CODES.invalidConfig, with no runtime
+  // import, probe, or state side effect.
+  const badConfig = writeCase("provider-prefixed", {
+    model: "anthropic/claude-fable-5",
+    reporting: validReporting(lifecycle, { agent: "claude", model: "anthropic/claude-fable-5" })
+  });
+  assert.throws(
+    () => loadSupervisorConfig(badConfig),
+    {
+      message: "invalid_model_openclaw_provider_key",
+      code: "invalid_model_openclaw_provider_key"
+    }
+  );
+  const writes = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    writes.push(String(chunk));
+    return true;
+  };
+  let exitCode;
+  try {
+    exitCode = await main(["--config", badConfig]);
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.equal(exitCode, EXIT_CODES.invalidConfig);
+  const cliEmitted = JSON.parse(writes.join("").trim());
+  assert.equal(cliEmitted.type, "supervisor_error");
+  assert.equal(cliEmitted.code, "invalid_model_openclaw_provider_key");
+  assert.equal(fs.existsSync(path.join(root, "state")), false);
+
+  // Canonical adapter-advertised Claude IDs still load through the same
+  // preflight, bracketed form included.
+  for (const model of ["claude-fable-5", "claude-opus-5", "claude-fable-5[1m]"]) {
+    const loaded = loadSupervisorConfig(writeCase("canonical-" + model.replace(/[^a-z0-9-]/g, ""), {
+      model,
+      reporting: validReporting(lifecycle, { agent: "claude", model })
+    }));
+    assert.equal(loaded.model, model);
+    assert.ok(loaded.reporting.startMessage.includes("`" + model + "`"), model);
+  }
+
+  // In-memory path: runSupervisor fails closed with the same stable code and
+  // the supervisor-error exit before the injected runtime module is ever
+  // constructed — no probe, no adapter startup, no state directory. The
+  // reporting-preflight backstop rejects the same config when invoked
+  // directly.
+  const memRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-provider-prefix-mem-"));
+  const memLifecycle = parsedLifecycle();
+  const memConfig = makeConfig(memRoot, {
+    agent: "claude",
+    auth: { kind: CLAUDE_AUTH_KIND, envFile: "/private/claude-acp-oauth.env" },
+    model: "anthropic/claude-fable-5",
+    lifecycle: memLifecycle,
+    reporting: validReporting(memLifecycle, {
+      agent: "claude",
+      model: "anthropic/claude-fable-5"
+    })
+  });
+  assert.throws(
+    () => runReportingPreflight(memConfig),
+    {
+      message: "invalid_model_openclaw_provider_key",
+      code: "invalid_model_openclaw_provider_key"
+    }
+  );
+  const { module, state } = makeRuntimeModule({});
+  const emitted = [];
+  const memExitCode = await runSupervisor(memConfig, {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(memExitCode, EXIT_CODES.supervisorError);
+  assert.equal(emitted.at(-1).type, "supervisor_error");
+  assert.equal(emitted.at(-1).code, "invalid_model_openclaw_provider_key");
+  assert.equal(state.runtimeOptions, undefined);
+  assert.equal(fs.existsSync(path.join(memRoot, "state")), false);
+});
+
 test("public docs describe the bracketed model-ID grammar", () => {
   const skill = fs.readFileSync(new URL("../SKILL.md", import.meta.url), "utf8");
   const contract = fs.readFileSync(
@@ -1776,6 +1908,11 @@ test("public docs describe the bracketed model-ID grammar", () => {
     // The explicit Codex omission default is documented in both public docs.
     assert.match(doc, /gpt-5\.6-sol\[medium\]/);
     assert.match(doc, /runtime-default/);
+    // Both docs distinguish the adapter-advertised ACP model ID from the
+    // OpenClaw provider/catalog key and name the stable rejection code.
+    assert.match(doc, /`claude-fable-5`/);
+    assert.match(doc, /anthropic\/claude-fable-5/);
+    assert.match(doc, /invalid_model_openclaw_provider_key/);
   }
   assert.match(contract, /claude-fable-5\[1m\]/);
   assert.match(contract, /sessionOptions\.model/);
