@@ -3,7 +3,10 @@ import path from "node:path";
 
 export const ACP_HOST_ACTIVATION_SCHEMA_VERSION = "acp-host-activation.v1";
 export const ACP_LIFECYCLE_LEDGER_SCHEMA_VERSION = "acp-host-lifecycle.v1";
-export const DEFAULT_HOST_ACTIVATION_TIMEOUT_MS = 15000;
+// A two-call host transport must first return the exact handle to the owner
+// and only then deliver activation. Keep the barrier fail-closed, but allow a
+// full minute for bounded tool round-trip latency before pre-runtime exit.
+export const DEFAULT_HOST_ACTIVATION_TIMEOUT_MS = 60000;
 export const LIFECYCLE_LEDGER_ACTIVITY_FLUSH_MS = 1000;
 
 const PROCESS_HANDLE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
@@ -356,7 +359,7 @@ function validateLedgerState(value) {
   }
   if (value.state === "exit_reconciled") {
     if (
-      !activated ||
+      (!activated && !notActivated) ||
       value.terminalIntent === null ||
       value.exitReconciliation.status !== "confirmed" ||
       value.trackingFault !== null
@@ -555,9 +558,18 @@ export function reconcileLifecycleLedger({
   nowMs = Date.now()
 }) {
   const loaded = loadLifecycleLedger(ledgerFile);
-  const handle = assertProcessHandle(processHandle);
-  if (loaded.document.processHandle !== handle) {
-    ledgerFail("lifecycle_handle_mismatch");
+  const activated = loaded.document.processHandle !== null;
+  if (activated) {
+    const handle = assertProcessHandle(processHandle);
+    if (loaded.document.processHandle !== handle) {
+      ledgerFail("lifecycle_handle_mismatch");
+    }
+  } else if (processHandle !== null) {
+    // A supervisor can fail before host activation (for example EOF or an
+    // activation timeout). In that state there is deliberately no process
+    // handle in the ledger. Reconciliation must require an explicit null
+    // rather than accepting a guessed host handle that was never bound.
+    ledgerFail("lifecycle_handle_unexpected");
   }
   if (loaded.document.state === "exit_reconciled" || loaded.document.state === "tracking_lost") {
     ledgerFail("lifecycle_already_reconciled");
@@ -582,6 +594,9 @@ export function reconcileLifecycleLedger({
       reconciledAt: observedAt
     };
   } else if (outcome === "tracking_lost") {
+    if (!activated) {
+      ledgerFail("lifecycle_tracking_not_activated");
+    }
     if (loaded.document.terminalIntent) {
       ledgerFail("lifecycle_terminal_already_present");
     }

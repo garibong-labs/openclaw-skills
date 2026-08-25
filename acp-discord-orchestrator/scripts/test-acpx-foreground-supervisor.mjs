@@ -291,7 +291,7 @@ test("host activation parser accepts one exact bounded handle record", () => {
     schemaVersion: ACP_HOST_ACTIVATION_SCHEMA_VERSION,
     processHandle: "session-123"
   });
-  assert.equal(DEFAULT_HOST_ACTIVATION_TIMEOUT_MS, 15000);
+  assert.equal(DEFAULT_HOST_ACTIVATION_TIMEOUT_MS, 60000);
   for (const invalid of [
     "{}",
     JSON.stringify({ schemaVersion: "wrong", processHandle: "session-123" }),
@@ -404,6 +404,52 @@ test("missing activation exits before runtime access with a terminal ledger inte
   assert.equal(ledger.terminalIntent.code, "activation_eof");
   assert.equal(ledger.exitReconciliation.expectedExitCode, EXIT_CODES.supervisorError);
   assert.equal(loadLifecycleLedger(ledgerFile).document.processHandle, null);
+
+  const reconciled = reconcileLifecycleLedger({
+    ledgerFile,
+    processHandle: null,
+    outcome: "exited",
+    exitCode: EXIT_CODES.supervisorError,
+    nowMs: Date.now()
+  });
+  assert.equal(reconciled.state, "exit_reconciled");
+  assert.equal(reconciled.processHandle, null);
+  assert.equal(reconciled.activatedAt, null);
+  assert.equal(reconciled.exitReconciliation.status, "confirmed");
+});
+
+test("pre-activation exit reconciliation rejects invented handles and tracking loss", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-pre-activation-exit-"));
+  if (process.platform !== "win32") {
+    fs.chmodSync(stateDir, 0o700);
+  }
+  const writer = createLifecycleLedger({
+    stateDir,
+    runId: "run-pre-activation",
+    requestId: "request-pre-activation",
+    nowMs: Date.now()
+  });
+  recordLifecycleEvent(writer, {
+    type: "supervisor_error",
+    code: "activation_timeout",
+    sequence: 2,
+    timestamp: new Date().toISOString()
+  }, {
+    force: true,
+    expectedExitCode: EXIT_CODES.supervisorError
+  });
+
+  assert.throws(() => reconcileLifecycleLedger({
+    ledgerFile: writer.filePath,
+    processHandle: "invented-handle",
+    outcome: "exited",
+    exitCode: EXIT_CODES.supervisorError
+  }), /lifecycle_handle_unexpected/);
+  assert.throws(() => reconcileLifecycleLedger({
+    ledgerFile: writer.filePath,
+    processHandle: null,
+    outcome: "tracking_lost"
+  }), /lifecycle_tracking_not_activated/);
 });
 
 test("terminal delivery failure corrects the private ledger to supervisor exit", async () => {
@@ -2520,7 +2566,7 @@ test("template ships the two-hour emergency timeout ceiling", () => {
   assert.equal(template.timeoutMs, 7200000);
 });
 
-test("public docs separate foreground ownership from host caller blocking", () => {
+test("public docs separate tmux transport ownership from host caller blocking", () => {
   const skill = fs.readFileSync(new URL("../SKILL.md", import.meta.url), "utf8");
   const contract = fs.readFileSync(
     new URL("../references/runtime-contract.md", import.meta.url),
@@ -2531,7 +2577,10 @@ test("public docs separate foreground ownership from host caller blocking", () =
   assert.match(contract, /^## Host activation and lifecycle ledger$/m);
   for (const doc of [skill, contract]) {
     assert.match(doc, /1, 2, 4, and then 5 seconds/);
-    assert.match(doc, /exact non-empty process handle/);
+    assert.match(doc, /exact non-empty (?:process|session) handle/);
+    assert.match(doc, /acp-host-transport-cli\.mjs/);
+    assert.match(doc, /prepare/);
+    assert.match(doc, /activate/);
     assert.match(doc, /acp-host-activation\.v1/);
     assert.match(doc, /tracking_lost/);
     assert.match(doc, /acp-lifecycle-reconcile-cli\.mjs/);
@@ -2541,6 +2590,8 @@ test("public docs separate foreground ownership from host caller blocking", () =
       /both the matching normalized terminal event and the mapped/
     );
   }
+
+  assert.doesNotMatch(skill + contract, /exec_command|write_stdin/);
 
   assert.doesNotMatch(skill + contract, /ten-minute|10-minute/i);
   assert.match(

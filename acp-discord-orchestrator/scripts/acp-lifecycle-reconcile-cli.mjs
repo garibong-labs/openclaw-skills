@@ -88,8 +88,14 @@ function readPrivateInput(inputFile) {
     if (!keys.includes("exitCode")) {
       cliFail("reconcile_input_shape");
     }
+    if (parsed.processHandle !== null && typeof parsed.processHandle !== "string") {
+      cliFail("reconcile_input_shape");
+    }
   } else if (parsed.outcome === "tracking_lost") {
     if (keys.includes("exitCode")) {
+      cliFail("reconcile_input_shape");
+    }
+    if (typeof parsed.processHandle !== "string") {
       cliFail("reconcile_input_shape");
     }
   } else {
