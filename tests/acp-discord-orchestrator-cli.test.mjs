@@ -270,6 +270,36 @@ test("lifecycle reconciliation CLI records tracking_lost and rejects mismatched 
   assert.equal(ledger.trackingFault.code, "tracking_lost");
 });
 
+test("lifecycle reconciliation CLI confirms a pre-activation mapped exit with null handle", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reconcile-pre-activation-"));
+  const ledgerFile = writeLifecycleLedger(root, {
+    processHandle: null,
+    activatedAt: null,
+    lastEvent: {
+      type: "supervisor_error",
+      sequence: 2,
+      timestamp: new Date().toISOString()
+    },
+    terminalIntent: { type: "supervisor_error", code: "activation_timeout" },
+    exitReconciliation: { status: "pending", expectedExitCode: 22 }
+  });
+  const inputFile = path.join(root, "reconcile.json");
+  fs.writeFileSync(inputFile, JSON.stringify({
+    ledgerFile,
+    processHandle: null,
+    outcome: "exited",
+    exitCode: 22
+  }), { mode: 0o600 });
+
+  const outcome = await runLifecycleReconcileCli(inputFile);
+  assert.equal(outcome.code, 0);
+  assert.equal(outcome.stderr, "");
+  assert.equal(JSON.parse(outcome.stdout).status, "exit_reconciled");
+  const ledger = JSON.parse(fs.readFileSync(ledgerFile, "utf8"));
+  assert.equal(ledger.processHandle, null);
+  assert.equal(ledger.exitReconciliation.status, "confirmed");
+});
+
 // ---------------------------------------------------------------------------
 // acp-start-message-cli.mjs — the production start-message builder CLI.
 // ---------------------------------------------------------------------------

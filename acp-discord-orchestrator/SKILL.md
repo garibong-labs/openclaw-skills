@@ -1,8 +1,9 @@
 ---
 name: "acp-discord-orchestrator"
-description: "Track foreground ACPX turns with bounded CLI exit and exact completion."
+description: "Track host-owned ACPX turns with bounded CLI control and exact completion."
 runtime:
   - node (22.13+; the Claude launcher additionally needs process.execve — 22.15+ in the 22.x line, 23.11+ in the 23.x line, or any later line — on a POSIX platform)
+  - tmux and executable `/usr/bin/env` (production host transport on POSIX)
 credentials:
   - purpose: Claude Code setup token for ACP runs with agent "claude", injected only via node --env-file by scripts/claude-acp-launcher.mjs
     required: false
@@ -18,7 +19,7 @@ The skill is agent-neutral within a closed supported set: ACP agent `claude` (pu
 
 ## Required route
 
-Use `scripts/acpx-foreground-supervisor.mjs` for every ACP task started by the calling agent.
+Use `scripts/acp-host-transport-cli.mjs` for every production ACP task started by the calling agent. The transport starts `scripts/acpx-foreground-supervisor.mjs` inside one owner-only tmux session and returns the exact non-empty session handle before a separate activation call can begin ACP mutation.
 
 For `agent: "claude"`, start the supervisor only through the canonical launcher `scripts/claude-acp-launcher.mjs`. It validates the config's `auth` declaration, the parent environment, and the private setup-token env file, then replaces its own process with the supervisor via POSIX `process.execve` so the run still owns exactly one foreground PID and the supervisor starts as `node --env-file=<auth.envFile> acpx-foreground-supervisor.mjs --config <config>`. The launcher requires a POSIX platform and a Node.js runtime with `process.execve` — 22.15 or newer in the 22.x line, 23.11 or newer in the 23.x line, or any later release line (23.0–23.10 lack it) — and fails closed with `execve_unsupported` everywhere else. A bare direct Claude supervisor launch is a bypass and fails closed with the supervisor policy exit before any runtime loading. The agent name must be the canonical lowercase `claude`: ACPX normalizes agent names, so other spellings would reach the same adapter and are rejected as invalid config.
 
@@ -65,53 +66,43 @@ This policy does not globally disable human-operated OpenClaw ACP commands.
 
    The launcher certifies a clean parent environment and unsets nothing silently. If the launching shell already exports `CLAUDE_CODE_OAUTH_TOKEN` (even empty), a competing credential selector, or an injection-capable variable such as `NODE_OPTIONS`, the launch fails closed with a code naming the variable. Remediate by removing the variable explicitly in the launching shell — for example `env -u NODE_OPTIONS -u CLAUDE_CODE_OAUTH_TOKEN node …` — rather than expecting the launcher to strip it.
 11. Define terminal acceptance checks in the prompt.
-12. Resolve this skill's directory and run the run's canonical entry point by absolute path in the foreground. For Claude (POSIX, Node.js 22.15+/23.11+ or any later line):
+12. Resolve this skill's directory and use `scripts/acp-host-transport-cli.mjs` by absolute path. Before publishing the ACP start boundary, run the harmless `probe` action from a private input file and require `host_transport_ready`. After the boundary and config receipt exist, run `prepare` with the private config path. For Codex, inject the host-specific executable path on the `prepare` command, for example `CODEX_PATH=/opt/homebrew/bin/codex`; the transport copies only the bounded operational environment plus caller-declared required variables into the tmux-owned child.
 
-```bash
-node /absolute/path/to/acp-discord-orchestrator/scripts/claude-acp-launcher.mjs --config /absolute/private/run.json
+Every CLI action reads one owner-only JSON file:
+
+```json
+{"schemaVersion":"acp-host-transport.v1","action":"prepare","configFile":"/absolute/private/run.json"}
 ```
 
-The launcher re-execs in place via `process.execve`, so the same PID becomes the supervisor with the env file injected through Node's `--env-file` startup option. For every other agent, run the supervisor directly. For `agent: "codex"`, the launch command must carry an explicit `CODEX_PATH` environment assignment naming the host's real Codex executable:
-
 ```bash
-CODEX_PATH=/absolute/path/to/codex node /absolute/path/to/acp-discord-orchestrator/scripts/acpx-foreground-supervisor.mjs --config /absolute/private/run.json
+CODEX_PATH=/absolute/path/to/codex node /absolute/path/to/acp-discord-orchestrator/scripts/acp-host-transport-cli.mjs --input /absolute/private/prepare.json
 ```
 
-The `CODEX_PATH` value is host-specific operator configuration, never a constant in this skill — for example, the current Mac mini operator injects `CODEX_PATH=/opt/homebrew/bin/codex`, a Homebrew bin-link, which is valid because path resolution follows symlinks to the regular executable target. A codex launch without it (or with a value that is not an absolute existing executable regular file) fails closed before runtime loading, so a run can never silently bind a transient npx-bundled Codex installation.
-
-A bare direct supervisor launch with `agent: "claude"` fails closed before runtime loading. Do not background either process. Consume the newline-delimited JSON events while the process remains attached.
-
-Every production launch begins behind a host-activation barrier. The supervisor creates an owner-private `supervisor-<runId>.lifecycle.json` ledger in `stateDir`, emits `activation_required`, and waits without importing ACPX or touching an adapter. Bound the initial host exec wait to five seconds. When the host returns `status: running`, retain its exact non-empty process handle and write exactly one line through that same handle's stdin:
+`prepare` returns `host_transport_prepared` with one exact `processHandle` and private `transportFile`. It does not activate ACP. Persist both values privately, then make a second CLI call whose input has `action: "activate"`, the exact returned `transportFile`, and the exact returned `processHandle`. The transport verifies that tmux still owns that session, waits for `activation_required`, and writes exactly one line into that same PTY:
 
 ```json
 {"schemaVersion":"acp-host-activation.v1","processHandle":"<exact-host-handle>"}
 ```
 
-Only the matching `activation_confirmed` event permits runtime import, probe, `ensureSession`, and `startTurn`. EOF, timeout, malformed activation, or a missing/invalid handle fails closed before ACP mutation. The handle lives only in the private ledger and must never enter Discord output or a watchdog payload.
+Only the matching `host_transport_activated` result and supervisor `activation_confirmed` event permit runtime import, probe, `ensureSession`, and `startTurn`. EOF, timeout, malformed activation, a missing/invalid handle, or loss of the owner between the two calls fails closed before ACP mutation. The activation deadline is 60 seconds. The handle and transport file stay owner-private and must never enter Discord output or a watchdog payload.
 
 ## Own the process without blocking the conversation
 
-Process foreground ownership and host conversation blocking are separate properties. Keep the first without assuming it requires the second.
+Process ownership belongs to the transport's exact tmux session. It is detached from any one shell tool call but remains explicitly addressable by the returned handle and private transport record until the supervisor exits. The ACP supervisor and adapter remain foreground children inside that owned PTY; they are not shell-backgrounded within it.
 
-Foreground ownership belongs to the supervisor process. It runs as exactly one tracked host exec process tree, stays attached, is never detached, daemonized, or backgrounded, and stays owned until it exits.
-
-Conversation blocking belongs to the caller. One host tool call does not have to stay open for the whole ACP turn. Return control at short, bounded host-tool boundaries while the same supervisor process keeps running under host process tracking.
-
-Bound the initial host wait to five seconds unless the process is already terminal. Once the host reports a running process, retain its exact non-empty process handle, activate the supervisor through that same handle as described above, and use only that handle for the rest of the turn. If no exact handle is returned, do not try another launch: the activation deadline ends the run before ACP mutation.
-
-Poll the retained handle with bounded waits of 1, 2, 4, and then 5 seconds for every later poll. Five seconds is the cap.
+Conversation blocking belongs to the caller. Use separate bounded `status` calls with the same `transportFile` and `processHandle`, carrying the previous `lastSequence` as `afterSequence`. Poll at 1, 2, 4, and then 5 seconds, capped at five seconds. Do not read the event, stderr, or exit files directly; the transport validates and bounds them.
 
 Do not substitute:
 
 - a PID search or broad process monitoring
-- transcript or log-file polling
+- transcript or direct log-file polling
 - a long shell sleep
 - a long blocking exec or write wait
-- a second launch, wrapper, or nested runner around the same run
+- a second transport, wrapper, or nested runner around the same run
 
 A returned poll is a host-tool boundary. It is not activity evidence and never terminal evidence.
 
-Keep the owner turn alive while the handle is active. Do not final, yield, or abandon ownership between polls. If the handle becomes dead or unavailable without a matching terminal intent, classify the run as `tracking_lost`, stop active-reporting publication, and never infer success or relaunch automatically.
+Keep the owner turn alive while the handle is active. Do not final, yield, or abandon ownership between polls. If `status` reports `unavailable` without a mapped exit and the private ledger has no terminal intent, classify the run as `tracking_lost`, stop active-reporting publication, and never infer success or relaunch automatically.
 
 ## Stay responsive at each poll boundary
 
@@ -131,7 +122,7 @@ Treat only the matching `terminal` event as terminal evidence. Preserve `complet
 
 Map supervisor exits as documented in the runtime contract. Never turn a failed or cancelled run into a success report. Treat process exit as the final delivery of that mapping; the CLI bounds output flushing before forcing termination so leaked runtime handles cannot hold the caller open.
 
-After the exact handle returns its process exit, reconcile the owner-private ledger with `scripts/acp-lifecycle-reconcile-cli.mjs --input <private JSON>`. The input binds the ledger path and the same handle to `outcome: "exited"` plus the mapped exit code. If the handle is dead with no terminal intent, use `outcome: "tracking_lost"` and no exit code. Handle mismatch, missing terminal evidence, exit mismatch, and attempts to overwrite an already reconciled ledger fail closed.
+After `status` returns `exited` with a mapped exit code, call the host transport CLI with `action: "reconcile"`, the same private transport file, and the same handle. It derives the exact lifecycle ledger and confirms terminal intent plus mapped exit. A supervisor error before activation is reconciled with the ledger's explicit null handle; an invented handle is never bound to that run. If an activated transport disappears without terminal intent, use `scripts/acp-lifecycle-reconcile-cli.mjs` with the `tracking_lost` outcome. Handle mismatch, missing terminal evidence, exit mismatch, and attempts to overwrite an already reconciled ledger fail closed.
 
 Report completion only after both the matching normalized terminal event and the mapped supervisor process exit have been observed and the private-ledger reconciliation succeeds. A returned poll, a quiet event stream, or a serviced conversation reply replaces none of them.
 
