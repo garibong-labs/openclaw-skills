@@ -177,13 +177,19 @@ Reject:
 - missing or unknown tool kind;
 - tool kind outside `allowKinds`;
 - missing, non-object, over-depth, over-width, oversized, or otherwise uninspectable structured raw input;
+- an `execute` request that exposes no inspectable command;
 - the unclassified `other` tool kind;
 - explicit background or daemon flags;
 - permission bypass settings or command-line flags;
 - nested ACP or background-agent routes;
-- `nohup`, `disown`, `setsid`, or standalone shell `&`.
+- `nohup`, `disown`, `setsid`, or standalone shell `&`;
+- remote VCS actions reserved for the owner-side handoff: `git push`, `git send-pack`, `git lfs push`, Git aliases configured inside the turn, and every invocation of the repository-hosting CLIs `gh`, `hub`, or `glab`, including recognized shell and package-runner wrappers.
 
 The shell rule is intentionally conservative. Use foreground parallel runners whose own process blocks until every child finishes.
+
+The ACP implementation boundary is local-commit-only. Local inspection and commit commands such as `git status`, `git diff`, `git add`, `git commit`, and `git log` remain eligible for one-shot approval. After the ACP terminal result, the host owner independently verifies the diff, tests, and Git identity before performing any feature push or pull-request operation outside the ACP turn. The task prompt must explicitly stop the ACP agent after its local commit and prohibit delegating a remote action to a script.
+
+This remains a permission-layer contract, not an operating-system network sandbox. It rejects the inspected request shapes above; it cannot prove that an otherwise allowed opaque program has no remote side effect. Do not describe it as network isolation.
 
 ## Event identity
 

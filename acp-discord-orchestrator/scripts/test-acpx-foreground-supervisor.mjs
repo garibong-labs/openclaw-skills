@@ -30,6 +30,7 @@ import {
   buildPermissionHandler,
   classifyPermissionRequest,
   containsDetachedShell,
+  containsRemoteVcsAction,
   discoverRuntimeLocation,
   isClaudeAgent,
   isCliEntry,
@@ -623,6 +624,97 @@ test("detached-shell scanner ignores quoted ampersands and shell redirection", (
   assert.equal(containsDetachedShell("node test.mjs 2>&1"), false);
   assert.equal(containsDetachedShell("node a.mjs && node b.mjs"), false);
   assert.equal(containsDetachedShell("node server.mjs &"), true);
+});
+
+test("remote VCS guard enforces the ACP local-commit-only handoff", () => {
+  const rejected = [
+    "git push origin HEAD",
+    "git -C repo push --force-with-lease",
+    "/usr/bin/git send-pack origin HEAD",
+    "git lfs push origin main",
+    "git -c alias.ship=push ship origin main",
+    "git --config-env=alias.ship=SHIP ship origin main",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.ship GIT_CONFIG_VALUE_0=push git ship origin main",
+    "git config alias.ship push",
+    "env GIT_SSH_COMMAND=ssh git push origin main",
+    "bash -lc 'git push origin main'",
+    "if true; then git push origin main; fi",
+    "time -p git push origin main",
+    "nice -n 5 git push origin main",
+    "timeout 30 git push origin main",
+    "sudo -u builder git push origin main",
+    "gh pr create --fill",
+    "/opt/homebrew/bin/gh api repos/o/r/pulls -X POST",
+    "hub pull-request",
+    "glab mr create",
+    "npx -y gh pr create",
+    "pnpm dlx gh pr create",
+    "yarn dlx -- gh pr create",
+    "npm exec -- gh pr create",
+    "npm exec -c 'gh pr create'",
+    "find . -exec git push origin main ;"
+  ];
+  for (const command of rejected) {
+    assert.equal(containsRemoteVcsAction(command), true, command);
+  }
+
+  const allowed = [
+    "git status --short",
+    "git diff --check",
+    "git add src test && git commit -m 'fix: local change'",
+    "git log -1 --oneline",
+    "git fetch --prune origin",
+    "git config --get alias.ship",
+    "git config alias.ship",
+    "rg -n 'git push' docs",
+    "printf '%s' 'gh pr create'",
+    "command -v gh"
+  ];
+  for (const command of allowed) {
+    assert.equal(containsRemoteVcsAction(command), false, command);
+  }
+});
+
+test("permission guard rejects opaque execute and remote VCS actions", () => {
+  const allowed = new Set(["execute", "edit"]);
+  const rejected = [
+    [permissionRequest({}, "execute"), "uninspectable_input"],
+    [permissionRequest({ opaque: true }, "execute"), "uninspectable_input"],
+    [permissionRequest({ command: "git push origin HEAD" }, "execute"), "remote_vcs_action"],
+    [permissionRequest({ command: "gh", args: ["pr", "create", "--fill"] }, "execute"), "remote_vcs_action"]
+  ];
+  for (const [request, reason] of rejected) {
+    assert.equal(classifyPermissionRequest(request, allowed).reason, reason);
+  }
+
+  assert.equal(
+    classifyPermissionRequest(permissionRequest({}, "edit"), allowed).allowed,
+    true
+  );
+  assert.equal(
+    classifyPermissionRequest(
+      permissionRequest({ command: "git add src && git commit -m 'fix: local'" }, "execute"),
+      allowed
+    ).allowed,
+    true
+  );
+});
+
+test("public docs bind ACP work to local commit before the owner handoff", () => {
+  const skill = fs.readFileSync(new URL("../SKILL.md", import.meta.url), "utf8");
+  const contract = fs.readFileSync(
+    new URL("../references/runtime-contract.md", import.meta.url),
+    "utf8"
+  );
+
+  for (const doc of [skill, contract]) {
+    assert.match(doc, /local-commit-only/);
+    assert.match(doc, /git push/);
+    assert.match(doc, /git send-pack/);
+    assert.match(doc, /git lfs push/);
+    assert.match(doc, /`gh`/);
+    assert.match(doc, /network sandbox/);
+  }
 });
 
 test("permission handler only returns one-shot outcomes", async () => {
@@ -1262,6 +1354,27 @@ test("runtime permission callback is wired and rejects opaque input", async () =
     }
   }), EXIT_CODES.completed);
   assert.deepEqual(state.permissionOutcome, { outcome: "reject_once" });
+  assert.equal(emitted.at(-1).counters.permissionsRejected, 1);
+});
+
+test("runtime permission callback rejects remote VCS actions before execution", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-remote-vcs-wire-"));
+  const { module, state } = makeRuntimeModule({
+    permissionRequest: permissionRequest({ command: "git push origin HEAD" })
+  });
+  const emitted = [];
+  assert.equal(await runSupervisor(makeConfig(root), {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  }), EXIT_CODES.completed);
+  assert.deepEqual(state.permissionOutcome, { outcome: "reject_once" });
+  assert.equal(
+    emitted.find((event) => event.type === "permission_rejected").reason,
+    "remote_vcs_action"
+  );
   assert.equal(emitted.at(-1).counters.permissionsRejected, 1);
 });
 

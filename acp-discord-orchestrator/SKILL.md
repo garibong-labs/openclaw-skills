@@ -65,7 +65,7 @@ This policy does not globally disable human-operated OpenClaw ACP commands.
    The main template is agent-neutral and ships no `auth` block. The Claude-specific `agent`/`auth` pairing lives in the provider-specific profile [templates/claude-auth-profile.json](templates/claude-auth-profile.json); for `agent: "claude"`, merge that profile's `auth` block into your run config. For every other agent, declare no `auth` at all: an `auth` profile on a non-Claude agent is invalid config (`invalid_auth_agent`), and non-Claude runs — including `codex` — declare their whole environment contract through `requiredEnv`/`forbiddenEnv` instead. (A dedicated provider-auth skill, `acp-agent-auth`, is planned separately; until it exists, the generic environment contract is the only supported non-Claude credential gate.)
 
    The launcher certifies a clean parent environment and unsets nothing silently. If the launching shell already exports `CLAUDE_CODE_OAUTH_TOKEN` (even empty), a competing credential selector, or an injection-capable variable such as `NODE_OPTIONS`, the launch fails closed with a code naming the variable. Remediate by removing the variable explicitly in the launching shell — for example `env -u NODE_OPTIONS -u CLAUDE_CODE_OAUTH_TOKEN node …` — rather than expecting the launcher to strip it.
-11. Define terminal acceptance checks in the prompt.
+11. Define terminal acceptance checks in the prompt. Every implementation prompt must stop the ACP agent after tests and a local commit, prohibit `git push` and remote VCS/repository-hosting actions, and prohibit delegating those actions to a script. Feature push, pull-request creation or updates, public comments, review responses, and merge happen only in the owner-side verification handoff after the ACP terminal result.
 12. Resolve this skill's directory and use `scripts/acp-host-transport-cli.mjs` by absolute path. Before publishing the ACP start boundary, run the harmless `probe` action from a private input file and require `host_transport_ready`. After the boundary and config receipt exist, run `prepare` with the private config path. For Codex, inject the host-specific executable path on the `prepare` command, for example `CODEX_PATH=/opt/homebrew/bin/codex`; the transport copies only the bounded operational environment plus caller-declared required variables into the tmux-owned child.
 
 Every CLI action reads one owner-only JSON file:
@@ -128,11 +128,13 @@ Report completion only after both the matching normalized terminal event and the
 
 ## Foreground policy
 
-The supervisor rejects detached execution forms, explicit background flags, permission bypass modes, nested agent routes, uninspectable or over-limit permission input, unclassified tool kinds, and tool kinds outside the configured allowlist.
+The supervisor rejects detached execution forms, explicit background flags, permission bypass modes, nested agent routes, uninspectable or over-limit permission input, unclassified tool kinds, tool kinds outside the configured allowlist, and an `execute` request that exposes no inspectable command.
+
+ACP implementation is local-commit-only. The permission guard keeps local Git inspection and commit commands eligible, but rejects direct remote Git writes (`git push`, `git send-pack`, and `git lfs push`), Git-alias creation that could hide them, and every invocation of the repository-hosting CLIs `gh`, `hub`, or `glab`, including recognized nested shell and package-runner forms. The host owner verifies the terminal result, full diff, tests, and Git identity before performing feature push or pull-request work outside ACP.
 
 Foreground parallel runners are allowed when their parent process blocks until all children finish. Use test-runner concurrency, `xargs -P`, or an equivalent joining primitive. Shell `&` is rejected because the permission request does not prove that every child will be joined.
 
-The guard is a permission-layer contract, not an operating-system sandbox. It rejects only the inspected request shape; approved foreground code may still daemonize internally. Do not claim stronger containment.
+The guard is a permission-layer contract, not an operating-system or network sandbox. It rejects only the inspected request shape; approved foreground code may still daemonize or perform a remote action internally. The task prompt must prohibit delegating remote actions to scripts, and callers must not claim stronger containment.
 
 ## Report to Discord
 
