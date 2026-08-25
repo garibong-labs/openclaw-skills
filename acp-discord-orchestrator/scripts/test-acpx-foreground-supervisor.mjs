@@ -19,6 +19,7 @@ import {
   CLAUDE_INJECTION_ENV,
   CLAUDE_OAUTH_TOKEN_ENV,
   CLAUDE_PROVIDER_INJECTION_ENV,
+  CODEX_DEFAULT_MODEL,
   EXIT_CODES,
   assertCanonicalSupportedAgent,
   buildPermissionHandler,
@@ -31,6 +32,7 @@ import {
   loadSupervisorConfig,
   main,
   normalizeRuntimeEvent,
+  resolveConfiguredModel,
   runClaudeSupervisorPreflight,
   runReportingPreflight,
   runStartReceiptPreflight,
@@ -1499,8 +1501,72 @@ test("in-memory reporting preflight backstop fails closed before runtime access"
   assert.equal(fs.existsSync(path.join(root, "state")), false);
 });
 
-test("optional model keeps the reporting contract consistent end to end", async () => {
+test("claude omitted model keeps the runtime-default reporting contract", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-no-model-"));
+  const prompt = path.join(root, "prompt.txt");
+  fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
+  const lifecycle = rawLifecycle();
+  const writeCase = (name, extra) => {
+    const file = path.join(root, name + ".json");
+    fs.writeFileSync(file, JSON.stringify({
+      agent: "claude",
+      auth: { kind: CLAUDE_AUTH_KIND, envFile: "/private/claude-acp-oauth.env" },
+      cwd: root,
+      sessionKey: "test-session",
+      promptFile: prompt,
+      responseFile: path.join(root, "response-" + name + ".txt"),
+      stateDir: path.join(root, "state"),
+      runtimeModule: root,
+      timeoutMs: 30000,
+      lifecycle,
+      allowKinds: ["read"],
+      ...extra
+    }), { mode: 0o600 });
+    return file;
+  };
+
+  // Claude has no supervisor-side omission default: a config without model
+  // loads with model undefined when the templates use the runtime-default
+  // label, and the normalized bundle keeps that label on the identity lines.
+  const loaded = loadSupervisorConfig(writeCase("no-model", {
+    reporting: validReporting(lifecycle, { agent: "claude", model: "runtime-default" })
+  }));
+  assert.equal(loaded.model, undefined);
+  assert.match(loaded.reporting.startMessage, /`runtime-default`/);
+  assert.equal(resolveConfiguredModel("claude", undefined), undefined);
+
+  // Without model, templates claiming a concrete model are a mismatch, not a
+  // silent pass: the identity line no longer matches the expected label.
+  assert.throws(
+    () => loadSupervisorConfig(writeCase("no-model-mismatch", {
+      reporting: validReporting(lifecycle, { agent: "claude", model: "test-model" })
+    })),
+    { message: "invalid_reporting_start_message", code: "invalid_reporting_start_message" }
+  );
+
+  // The in-memory backstop agrees: a claude config without model binds its
+  // reporting to the runtime-default label, not to any implicit default.
+  const memRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-no-model-mem-"));
+  const memLifecycle = parsedLifecycle();
+  runReportingPreflight(makeConfig(memRoot, {
+    agent: "claude",
+    model: undefined,
+    lifecycle: memLifecycle,
+    reporting: validReporting(memLifecycle, { agent: "claude", model: "runtime-default" })
+  }));
+});
+
+test("codex omitted model resolves to the explicit medium default on every surface", async () => {
+  // One authoritative constant, and it satisfies the fail-closed model
+  // grammar as a complete bracketed ACPX model ID.
+  assert.equal(CODEX_DEFAULT_MODEL, "gpt-5.6-sol[medium]");
+  assert.equal(resolveConfiguredModel("codex", undefined), CODEX_DEFAULT_MODEL);
+  // Explicit models are preserved byte-for-byte for both agents, including
+  // bracketed ACPX IDs that differ from the default only in the suffix.
+  assert.equal(resolveConfiguredModel("codex", "gpt-5.6-sol[low]"), "gpt-5.6-sol[low]");
+  assert.equal(resolveConfiguredModel("claude", "test-model"), "test-model");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-default-model-"));
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
   const lifecycle = rawLifecycle();
@@ -1522,34 +1588,48 @@ test("optional model keeps the reporting contract consistent end to end", async 
     return file;
   };
 
-  // A config without model loads when the templates use the runtime-default
-  // label, and the normalized bundle keeps that label on the identity lines.
-  const loaded = loadSupervisorConfig(writeCase("no-model", {
-    reporting: validReporting(lifecycle, { model: "runtime-default" })
+  // Loader: an omitted codex model is normalized to the explicit default
+  // before reporting validation, so the loaded config carries the default and
+  // the reporting bundle must bind its identity lines to the same explicit ID.
+  const loaded = loadSupervisorConfig(writeCase("codex-no-model", {
+    reporting: validReporting(lifecycle, { model: CODEX_DEFAULT_MODEL })
   }));
-  assert.equal(loaded.model, undefined);
-  assert.match(loaded.reporting.startMessage, /`runtime-default`/);
+  assert.equal(loaded.model, CODEX_DEFAULT_MODEL);
+  assert.ok(loaded.reporting.startMessage.includes("`" + CODEX_DEFAULT_MODEL + "`"));
 
-  // Without model, templates claiming a concrete model are a mismatch, not a
-  // silent pass: the identity line no longer matches the expected label.
+  // A codex bundle claiming runtime-default for an omitted model cannot load:
+  // reporting is validated against the normalized explicit default.
   assert.throws(
-    () => loadSupervisorConfig(writeCase("no-model-mismatch", {
-      reporting: validReporting(lifecycle, { model: "test-model" })
+    () => loadSupervisorConfig(writeCase("codex-runtime-default-claim", {
+      reporting: validReporting(lifecycle, { model: "runtime-default" })
     })),
     { message: "invalid_reporting_start_message", code: "invalid_reporting_start_message" }
   );
 
-  // The started event and the reporting templates agree on the label.
-  const memRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-reporting-no-model-mem-"));
+  // The in-memory backstop rejects the same runtime-default claim, so a
+  // config assembled without the loader cannot diverge either.
+  const memRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-default-mem-"));
   const memLifecycle = parsedLifecycle();
-  const { module } = makeRuntimeModule({
+  assert.throws(
+    () => runReportingPreflight(makeConfig(memRoot, {
+      model: undefined,
+      lifecycle: memLifecycle,
+      reporting: validReporting(memLifecycle, { model: "runtime-default" })
+    })),
+    { message: "invalid_reporting_start_message", code: "invalid_reporting_start_message" }
+  );
+
+  // End to end through runSupervisor: the started event and the runtime
+  // session options both carry the explicit default — the adapter/backend
+  // preset is never inherited for an omitted codex model.
+  const { module, state } = makeRuntimeModule({
     events: [{ type: "text_delta", stream: "output", text: "ok" }]
   });
   const emitted = [];
   const exitCode = await runSupervisor(makeConfig(memRoot, {
     model: undefined,
     lifecycle: memLifecycle,
-    reporting: validReporting(memLifecycle, { model: "runtime-default" })
+    reporting: validReporting(memLifecycle, { model: CODEX_DEFAULT_MODEL })
   }), {
     runtimeModule: module,
     bindSignals: false,
@@ -1559,7 +1639,8 @@ test("optional model keeps the reporting contract consistent end to end", async 
   });
   assert.equal(exitCode, EXIT_CODES.completed);
   const started = emitted.find((event) => event.type === "started");
-  assert.equal(started.model, "runtime-default");
+  assert.equal(started.model, CODEX_DEFAULT_MODEL);
+  assert.equal(state.ensureInput.sessionOptions.model, CODEX_DEFAULT_MODEL);
 });
 
 test("model grammar accepts ACPX bracketed reasoning-selection IDs and fails closed on malformed brackets", () => {
@@ -1692,6 +1773,9 @@ test("public docs describe the bracketed model-ID grammar", () => {
     assert.match(doc, /gpt-5\.2\[high\]/);
     assert.match(doc, /gpt-5\.6-sol\[low\]/);
     assert.match(doc, /invalid_model/);
+    // The explicit Codex omission default is documented in both public docs.
+    assert.match(doc, /gpt-5\.6-sol\[medium\]/);
+    assert.match(doc, /runtime-default/);
   }
   assert.match(contract, /claude-fable-5\[1m\]/);
   assert.match(contract, /sessionOptions\.model/);
@@ -2581,6 +2665,37 @@ test("canonical claude launch reaches the runtime without token disclosure", POS
   assert.equal(emitted.at(-1).type, "terminal");
   assert.equal(emitted.at(-1).status, "completed");
   assert.equal(JSON.stringify(emitted).includes(DUMMY_CLAUDE_TOKEN), false);
+});
+
+test("claude omitted model keeps genuine omission through the runtime", POSIX_ONLY, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-no-model-"));
+  const envFile = makeClaudeAuthFixture(root);
+  const { module, state } = makeRuntimeModule({
+    events: [{ type: "text_delta", stream: "output", text: "bounded result" }]
+  });
+  const lifecycle = parsedLifecycle();
+  const config = makeClaudeConfig(root, envFile, {
+    model: undefined,
+    lifecycle,
+    reporting: validReporting(lifecycle, { agent: "claude", model: "runtime-default" })
+  });
+  const emitted = [];
+  const exitCode = await runSupervisor(config, {
+    runtimeModule: module,
+    bindSignals: false,
+    env: claudeEnv(envFile),
+    execArgv: ["--env-file=" + envFile],
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  assert.equal(exitCode, EXIT_CODES.completed);
+  // No codex default leaks into claude: the started event keeps the public
+  // runtime-default label and the runtime session options omit model, so the
+  // adapter's own runtime default stays in charge.
+  const started = emitted.find((event) => event.type === "started");
+  assert.equal(started.model, "runtime-default");
+  assert.equal("model" in state.ensureInput.sessionOptions, false);
 });
 
 test("claude unsupported session/close keeps the fail-closed cleanup contract", POSIX_ONLY, async () => {
