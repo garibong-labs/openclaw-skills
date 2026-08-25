@@ -4,6 +4,7 @@ import fs from "node:fs";
 import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -13,6 +14,7 @@ import {
   ACP_INJECTION_ENV,
   ACP_SUPPORTED_AGENTS,
   ACPX_UNSUPPORTED_CONTROL_ERROR_CODE,
+  ACP_HOST_ACTIVATION_SCHEMA_VERSION,
   CLAUDE_AUTH_KIND,
   CLAUDE_FORBIDDEN_ENV,
   CLAUDE_IMPLICIT_ENV_CONTRACT,
@@ -22,6 +24,7 @@ import {
   CODEX_DEFAULT_MODEL,
   CODEX_IMPLICIT_ENV_CONTRACT,
   CODEX_PATH_ENV,
+  DEFAULT_HOST_ACTIVATION_TIMEOUT_MS,
   EXIT_CODES,
   assertCanonicalSupportedAgent,
   buildPermissionHandler,
@@ -35,16 +38,25 @@ import {
   loadSupervisorConfig,
   main,
   normalizeRuntimeEvent,
+  parseHostActivationLine,
+  reconcileLifecycleLedger,
   resolveConfiguredModel,
   runClaudeSupervisorPreflight,
   runCodexSupervisorPreflight,
   runReportingPreflight,
   runStartReceiptPreflight,
   runSupervisor,
+  waitForHostActivation,
   validateClaudeAuthEnvFile,
   validateCodexExecutablePath,
   validateRuntimeModuleExports
 } from "./acpx-foreground-supervisor.mjs";
+import {
+  activateLifecycleLedger,
+  createLifecycleLedger,
+  loadLifecycleLedger,
+  recordLifecycleEvent
+} from "./acp-lifecycle-ledger.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 
 // Canonical codex runs require the operator-injected CODEX_PATH before any
@@ -260,6 +272,267 @@ function permissionRequest(rawInput, kind = "execute") {
     }
   };
 }
+
+function activationLine(processHandle = "tracked-session-42") {
+  return JSON.stringify({
+    schemaVersion: ACP_HOST_ACTIVATION_SCHEMA_VERSION,
+    processHandle
+  }) + "\n";
+}
+
+function onlyLifecycleLedger(stateDir) {
+  const names = fs.readdirSync(stateDir).filter((name) => name.endsWith(".lifecycle.json"));
+  assert.equal(names.length, 1);
+  return path.join(stateDir, names[0]);
+}
+
+test("host activation parser accepts one exact bounded handle record", () => {
+  assert.deepEqual(parseHostActivationLine(activationLine("session-123").trim()), {
+    schemaVersion: ACP_HOST_ACTIVATION_SCHEMA_VERSION,
+    processHandle: "session-123"
+  });
+  assert.equal(DEFAULT_HOST_ACTIVATION_TIMEOUT_MS, 15000);
+  for (const invalid of [
+    "{}",
+    JSON.stringify({ schemaVersion: "wrong", processHandle: "session-123" }),
+    JSON.stringify({
+      schemaVersion: ACP_HOST_ACTIVATION_SCHEMA_VERSION,
+      processHandle: "session 123"
+    }),
+    JSON.stringify({
+      schemaVersion: ACP_HOST_ACTIVATION_SCHEMA_VERSION,
+      processHandle: "session-123",
+      title: "caller-controlled"
+    })
+  ]) {
+    assert.throws(() => parseHostActivationLine(invalid), /activation_invalid/);
+  }
+});
+
+test("host activation stream fails closed on timeout, EOF, and malformed input", async () => {
+  const timeoutInput = new PassThrough();
+  await assert.rejects(
+    waitForHostActivation(timeoutInput, { timeoutMs: 5 }),
+    /activation_timeout/
+  );
+
+  const eofInput = new PassThrough();
+  const eofResult = waitForHostActivation(eofInput, { timeoutMs: 100 });
+  eofInput.end();
+  await assert.rejects(eofResult, /activation_eof/);
+
+  const malformedInput = new PassThrough();
+  const malformedResult = waitForHostActivation(malformedInput, { timeoutMs: 100 });
+  malformedInput.end("not-json\n");
+  await assert.rejects(malformedResult, /activation_invalid/);
+});
+
+test("runtime mutation waits for activation from the retained host handle", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-activation-gate-"));
+  const activationInput = new PassThrough();
+  const { module, state } = makeRuntimeModule();
+  const config = makeConfig(root);
+  const emitted = [];
+  const run = runSupervisor(config, {
+    runtimeModule: module,
+    activationInput,
+    activationTimeoutMs: 1000,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(emitted.at(-1).type, "activation_required");
+  assert.equal(state.runtimeOptions, undefined);
+  assert.equal(state.ensureInput, undefined);
+  assert.equal(state.turnInput, undefined);
+
+  activationInput.end(activationLine());
+  assert.equal(await run, EXIT_CODES.completed);
+  assert.equal(emitted.some((event) => event.type === "activation_confirmed"), true);
+  assert.notEqual(state.runtimeOptions, undefined);
+  assert.notEqual(state.ensureInput, undefined);
+  assert.notEqual(state.turnInput, undefined);
+
+  const ledgerFile = onlyLifecycleLedger(config.stateDir);
+  const ledger = JSON.parse(fs.readFileSync(ledgerFile, "utf8"));
+  assert.equal(ledger.processHandle, "tracked-session-42");
+  assert.equal(ledger.state, "terminal_intent");
+  assert.equal(ledger.lastEvent.type, "terminal");
+  assert.deepEqual(ledger.exitReconciliation, {
+    status: "pending",
+    expectedExitCode: EXIT_CODES.completed
+  });
+
+  const reconciled = reconcileLifecycleLedger({
+    ledgerFile,
+    processHandle: "tracked-session-42",
+    outcome: "exited",
+    exitCode: EXIT_CODES.completed,
+    nowMs: Date.now()
+  });
+  assert.equal(reconciled.state, "exit_reconciled");
+  assert.equal(reconciled.exitReconciliation.status, "confirmed");
+});
+
+test("missing activation exits before runtime access with a terminal ledger intent", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-activation-eof-"));
+  const activationInput = new PassThrough();
+  const { module, state } = makeRuntimeModule();
+  const config = makeConfig(root);
+  const emitted = [];
+  const run = runSupervisor(config, {
+    runtimeModule: module,
+    activationInput,
+    activationTimeoutMs: 100,
+    bindSignals: false,
+    writeEvent(event) {
+      emitted.push(event);
+    }
+  });
+  activationInput.end();
+
+  assert.equal(await run, EXIT_CODES.supervisorError);
+  assert.equal(state.runtimeOptions, undefined);
+  assert.equal(emitted.at(-1).type, "supervisor_error");
+  assert.equal(emitted.at(-1).code, "activation_eof");
+  const ledgerFile = onlyLifecycleLedger(config.stateDir);
+  const ledger = JSON.parse(fs.readFileSync(ledgerFile, "utf8"));
+  assert.equal(ledger.state, "terminal_intent");
+  assert.equal(ledger.terminalIntent.code, "activation_eof");
+  assert.equal(ledger.exitReconciliation.expectedExitCode, EXIT_CODES.supervisorError);
+  assert.equal(loadLifecycleLedger(ledgerFile).document.processHandle, null);
+});
+
+test("terminal delivery failure corrects the private ledger to supervisor exit", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-ledger-delivery-fail-"));
+  const { module } = makeRuntimeModule();
+  const config = makeConfig(root);
+  const emitted = [];
+  const exitCode = await runSupervisor(config, {
+    runtimeModule: module,
+    bindSignals: false,
+    writeEvent(event) {
+      if (event.type === "terminal") {
+        throw new Error("private delivery failure");
+      }
+      emitted.push(event);
+    }
+  });
+
+  assert.equal(exitCode, EXIT_CODES.supervisorError);
+  assert.equal(emitted.some((event) => event.type === "terminal"), false);
+  const ledger = JSON.parse(fs.readFileSync(onlyLifecycleLedger(config.stateDir), "utf8"));
+  assert.equal(ledger.state, "terminal_intent");
+  assert.deepEqual(ledger.terminalIntent, {
+    type: "supervisor_error",
+    code: "supervisor_failure"
+  });
+  assert.deepEqual(ledger.exitReconciliation, {
+    status: "pending",
+    expectedExitCode: EXIT_CODES.supervisorError
+  });
+  assert.equal(JSON.stringify(ledger).includes("private delivery failure"), false);
+});
+
+test("dead handle without terminal evidence reconciles only as tracking_lost", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-tracking-lost-"));
+  if (process.platform !== "win32") {
+    fs.chmodSync(stateDir, 0o700);
+  }
+  const writer = createLifecycleLedger({
+    stateDir,
+    runId: "run-1",
+    requestId: "request-1",
+    nowMs: Date.now()
+  });
+  activateLifecycleLedger(writer, "tracked-session-99", Date.now());
+  recordLifecycleEvent(writer, {
+    type: "started",
+    sequence: 1,
+    timestamp: new Date().toISOString()
+  }, { force: true });
+
+  const reconciled = reconcileLifecycleLedger({
+    ledgerFile: writer.filePath,
+    processHandle: "tracked-session-99",
+    outcome: "tracking_lost",
+    nowMs: Date.now()
+  });
+  assert.equal(reconciled.state, "tracking_lost");
+  assert.equal(reconciled.trackingFault.code, "tracking_lost");
+  assert.equal(reconciled.exitReconciliation.status, "tracking_lost");
+  assert.throws(() => reconcileLifecycleLedger({
+    ledgerFile: writer.filePath,
+    processHandle: "tracked-session-99",
+    outcome: "tracking_lost"
+  }), /lifecycle_already_reconciled/);
+});
+
+test("lifecycle ledger loader rejects impossible states and unbounded nested shapes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-ledger-shape-"));
+  const timestamp = new Date().toISOString();
+  const base = {
+    schemaVersion: "acp-host-lifecycle.v1",
+    runId: "run-1",
+    requestId: "request-1",
+    processHandle: "tracked-session-42",
+    state: "terminal_intent",
+    activatedAt: timestamp,
+    lastEvent: { type: "terminal", sequence: 4, timestamp },
+    terminalIntent: { type: "terminal", status: "completed" },
+    exitReconciliation: { status: "pending", expectedExitCode: 0 },
+    trackingFault: null,
+    updatedAt: timestamp
+  };
+  const invalidDocuments = [
+    {
+      ...base,
+      state: "active"
+    },
+    {
+      ...base,
+      terminalIntent: { type: "terminal", status: "completed", detail: "private" }
+    },
+    {
+      ...base,
+      exitReconciliation: { status: "pending" }
+    },
+    {
+      ...base,
+      state: "exit_reconciled",
+      exitReconciliation: {
+        status: "confirmed",
+        expectedExitCode: 0,
+        exitCode: 20,
+        reconciledAt: timestamp
+      }
+    },
+    {
+      ...base,
+      state: "tracking_lost",
+      terminalIntent: null,
+      exitReconciliation: { status: "tracking_lost", reconciledAt: timestamp },
+      trackingFault: { code: "other", observedAt: timestamp }
+    },
+    {
+      ...base,
+      lastEvent: { type: "terminal\nprivate", sequence: 4, timestamp }
+    }
+  ];
+
+  for (const [index, document] of invalidDocuments.entries()) {
+    const ledgerFile = path.join(root, `invalid-${index}.json`);
+    fs.writeFileSync(ledgerFile, JSON.stringify(document), { mode: 0o600 });
+    assert.throws(
+      () => loadLifecycleLedger(ledgerFile),
+      /invalid_lifecycle_ledger/,
+      `case ${index}`
+    );
+  }
+});
 
 test("permission guard rejects detachment and bypass while allowing foreground parallel runners", () => {
   const allowed = new Set(["execute", "read"]);
@@ -2255,9 +2528,13 @@ test("public docs separate foreground ownership from host caller blocking", () =
   );
 
   assert.match(contract, /^## Host wait boundaries$/m);
+  assert.match(contract, /^## Host activation and lifecycle ledger$/m);
   for (const doc of [skill, contract]) {
     assert.match(doc, /1, 2, 4, and then 5 seconds/);
     assert.match(doc, /exact non-empty process handle/);
+    assert.match(doc, /acp-host-activation\.v1/);
+    assert.match(doc, /tracking_lost/);
+    assert.match(doc, /acp-lifecycle-reconcile-cli\.mjs/);
     assert.match(doc, /unless the message explicitly cancels or replaces it/);
     assert.match(
       doc,
@@ -2268,7 +2545,7 @@ test("public docs separate foreground ownership from host caller blocking", () =
   assert.doesNotMatch(skill + contract, /ten-minute|10-minute/i);
   assert.match(
     contract,
-    /define host-specific stale-session detection or recovery/
+    /discover or reconstruct a lost host handle/
   );
 });
 

@@ -81,6 +81,14 @@ The `CODEX_PATH` value is host-specific operator configuration, never a constant
 
 A bare direct supervisor launch with `agent: "claude"` fails closed before runtime loading. Do not background either process. Consume the newline-delimited JSON events while the process remains attached.
 
+Every production launch begins behind a host-activation barrier. The supervisor creates an owner-private `supervisor-<runId>.lifecycle.json` ledger in `stateDir`, emits `activation_required`, and waits without importing ACPX or touching an adapter. Bound the initial host exec wait to five seconds. When the host returns `status: running`, retain its exact non-empty process handle and write exactly one line through that same handle's stdin:
+
+```json
+{"schemaVersion":"acp-host-activation.v1","processHandle":"<exact-host-handle>"}
+```
+
+Only the matching `activation_confirmed` event permits runtime import, probe, `ensureSession`, and `startTurn`. EOF, timeout, malformed activation, or a missing/invalid handle fails closed before ACP mutation. The handle lives only in the private ledger and must never enter Discord output or a watchdog payload.
+
 ## Own the process without blocking the conversation
 
 Process foreground ownership and host conversation blocking are separate properties. Keep the first without assuming it requires the second.
@@ -89,7 +97,7 @@ Foreground ownership belongs to the supervisor process. It runs as exactly one t
 
 Conversation blocking belongs to the caller. One host tool call does not have to stay open for the whole ACP turn. Return control at short, bounded host-tool boundaries while the same supervisor process keeps running under host process tracking.
 
-Bound the initial host wait to five seconds unless the process is already terminal. Once the host reports a running process, retain its exact non-empty process handle and use only that handle for the rest of the turn.
+Bound the initial host wait to five seconds unless the process is already terminal. Once the host reports a running process, retain its exact non-empty process handle, activate the supervisor through that same handle as described above, and use only that handle for the rest of the turn. If no exact handle is returned, do not try another launch: the activation deadline ends the run before ACP mutation.
 
 Poll the retained handle with bounded waits of 1, 2, 4, and then 5 seconds for every later poll. Five seconds is the cap.
 
@@ -102,6 +110,8 @@ Do not substitute:
 - a second launch, wrapper, or nested runner around the same run
 
 A returned poll is a host-tool boundary. It is not activity evidence and never terminal evidence.
+
+Keep the owner turn alive while the handle is active. Do not final, yield, or abandon ownership between polls. If the handle becomes dead or unavailable without a matching terminal intent, classify the run as `tracking_lost`, stop active-reporting publication, and never infer success or relaunch automatically.
 
 ## Stay responsive at each poll boundary
 
@@ -121,7 +131,9 @@ Treat only the matching `terminal` event as terminal evidence. Preserve `complet
 
 Map supervisor exits as documented in the runtime contract. Never turn a failed or cancelled run into a success report. Treat process exit as the final delivery of that mapping; the CLI bounds output flushing before forcing termination so leaked runtime handles cannot hold the caller open.
 
-Report completion only after both the matching normalized terminal event and the mapped supervisor process exit. A returned poll, a quiet event stream, or a serviced conversation reply replaces neither.
+After the exact handle returns its process exit, reconcile the owner-private ledger with `scripts/acp-lifecycle-reconcile-cli.mjs --input <private JSON>`. The input binds the ledger path and the same handle to `outcome: "exited"` plus the mapped exit code. If the handle is dead with no terminal intent, use `outcome: "tracking_lost"` and no exit code. Handle mismatch, missing terminal evidence, exit mismatch, and attempts to overwrite an already reconciled ledger fail closed.
+
+Report completion only after both the matching normalized terminal event and the mapped supervisor process exit have been observed and the private-ledger reconciliation succeeds. A returned poll, a quiet event stream, or a serviced conversation reply replaces none of them.
 
 ## Foreground policy
 
@@ -139,4 +151,4 @@ The watchdog cadence, control-conversation routing, and public message templates
 
 ## Fail closed
 
-Stop without fallback when the start-receipt gate, reporting contract, environment preflight, runtime discovery, capability checks, permission inspection, event/result identity, response storage, or terminal mapping is uncertain. Do not recover by creating an official ACP thread or launching untracked ACPX.
+Stop without fallback when the start-receipt gate, reporting contract, host activation, private lifecycle ledger, exact-handle tracking, environment preflight, runtime discovery, capability checks, permission inspection, event/result identity, response storage, exit reconciliation, or terminal mapping is uncertain. Do not recover by creating an official ACP thread, launching untracked ACPX, reconstructing ownership from PIDs/transcripts, or automatically retrying `tracking_lost`.

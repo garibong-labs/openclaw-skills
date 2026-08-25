@@ -417,14 +417,20 @@ test("canonical launcher replaces itself with the supervisor under one PID", EXE
   const result = spawnSync(process.execPath, [LAUNCHER_PATH, "--config", configFile], {
     env: cleanSpawnEnv(),
     encoding: "utf8",
+    input: JSON.stringify({
+      schemaVersion: "acp-host-activation.v1",
+      processHandle: "launcher-e2e-session"
+    }) + "\n",
     timeout: 30000
   });
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, "");
   const events = result.stdout.trim().split("\n").map((line) => JSON.parse(line));
-  assert.equal(events[0].type, "started");
-  assert.equal(events[0].agent, "claude");
+  assert.equal(events[0].type, "activation_required");
+  assert.equal(events[1].type, "activation_confirmed");
+  const started = events.find((event) => event.type === "started");
+  assert.equal(started.agent, "claude");
   assert.equal(events.at(-1).type, "terminal");
   assert.equal(events.at(-1).status, "completed");
   assert.equal(events.at(-1).supervisorStatus, "ok");

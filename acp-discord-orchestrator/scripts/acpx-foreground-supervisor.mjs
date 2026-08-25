@@ -9,8 +9,27 @@ import {
   AcpReportingContractError,
   validateAcpReportingContract
 } from "./acp-reporting-contract.mjs";
+import {
+  ACP_HOST_ACTIVATION_SCHEMA_VERSION,
+  DEFAULT_HOST_ACTIVATION_TIMEOUT_MS,
+  activateLifecycleLedger,
+  createLifecycleLedger,
+  parseHostActivationLine,
+  recordLifecycleEvent,
+  recordLifecycleFailureIntent,
+  waitForHostActivation
+} from "./acp-lifecycle-ledger.mjs";
 
 export { ACP_AGENT_PRESENTATIONS, ACP_SUPPORTED_AGENTS } from "./acp-reporting-contract.mjs";
+export {
+  ACP_HOST_ACTIVATION_SCHEMA_VERSION,
+  ACP_LIFECYCLE_LEDGER_SCHEMA_VERSION,
+  DEFAULT_HOST_ACTIVATION_TIMEOUT_MS,
+  lifecycleLedgerPath,
+  parseHostActivationLine,
+  reconcileLifecycleLedger,
+  waitForHostActivation
+} from "./acp-lifecycle-ledger.mjs";
 
 export const SCHEMA_VERSION = "acp-discord-orchestrator.v1";
 export const EXIT_CODES = Object.freeze({
@@ -1608,6 +1627,7 @@ export async function runSupervisor(config, dependencies = {}) {
   let handle;
   let turn;
   let progressTimer;
+  let lifecycleLedger;
   let eventIterator;
   let eventPumpStopped = false;
   let outputClosed = false;
@@ -1618,7 +1638,7 @@ export async function runSupervisor(config, dependencies = {}) {
   const eventCloseGraceMs = dependencies.eventCloseGraceMs ?? 500;
   const cleanupTimeoutMs = dependencies.cleanupTimeoutMs ?? 5000;
 
-  const emit = (type, payload = {}) => {
+  const emit = (type, payload = {}, lifecycleOptions = {}) => {
     if (outputClosed) {
       return false;
     }
@@ -1628,7 +1648,7 @@ export async function runSupervisor(config, dependencies = {}) {
     }
     const timestampMs = now();
     sequence += 1;
-    writeEvent({
+    const event = {
       schemaVersion: SCHEMA_VERSION,
       runId,
       requestId,
@@ -1637,7 +1657,9 @@ export async function runSupervisor(config, dependencies = {}) {
       elapsedMs: Math.max(0, timestampMs - startedAt),
       type,
       ...payload
-    });
+    };
+    recordLifecycleEvent(lifecycleLedger, event, lifecycleOptions);
+    writeEvent(event);
     return true;
   };
 
@@ -1685,6 +1707,44 @@ export async function runSupervisor(config, dependencies = {}) {
     if (fs.existsSync(config.responseFile)) {
       fail("response_file_exists");
     }
+
+    // ACP runtime loading and every mutating adapter surface stay behind one
+    // host-activation barrier. The caller first launches this process through
+    // a bounded tracked exec, receives that exec's exact non-empty handle, and
+    // then writes the activation record back through that same handle's stdin.
+    // A missing launch response can therefore never reach runtime import,
+    // ensureSession, or startTurn.
+    lifecycleLedger = createLifecycleLedger({
+      stateDir: config.stateDir,
+      runId,
+      requestId,
+      nowMs: now()
+    });
+    emit("activation_required", {
+      activationSchemaVersion: ACP_HOST_ACTIVATION_SCHEMA_VERSION
+    });
+    let activation;
+    if ("hostActivation" in dependencies) {
+      activation = parseHostActivationLine(JSON.stringify(dependencies.hostActivation));
+    } else if ("activationInput" in dependencies) {
+      activation = await waitForHostActivation(dependencies.activationInput, {
+        timeoutMs: dependencies.activationTimeoutMs ?? DEFAULT_HOST_ACTIVATION_TIMEOUT_MS
+      });
+    } else if (dependencies.runtimeModule) {
+      // Hermetic unit tests inject the runtime module directly and cannot be
+      // reached by the production CLI. Keep the legacy test seam bounded to a
+      // fixed synthetic handle; production always reads process.stdin below.
+      activation = {
+        schemaVersion: ACP_HOST_ACTIVATION_SCHEMA_VERSION,
+        processHandle: "in-memory-test-handle"
+      };
+    } else {
+      activation = await waitForHostActivation(process.stdin, {
+        timeoutMs: dependencies.activationTimeoutMs ?? DEFAULT_HOST_ACTIVATION_TIMEOUT_MS
+      });
+    }
+    activateLifecycleLedger(lifecycleLedger, activation.processHandle, now());
+    emit("activation_confirmed");
 
     const loaded = await loadRuntimeModule(config, dependencies);
     const permissionHandler = buildPermissionHandler({
@@ -1915,10 +1975,14 @@ export async function runSupervisor(config, dependencies = {}) {
       terminal.errorCode = safeErrorCode(result.error.code);
       terminal.retryable = result.error.retryable === true;
     }
-    emit("terminal", terminal);
-    return supervisorStatus === "ok"
+    const mappedExitCode = supervisorStatus === "ok"
       ? EXIT_CODES[result.status]
       : EXIT_CODES.supervisorError;
+    emit("terminal", terminal, {
+      expectedExitCode: mappedExitCode,
+      force: true
+    });
+    return mappedExitCode;
   } catch (error) {
     if (progressTimer) {
       clearInterval(progressTimer);
@@ -1928,9 +1992,23 @@ export async function runSupervisor(config, dependencies = {}) {
       "supervisor_failure"
     );
     try {
-      emit("supervisor_error", { code });
+      emit("supervisor_error", { code }, {
+        expectedExitCode: EXIT_CODES.supervisorError,
+        force: true
+      });
     } catch {
       // There is no safe secondary output channel after event delivery fails.
+    }
+    try {
+      recordLifecycleFailureIntent(
+        lifecycleLedger,
+        code,
+        EXIT_CODES.supervisorError,
+        now()
+      );
+    } catch {
+      // The original supervisor error remains authoritative when the private
+      // ledger cannot be corrected.
     }
     return EXIT_CODES.supervisorError;
   } finally {
