@@ -17,7 +17,8 @@ import {
   ACP_REPORT_INSTRUCTION,
   ACP_REPORT_ISSUE_HEADER,
   ACP_REPORT_PHASES,
-  ACP_REPORT_SECTION_HEADERS
+  ACP_REPORT_SECTION_HEADERS,
+  buildAcpStartMessage
 } from "./acp-reporting-contract.mjs";
 
 export const FIXTURE_REPOSITORY = "openclaw-skills";
@@ -29,6 +30,58 @@ const DEFAULT_SECTION_BULLETS = Object.freeze([
   "- 단위 테스트 통과 확인",
   "- 통합 검증 마무리"
 ]);
+
+const FIXTURE_START_TIME_KST = "18:30";
+
+// Canonical path: the production builder. Returns null when the fixture
+// inputs are not the builder's valid shape (spoofed label, screened bullet,
+// non-canonical agent, …) so the caller falls back to literal assembly.
+function tryBuildStartMessage({ agent, agentLabel, model, roundIndex, repository, branch, scopeBullet }) {
+  if (
+    agentLabel !== ACP_AGENT_PRESENTATIONS[agent] ||
+    typeof scopeBullet !== "string" ||
+    !scopeBullet.startsWith("- ")
+  ) {
+    return null;
+  }
+  try {
+    return buildAcpStartMessage({
+      agent,
+      model,
+      roundIndex,
+      repository,
+      branch,
+      timeKst: FIXTURE_START_TIME_KST,
+      scope: scopeBullet.slice(2),
+      externalAction: "없음"
+    });
+  } catch {
+    return null;
+  }
+}
+
+// Literal fallback for deliberately invalid bundles, byte-identical to the
+// builder's output whenever both paths accept the same inputs.
+function buildLiteralStartMessage({ agentLabel, model, roundIndex, repository, branch, scopeBullet }) {
+  const title = roundIndex === 1
+    ? `🚀 **ACP 작업 시작 · ${FIXTURE_START_TIME_KST} KST**`
+    : `🔁 **ACP 수정 라운드 ${roundIndex} 시작 · ${FIXTURE_START_TIME_KST} KST**`;
+  return [
+    title,
+    "",
+    `🤖 **ACP**: ${agentLabel} · \`${model}\``,
+    `📍 **작업**: \`${repository}\` · \`${branch}\``,
+    "",
+    "🎯 **범위**",
+    scopeBullet,
+    "",
+    "🕒 **중간 보고**",
+    "- ACP 실행 10분 이상일 때만 시작",
+    "",
+    "🔒 **외부 작업**",
+    "- 없음"
+  ].join("\n");
+}
 
 /**
  * Build a fully valid reporting bundle bound to the given canonical agent,
@@ -60,24 +113,16 @@ export function buildValidReporting({
   sectionBullets = DEFAULT_SECTION_BULLETS,
   issueBullet = null
 }) {
-  const title = roundIndex === 1
-    ? "🚀 **ACP 작업 시작 · 18:30 KST**"
-    : `🔁 **ACP 수정 라운드 ${roundIndex} 시작 · 18:30 KST**`;
-  const startMessage = [
-    title,
-    "",
-    `🤖 **ACP**: ${agentLabel} · \`${model}\``,
-    `📍 **작업**: \`${repository}\` · \`${branch}\``,
-    "",
-    "🎯 **범위**",
-    scopeBullet,
-    "",
-    "🕒 **중간 보고**",
-    "- ACP 실행 10분 이상일 때만 시작",
-    "",
-    "🔒 **외부 작업**",
-    "- 없음"
-  ].join("\n");
+  // The valid path derives the start message through the production builder,
+  // so integration fixtures exercise the same canonical preparation path as
+  // operators — title and harness-label derivation included. Deliberately
+  // invalid fixtures (a spoofed agentLabel, a screened or malformed
+  // scopeBullet, a non-canonical agent) cannot pass the fail-closed builder
+  // and fall back to literal assembly: the contract under test, not this
+  // fixture, must be what rejects them.
+  const startMessage =
+    tryBuildStartMessage({ agent, agentLabel, model, roundIndex, repository, branch, scopeBullet }) ??
+    buildLiteralStartMessage({ agentLabel, model, roundIndex, repository, branch, scopeBullet });
   const reportLines = [
     "🔄 **ACP 중간 보고 · 18:45 KST**",
     "",

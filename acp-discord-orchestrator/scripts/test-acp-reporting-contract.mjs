@@ -5,6 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   AcpReportingContractError,
+  buildAcpStartMessage,
   validateAcpReportingContract,
 } from './acp-reporting-contract.mjs';
 
@@ -920,4 +921,207 @@ test('unsupported and non-canonical context agents are rejected first', () => {
       'invalid_reporting_agent'
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// buildAcpStartMessage — the production start-message builder. Expected
+// outputs are written as literals (not composed from module constants) so a
+// template drift in the builder fails these tests.
+// ---------------------------------------------------------------------------
+
+const BUILDER_INPUT = Object.freeze({
+  agent: 'claude',
+  model: 'claude-fable-5',
+  roundIndex: 1,
+  repository: REPO,
+  branch: BRANCH,
+  timeKst: '09:12',
+  scope: '보고 시작 메시지 빌더 검증',
+  externalAction: '없음',
+});
+
+function expectBuilderError(input, code) {
+  expectContractError(() => buildAcpStartMessage(input), code);
+}
+
+test('builder renders the exact 13-line round-1 message', () => {
+  assert.equal(
+    buildAcpStartMessage({ ...BUILDER_INPUT }),
+    [
+      '🚀 **ACP 작업 시작 · 09:12 KST**',
+      '',
+      '🤖 **ACP**: Claude Code · `claude-fable-5`',
+      `📍 **작업**: \`${REPO}\` · \`${BRANCH}\``,
+      '',
+      '🎯 **범위**',
+      '- 보고 시작 메시지 빌더 검증',
+      '',
+      '🕒 **중간 보고**',
+      '- ACP 실행 10분 이상일 때만 시작',
+      '',
+      '🔒 **외부 작업**',
+      '- 없음',
+    ].join('\n')
+  );
+});
+
+test('builder renders the exact correction-round-3 message with the derived 🔁 title', () => {
+  const message = buildAcpStartMessage({
+    ...BUILDER_INPUT,
+    agent: 'codex',
+    model: 'gpt-5.6-sol[medium]',
+    roundIndex: 3,
+  });
+  assert.equal(
+    message,
+    [
+      '🔁 **ACP 수정 라운드 3 시작 · 09:12 KST**',
+      '',
+      '🤖 **ACP**: Codex · `gpt-5.6-sol[medium]`',
+      `📍 **작업**: \`${REPO}\` · \`${BRANCH}\``,
+      '',
+      '🎯 **범위**',
+      '- 보고 시작 메시지 빌더 검증',
+      '',
+      '🕒 **중간 보고**',
+      '- ACP 실행 10분 이상일 때만 시작',
+      '',
+      '🔒 **외부 작업**',
+      '- 없음',
+    ].join('\n')
+  );
+});
+
+test('builder output is byte-identical to the suite literal template for both agents', () => {
+  for (const [agent, model] of [
+    ['claude', CONTEXT.model],
+    ['codex', CODEX_CONTEXT.model],
+  ]) {
+    for (const roundIndex of [1, 2, 7]) {
+      assert.equal(
+        buildAcpStartMessage({
+          agent,
+          model,
+          roundIndex,
+          repository: REPO,
+          branch: BRANCH,
+          timeKst: '18:30',
+          scope: '보고 계약 모듈과 테스트 구현',
+          externalAction: '없음',
+        }),
+        buildStartMessage({ roundIndex, label: AGENT_LABELS[agent], model })
+      );
+    }
+  }
+});
+
+test('builder derives runtime-default for an omitted claude model and rejects codex omission', () => {
+  const omitted = buildAcpStartMessage({ ...BUILDER_INPUT, model: undefined });
+  assert.equal(omitted.split('\n')[2], '🤖 **ACP**: Claude Code · `runtime-default`');
+  expectBuilderError(
+    { ...BUILDER_INPUT, agent: 'codex', model: undefined },
+    'invalid_reporting_context'
+  );
+});
+
+test('builder rejects caller-supplied titles and harness labels as unknown keys', () => {
+  for (const smuggled of [
+    { title: '🚀 **ACP 작업 시작 · 09:12 KST**' },
+    { agentLabel: 'Claude Codex Ultra' },
+    { label: 'Codex' },
+    { startMessage: 'x' },
+  ]) {
+    expectBuilderError({ ...BUILDER_INPUT, ...smuggled }, 'invalid_reporting_context');
+  }
+});
+
+test('builder rejects non-canonical and unsupported agents', () => {
+  for (const agent of ['Claude', ' codex ', 'CODEX', 'gemini', '', undefined, null, 42]) {
+    expectBuilderError({ ...BUILDER_INPUT, agent }, 'invalid_reporting_agent');
+  }
+});
+
+test('builder validates roundIndex, repository, branch, and time', () => {
+  for (const roundIndex of [0, -1, 2.5, '3', 1001, undefined]) {
+    expectBuilderError({ ...BUILDER_INPUT, roundIndex }, 'invalid_reporting_round_index');
+  }
+  expectBuilderError({ ...BUILDER_INPUT, repository: 'a/b' }, 'invalid_reporting_repository');
+  expectBuilderError({ ...BUILDER_INPUT, branch: 'a b' }, 'invalid_reporting_branch');
+  for (const timeKst of ['9:12', '24:00', '09:60', '09:12 KST', '', undefined]) {
+    expectBuilderError({ ...BUILDER_INPUT, timeKst }, 'invalid_reporting_start_message');
+  }
+});
+
+test('builder sanitizes the free-text slots and never echoes rejected text', () => {
+  for (const scope of ['', ' 앞공백', '뒷공백 ', '- 미리 조립된 불릿', '두\n줄', '제어문자', undefined]) {
+    expectBuilderError({ ...BUILDER_INPUT, scope }, 'invalid_reporting_start_message');
+  }
+  // A slot made only of zero-width characters renders as blank and fails the
+  // validator's visible-bullet check.
+  expectBuilderError({ ...BUILDER_INPUT, externalAction: '​​' }, 'invalid_reporting_start_message');
+
+  // The forbidden-content screen runs through the same validator path.
+  const screened = 'git status 출력 정리';
+  try {
+    buildAcpStartMessage({ ...BUILDER_INPUT, scope: screened });
+    assert.fail('expected forbidden-content rejection');
+  } catch (err) {
+    assert.ok(err instanceof AcpReportingContractError);
+    assert.equal(err.code, 'invalid_reporting_forbidden_content');
+    assert.ok(!err.message.includes(screened), 'error message must not echo the rejected slot text');
+  }
+});
+
+test('builder-generated messages validate under the existing reporting contract', () => {
+  for (const [agent, context] of [
+    ['claude', CONTEXT],
+    ['codex', CODEX_CONTEXT],
+  ]) {
+    for (const roundIndex of [1, 3]) {
+      const startMessage = buildAcpStartMessage({
+        agent,
+        model: context.model,
+        roundIndex,
+        repository: REPO,
+        branch: BRANCH,
+        timeKst: '18:30',
+        scope: '보고 계약 모듈과 테스트 구현',
+        externalAction: '없음',
+      });
+      const reporting = buildReporting({ agent, model: context.model, roundIndex });
+      reporting.startMessage = startMessage;
+      reporting.startReceipt.message = startMessage;
+      const normalized = validateAcpReportingContract(reporting, context);
+      assert.equal(normalized.startMessage, startMessage);
+    }
+  }
+});
+
+test('regression: hand-written round-1 title in a correction round fails; builder output cannot', () => {
+  // The prior mismatch class: a correction-round config whose hand-assembled
+  // startMessage still carries the round-1 🚀 title. Hand-written, it slips
+  // into the bundle and only the validator catches it …
+  const drifted = buildReporting({ roundIndex: 3 });
+  const round1Title = buildStartMessage({ roundIndex: 1 });
+  drifted.startMessage = round1Title;
+  drifted.startReceipt.message = round1Title;
+  expectRejected(drifted, 'invalid_reporting_start_message');
+
+  // … while the builder derives the title from roundIndex alone, so the same
+  // structured input can only ever render the correction title.
+  const built = buildAcpStartMessage({
+    agent: 'claude',
+    model: CONTEXT.model,
+    roundIndex: 3,
+    repository: REPO,
+    branch: BRANCH,
+    timeKst: '18:30',
+    scope: '보고 계약 모듈과 테스트 구현',
+    externalAction: '없음',
+  });
+  assert.ok(built.startsWith('🔁 **ACP 수정 라운드 3 시작 · '));
+  const reporting = buildReporting({ roundIndex: 3 });
+  reporting.startMessage = built;
+  reporting.startReceipt.message = built;
+  validateAcpReportingContract(reporting, CONTEXT);
 });

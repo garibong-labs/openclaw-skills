@@ -17,6 +17,12 @@
  * context. An agent outside the mapping, or any non-canonical spelling of a
  * supported agent, is rejected with `invalid_reporting_agent` before any
  * template content is examined.
+ *
+ * The module also owns the one production preparation path for the start
+ * message: buildAcpStartMessage derives the complete 13-line round-start
+ * template — round title included — from structured inputs and self-checks
+ * the result through the same validator, so callers never hand-assemble the
+ * template or choose its title or harness label.
  */
 
 const MAX_DISCORD_MESSAGE_LENGTH = 1400;
@@ -234,9 +240,20 @@ function deepFreeze(value) {
   return value;
 }
 
-function validateContext(context) {
-  if (!isPlainObject(context)) fail('invalid_reporting_context', 'context must be a plain object');
-  const { agent, model, controlConversationId, lifecycleStartReceipt } = context;
+// One shared model-string rule for every surface that renders a model on an
+// ACP identity line, so the builder and the validator can never accept
+// different model spellings.
+function isValidModelString(model) {
+  return (
+    typeof model === 'string' &&
+    model.length > 0 &&
+    model.length <= MAX_MODEL_LENGTH &&
+    !SINGLE_LINE_CONTROL_RE.test(model) &&
+    !model.includes('`')
+  );
+}
+
+function assertCanonicalAgent(agent, label) {
   // The agent is the supervisor's canonical config agent, not caller-chosen
   // presentation data. Only an exact canonical key of the closed presentation
   // mapping passes: an unsupported agent, a non-string, or any spelling that
@@ -246,8 +263,14 @@ function validateContext(context) {
     typeof agent !== 'string' ||
     !Object.prototype.hasOwnProperty.call(ACP_AGENT_PRESENTATIONS, agent)
   ) {
-    fail('invalid_reporting_agent', 'context.agent must be one of the canonical supported ACP agent names');
+    fail('invalid_reporting_agent', `${label} must be one of the canonical supported ACP agent names`);
   }
+}
+
+function validateContext(context) {
+  if (!isPlainObject(context)) fail('invalid_reporting_context', 'context must be a plain object');
+  const { agent, model, controlConversationId, lifecycleStartReceipt } = context;
+  assertCanonicalAgent(agent, 'context.agent');
   // `model` is optional in the supervisor config. A run without a pinned
   // model identifies itself with the same fixed label the supervisor's
   // `started` event emits, so the public templates and the event stream never
@@ -255,13 +278,7 @@ function validateContext(context) {
   let resolvedModel;
   if (model === undefined) {
     resolvedModel = ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL;
-  } else if (
-    typeof model !== 'string' ||
-    model.length === 0 ||
-    model.length > MAX_MODEL_LENGTH ||
-    SINGLE_LINE_CONTROL_RE.test(model) ||
-    model.includes('`')
-  ) {
+  } else if (!isValidModelString(model)) {
     fail('invalid_reporting_context', 'context.model must be omitted or a non-empty single-line model string');
   } else {
     resolvedModel = model;
@@ -401,6 +418,133 @@ function assertNoForbiddenContent(text, label) {
       fail('invalid_reporting_forbidden_content', `${label} contains forbidden operational content (${patternId})`);
     }
   }
+}
+
+// Input keys of buildAcpStartMessage. Deliberately closed: there is no title,
+// label, or raw-line key, so a caller cannot smuggle presentation data into
+// the builder — the round title and the public harness label are always
+// derived from roundIndex and the closed presentation mapping.
+const START_MESSAGE_INPUT_KEYS = Object.freeze([
+  'agent',
+  'model',
+  'roundIndex',
+  'repository',
+  'branch',
+  'timeKst',
+  'scope',
+  'externalAction',
+]);
+const TIME_KST_RE = new RegExp(`^${HHMM}$`);
+
+// The two free-text slot inputs arrive as bullet content, not bullet lines:
+// the builder owns the "- " prefix so a pre-assembled bullet (or a smuggled
+// second line) cannot change the template shape. Error messages name only the
+// slot, never the rejected text.
+function validateStartBulletInput(value, label) {
+  if (typeof value !== 'string' || value.length === 0 || SINGLE_LINE_CONTROL_RE.test(value)) {
+    fail('invalid_reporting_start_message', `${label} must be a non-empty single-line string`);
+  }
+  if (value !== value.trim()) {
+    fail('invalid_reporting_start_message', `${label} must not have leading or trailing whitespace`);
+  }
+  if (value.startsWith('- ')) {
+    fail('invalid_reporting_start_message', `${label} must be bullet content without a leading "- " prefix`);
+  }
+  return value;
+}
+
+/**
+ * Build the exact 13-line public round-start message from structured inputs.
+ *
+ * This is the one production preparation path for `startMessage`: the round
+ * title (`🚀 ACP 작업 시작` for roundIndex 1, `🔁 ACP 수정 라운드 N 시작` for
+ * every later round) and the public harness label are derived here — from
+ * `roundIndex` and the closed ACP_AGENT_PRESENTATIONS mapping — and cannot be
+ * supplied by the caller, so correction-round title drift is structurally
+ * impossible. Pure like the validator: no I/O, no clock access (the caller
+ * states the HH:MM KST delivery time), no randomness.
+ *
+ * The returned message is self-checked through validateStartMessage — the
+ * same code path that gates run configs, including the forbidden-content
+ * screen on the two free-text slots — so builder output can never drift from
+ * the contract grammar.
+ *
+ * @param {{ agent: string, model?: string, roundIndex: number,
+ *           repository: string, branch: string, timeKst: string,
+ *           scope: string, externalAction: string }} input
+ *   — `agent` must be a canonical key of ACP_AGENT_PRESENTATIONS. `model` may
+ *   be omitted only for `claude` (the message then carries the literal
+ *   `runtime-default` label); every other agent must state the run's
+ *   effective model, because the supervisor normalizes its omitted config
+ *   model to an explicit default before reporting validation. `scope` and
+ *   `externalAction` are single-line bullet content without the "- " prefix.
+ * @returns {string} the validated 13-line start message
+ * @throws {AcpReportingContractError} with a stable `invalid_reporting_*` code
+ */
+export function buildAcpStartMessage(input) {
+  if (!isPlainObject(input)) {
+    fail('invalid_reporting_context', 'start-message input must be a plain object');
+  }
+  for (const key of Object.keys(input)) {
+    if (!START_MESSAGE_INPUT_KEYS.includes(key)) {
+      fail('invalid_reporting_context', `start-message input contains unsupported key "${describeKey(key)}"`);
+    }
+  }
+  const { agent, model, roundIndex, timeKst } = input;
+  assertCanonicalAgent(agent, 'input.agent');
+  const agentLabel = ACP_AGENT_PRESENTATIONS[agent];
+  let resolvedModel;
+  if (model === undefined) {
+    // Genuine model omission (the public `runtime-default` label) exists only
+    // for claude runs: the supervisor normalizes an omitted codex config
+    // model to its explicit default before reporting validation, so a codex
+    // start message must name that effective model explicitly.
+    if (agent !== 'claude') {
+      fail('invalid_reporting_context', 'input.model is required for this agent and must name the run effective model');
+    }
+    resolvedModel = ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL;
+  } else if (!isValidModelString(model)) {
+    fail('invalid_reporting_context', 'input.model must be omitted or a non-empty single-line model string');
+  } else {
+    resolvedModel = model;
+  }
+  if (!Number.isInteger(roundIndex) || roundIndex < 1 || roundIndex > MAX_ROUND_INDEX) {
+    fail('invalid_reporting_round_index', `roundIndex must be a positive integer of at most ${MAX_ROUND_INDEX}`);
+  }
+  const repository = validateRepository(input.repository);
+  const branch = validateBranch(input.branch);
+  if (typeof timeKst !== 'string' || !TIME_KST_RE.test(timeKst)) {
+    fail('invalid_reporting_start_message', 'input.timeKst must be a 24-hour HH:MM time');
+  }
+  const scope = validateStartBulletInput(input.scope, 'input.scope');
+  const externalAction = validateStartBulletInput(input.externalAction, 'input.externalAction');
+  const title =
+    roundIndex === 1
+      ? `🚀 **ACP 작업 시작 · ${timeKst} KST**`
+      : `🔁 **ACP 수정 라운드 ${roundIndex} 시작 · ${timeKst} KST**`;
+  const startMessage = [
+    title,
+    '',
+    `🤖 **ACP**: ${agentLabel} · \`${resolvedModel}\``,
+    `📍 **작업**: \`${repository}\` · \`${branch}\``,
+    '',
+    '🎯 **범위**',
+    `- ${scope}`,
+    '',
+    '🕒 **중간 보고**',
+    '- ACP 실행 10분 이상일 때만 시작',
+    '',
+    '🔒 **외부 작업**',
+    `- ${externalAction}`,
+  ].join('\n');
+  validateStartMessage(startMessage, {
+    roundIndex,
+    repository,
+    branch,
+    agentLabel,
+    model: resolvedModel,
+  });
+  return startMessage;
 }
 
 function validateMiddleReport(report, expected) {

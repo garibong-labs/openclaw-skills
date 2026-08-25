@@ -133,3 +133,159 @@ export function createAcpRuntime() {
   assert.equal(events.at(-1).supervisorStatus, "degraded");
   assert.equal(events.at(-1).cleanupOk, false);
 });
+
+// ---------------------------------------------------------------------------
+// acp-start-message-cli.mjs — the production start-message builder CLI.
+// ---------------------------------------------------------------------------
+
+const INVALID_CONFIG_EXIT = 64;
+
+const START_MESSAGE_CLI = fileURLToPath(new URL(
+  "../acp-discord-orchestrator/scripts/acp-start-message-cli.mjs",
+  import.meta.url
+));
+
+const START_MESSAGE_INPUT = Object.freeze({
+  agent: "codex",
+  model: "gpt-5.6-sol[medium]",
+  roundIndex: 1,
+  repository: "openclaw-skills",
+  branch: "fix/acp-reporting-start-builder",
+  timeKst: "18:30",
+  scope: "보고 시작 메시지 빌더 검증",
+  externalAction: "없음"
+});
+
+function runStartMessageCli(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [START_MESSAGE_CLI, ...args], {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+function writeStartMessageInput(root, input, mode = 0o600) {
+  const inputFile = path.join(root, "start-message.json");
+  fs.writeFileSync(inputFile, JSON.stringify(input), { mode });
+  // The creation mode is narrowed by the process umask; set the exact mode so
+  // the broad-permissions case really is broad.
+  fs.chmodSync(inputFile, mode);
+  return inputFile;
+}
+
+async function expectStartMessageCliError(args, code) {
+  const outcome = await runStartMessageCli(args);
+  assert.equal(outcome.code, INVALID_CONFIG_EXIT);
+  assert.equal(outcome.stdout, "");
+  const events = outcome.stderr.trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, "start_message_builder_error");
+  assert.equal(events[0].code, code);
+  return outcome;
+}
+
+test("start-message CLI renders the exact round-1 message from a private JSON input", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-start-cli-"));
+  const inputFile = writeStartMessageInput(root, START_MESSAGE_INPUT);
+  const outcome = await runStartMessageCli(["--input", inputFile]);
+  assert.equal(outcome.code, 0);
+  assert.equal(outcome.stderr, "");
+  assert.equal(outcome.stdout, [
+    "🚀 **ACP 작업 시작 · 18:30 KST**",
+    "",
+    "🤖 **ACP**: Codex · `gpt-5.6-sol[medium]`",
+    "📍 **작업**: `openclaw-skills` · `fix/acp-reporting-start-builder`",
+    "",
+    "🎯 **범위**",
+    "- 보고 시작 메시지 빌더 검증",
+    "",
+    "🕒 **중간 보고**",
+    "- ACP 실행 10분 이상일 때만 시작",
+    "",
+    "🔒 **외부 작업**",
+    "- 없음",
+    ""
+  ].join("\n"));
+});
+
+test("start-message CLI derives the correction title from roundIndex alone", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-start-cli-"));
+  const inputFile = writeStartMessageInput(root, { ...START_MESSAGE_INPUT, roundIndex: 3 });
+  const outcome = await runStartMessageCli(["--input", inputFile]);
+  assert.equal(outcome.code, 0);
+  assert.equal(outcome.stderr, "");
+  assert.equal(
+    outcome.stdout.split("\n")[0],
+    "🔁 **ACP 수정 라운드 3 시작 · 18:30 KST**"
+  );
+});
+
+test("start-message CLI rejects a caller-supplied title without echoing it", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-start-cli-"));
+  const smuggledTitle = "🚀 **ACP 작업 시작 · 18:30 KST**";
+  const inputFile = writeStartMessageInput(root, {
+    ...START_MESSAGE_INPUT,
+    roundIndex: 3,
+    title: smuggledTitle
+  });
+  const outcome = await expectStartMessageCliError(
+    ["--input", inputFile],
+    "invalid_reporting_context"
+  );
+  assert.ok(!outcome.stderr.includes(smuggledTitle));
+});
+
+test("start-message CLI rejects screened free text without echoing it", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-start-cli-"));
+  const inputFile = writeStartMessageInput(root, {
+    ...START_MESSAGE_INPUT,
+    scope: "git status 출력 정리"
+  });
+  const outcome = await expectStartMessageCliError(
+    ["--input", inputFile],
+    "invalid_reporting_forbidden_content"
+  );
+  assert.ok(!outcome.stderr.includes("git status"));
+});
+
+test("start-message CLI enforces usage and private-path handling without echoing paths", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-start-cli-"));
+
+  await expectStartMessageCliError([], "usage");
+  await expectStartMessageCliError(["--config", path.join(root, "x.json")], "usage");
+  await expectStartMessageCliError(
+    ["--input", "relative/start.json"],
+    "invalid_input_path_not_absolute"
+  );
+  await expectStartMessageCliError(
+    ["--input", path.join(root, "missing.json")],
+    "invalid_input_file_missing"
+  );
+
+  const broad = writeStartMessageInput(root, START_MESSAGE_INPUT, 0o644);
+  const outcome = await expectStartMessageCliError(
+    ["--input", broad],
+    "invalid_input_file_permissions"
+  );
+  assert.ok(!outcome.stderr.includes(root));
+
+  const link = path.join(root, "link.json");
+  fs.symlinkSync(broad, link);
+  await expectStartMessageCliError(["--input", link], "invalid_input_file_symlink");
+
+  const malformed = path.join(root, "malformed.json");
+  fs.writeFileSync(malformed, "{not json", { mode: 0o600 });
+  await expectStartMessageCliError(["--input", malformed], "invalid_input_json");
+});
