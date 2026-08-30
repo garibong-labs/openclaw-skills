@@ -21,6 +21,7 @@ import {
   EXIT_CODES,
   loadSupervisorConfig
 } from "./acpx-foreground-supervisor.mjs";
+import { assembleSupervisorConfig } from "./acpx-runtime-preflight.mjs";
 
 const LAUNCHER_PATH = fileURLToPath(new URL("./claude-acp-launcher.mjs", import.meta.url));
 const SUPERVISOR_PATH = fileURLToPath(
@@ -627,7 +628,13 @@ test("substituted public template loads through the real supervisor loader", () 
     for (const placeholder of placeholders) {
       assert.equal(bound.includes(placeholder), false, `${placeholder} must be bound`);
     }
-    return bound;
+    // The template ships runtimeModule as the deliberately non-absolute
+    // preflight sentinel; the canonical preparation replaces it through the
+    // runtime-preflight assemble seam, exercised here with an attested-style
+    // absolute path.
+    const draft = JSON.parse(bound);
+    assert.equal(draft.runtimeModule, "RUNTIME_MODULE_FROM_PREFLIGHT");
+    return JSON.stringify(assembleSupervisorConfig(draft, { runtimeModule: root }));
   };
 
   // The agent-neutral template loads as-is for codex: no auth block needed.

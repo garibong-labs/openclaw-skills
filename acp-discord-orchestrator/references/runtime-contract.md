@@ -6,6 +6,7 @@ This reference defines the compatibility and evidence boundary for the direct AC
 
 - [Required capabilities](#required-capabilities)
 - [Compatibility targets](#compatibility-targets)
+- [Runtime-module preflight](#runtime-module-preflight)
 - [Private input and output](#private-input-and-output)
 - [Config fields](#config-fields)
 - [Start-receipt gate](#start-receipt-gate)
@@ -26,7 +27,7 @@ This reference defines the compatibility and evidence boundary for the direct AC
 
 Run on Node.js 22.13 or newer. The production host transport is POSIX-only and requires an available tmux executable plus an executable regular `/usr/bin/env`; the transport uses `env -i` to prevent stale tmux-server environment variables from entering the runner. The Claude canonical launcher `claude-acp-launcher.mjs` additionally requires a runtime with POSIX `process.execve`: Node.js 22.15 or newer within the 22.x line, 23.11 or newer within the 23.x line, or any later release line (24+). Node.js 23.0–23.10 is newer than 22.15 but lacks `process.execve`. The launcher is POSIX-only — `process.execve` does not exist on Windows. Support is capability-detected: any runtime or platform without a `process.execve` function fails closed with `execve_unsupported`.
 
-Resolve ACPX from the explicit package root recorded in `runtimeModule`. Obtain that path from the active OpenClaw plugin's read-only dependency information before launch. The supervisor does not execute discovery commands. Require public equivalents of:
+Resolve ACPX from the explicit package root recorded in `runtimeModule`. That path is machine-resolved by the [runtime-module preflight](#runtime-module-preflight) from the active OpenClaw plugin's read-only dependency information before launch — never hand-copied or chosen by the caller. The supervisor does not execute discovery commands. Require public equivalents of:
 
 - `createAcpRuntime`
 - `createRuntimeStore`
@@ -44,6 +45,40 @@ Require the ACPX 0.11.2-or-newer turn capability contract. Older releases such a
 A target passes only when the same behavior tests confirm runtime discovery, permission inspection, foreground rejection, normalized event consumption, response capture, exact result mapping, cancellation, cleanup, and process exit.
 
 Fail closed on incompatible capability changes. Never fall back to another ACP route.
+
+## Runtime-module preflight
+
+`runtimeModule` is machine-resolved. The canonical pre-start path is `scripts/acpx-runtime-preflight-cli.mjs` (module `scripts/acpx-runtime-preflight.mjs`), which reads exactly one absolute owner-private JSON input file behind `--input` — the same private-file contract as every other operator CLI in this skill (no symlink, a regular file with no group or world permissions on POSIX, bounded size). Its closed actions under schema `acpx-runtime-preflight.v1` are `attest` and `assemble`; a new run preparation must go through both, and the caller never hand-copies or chooses `runtimeModule`.
+
+`attest` (`pluginInfoFile`, `attestationFile`) consumes the owner-private structured output of `openclaw plugins info acpx --json`, saved by the operator to a private owner-only file. Selection is exact and fail-closed:
+
+- the `dependencies` array must contain exactly one entry whose `name` is exactly `acpx` — a missing exact match fails `plugin_info_dependency_missing` and more than one fails `plugin_info_dependency_duplicate`; a scoped name such as `@openclaw/acpx`, a cased spelling, or a prefix/suffix variant is never a match;
+- that entry's `resolvedPath` must be an absolute bounded well-formed path (`plugin_info_resolved_path_invalid` for a relative, empty, over-length, or malformed value);
+- a resolved path equal to a derivable active-plugin package root (a top-level `path`, `root`, or `packageRoot` string in the structured input) fails `plugin_info_plugin_root_selected`;
+- malformed structured data fails `plugin_info_invalid` or `plugin_info_dependencies_invalid`, and an unreadable or non-private input file fails `plugin_info_file_invalid` / `plugin_info_file_json`.
+
+The selected package is then validated before any attestation is written:
+
+- a real non-symlink package root (`runtime_package_root_missing`, `runtime_package_root_symlink`, `runtime_package_root_not_directory`) with a readable `package.json` (`runtime_package_json_missing`, `runtime_package_json_invalid`);
+- the manifest `name` must be exactly `acpx` — `runtime_package_name_invalid` rejects the `@openclaw/acpx` plugin package root even when no root field was derivable from the structured input, which is the machine gate against the mistaken-plugin-root selection;
+- a plain release `version` (`major.minor.patch`, `runtime_package_version_invalid` otherwise) of at least 0.11.2 (`runtime_package_version_unsupported`);
+- a real non-symlink regular `dist/runtime.js` entry (`runtime_entry_missing`, `runtime_entry_symlink`, `runtime_entry_not_regular`, `runtime_entry_unreadable`);
+- capability detection stays authoritative — the version gate alone is never sufficient: the entry is imported (`runtime_entry_unloadable` on failure) and must export `createAcpRuntime`, `createRuntimeStore`, and `createAgentRegistry`, enforced by the supervisor's own capability check with the same `acpx_runtime_capability_missing_*` codes.
+
+Success writes the owner-private attestation artifact, schema `acpx-runtime-attestation.v1`, with owner-only permissions and exactly once per path (`runtime_attestation_exists`, `runtime_attestation_write_failed`). It carries the validated absolute `runtimeModule`, the `runtimeVersion`, SHA-256 content digests of `package.json` and `dist/runtime.js`, and `issuedAtMs`. The attestation is owner-private evidence: it necessarily contains the resolved path and must never enter Discord output, a watchdog payload, or any public artifact.
+
+`assemble` (`attestationFile`, `configFile`, `outputFile`, optional `maxAttestationAgeMs`) supplies the attested module to the run config and fails closed when the attestation is:
+
+- absent — `runtime_attestation_missing`;
+- invalid — any filesystem, permission, size, JSON, or shape violation is `runtime_attestation_invalid`;
+- stale — older than the bounded freshness window (`runtime_attestation_stale`; `maxAttestationAgeMs` defaults to `600000` and is bounded to `1000`–`3600000`, out-of-bounds values fail `invalid_preflight_max_age`; an issue instant more than one second ahead of the clock fails `runtime_attestation_future`);
+- mismatched — a fresh static inspection of the attested package must still match byte-for-byte: a changed digest or version fails `runtime_attestation_mismatch`, and a package that degraded structurally fails with its own static `runtime_package_*` / `runtime_entry_*` code.
+
+Only then is `outputFile` written, exactly once (`config_output_exists`, `config_output_write_failed`), as the owner-prepared draft `configFile` with `runtimeModule` replaced by the attested path. Any pre-set draft value — including the template sentinel — is replaced, so the caller never chooses the module. The assemble step is deliberately narrow: it changes only `runtimeModule`, and the supervisor's config loader remains the authoritative validator of the assembled config. Draft-file problems fail `config_draft_file_invalid`, `config_draft_file_json`, or `invalid_config_draft`.
+
+CLI evidence is bounded on both streams: success writes one `runtime_preflight_result` event to stdout (`status` `runtime_attested` or `config_assembled`, plus the runtime version), and every failure writes exactly one `runtime_preflight_error` event with a bounded stable code to stderr and exits with the invalid-config code `64`. No event ever carries a path, plugin-info payload, or free text. Input-shape violations use the bounded codes `usage`, `invalid_input_file`, `invalid_input_file_missing`, `invalid_input_json`, `invalid_preflight_input`, `invalid_preflight_schema_version`, `invalid_preflight_action`, `invalid_preflight_plugin_info_file`, `invalid_preflight_attestation_file`, `invalid_preflight_config_file`, `invalid_preflight_output_file`, and `invalid_preflight_max_age`.
+
+`templates/supervisor-config.json` ships `runtimeModule` as the non-absolute sentinel `RUNTIME_MODULE_FROM_PREFLIGHT` on purpose: a config prepared from the template without the assemble step fails the supervisor's own loader (`invalid_runtime_module_not_absolute`) instead of running a hand-chosen module. Backward compatibility is preserved without a supervisor contract change: an already-prepared config carrying a previously validated absolute `runtimeModule` remains valid unchanged, and the supervisor keeps its own load-time and import-time runtime checks (`invalid_runtime_module*`, `acpx_runtime_module_*`, `acpx_runtime_capability_missing_*`) as the last line of defense.
 
 ## Private input and output
 
@@ -63,7 +98,7 @@ Required:
 - `promptFile`: absolute existing private file
 - `responseFile`: absolute new private file
 - `stateDir`: absolute private runtime state directory; before runtime loading the supervisor creates one owner-only host lifecycle ledger beneath this directory
-- `runtimeModule`: absolute ACPX package root or runtime module file
+- `runtimeModule`: absolute ACPX package root or runtime module file. New preparations obtain this value only through the [runtime-module preflight](#runtime-module-preflight) `assemble` action; already-prepared configs carrying a previously validated absolute path stay valid
 - `allowKinds`: non-empty tool-kind allowlist that excludes the unclassified `other` kind
 - `timeoutMs`: positive turn deadline independent of watchdog cadence; the template ships a two-hour emergency ceiling, configurable per run
 - `lifecycle`: start-receipt contract binding the run to the control conversation

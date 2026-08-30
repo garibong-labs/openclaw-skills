@@ -1,0 +1,6 @@
+{
+  "schemaVersion": "acpx-runtime-preflight.v1",
+  "action": "attest",
+  "pluginInfoFile": "/absolute/private/path/acpx-plugin-info.json",
+  "attestationFile": "/absolute/private/path/acpx-runtime-attestation.json"
+}
