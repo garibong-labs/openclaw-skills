@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "acpx-runtime-preflight.v1",
+  "action": "assemble",
+  "attestationFile": "/absolute/private/path/acpx-runtime-attestation.json",
+  "configFile": "/absolute/private/path/run-draft.json",
+  "outputFile": "/absolute/private/path/run.json",
+  "maxAttestationAgeMs": 600000
+}

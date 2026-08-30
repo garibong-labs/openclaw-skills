@@ -6,7 +6,7 @@
   "promptFile": "/absolute/private/path/prompt.txt",
   "responseFile": "/absolute/private/path/response.txt",
   "stateDir": "/absolute/private/path/acpx-state",
-  "runtimeModule": "/absolute/path/to/plugin-local/acpx",
+  "runtimeModule": "RUNTIME_MODULE_FROM_PREFLIGHT",
   "timeoutMs": 7200000,
   "progressMs": 600000,
   "maxResponseBytes": 1048576,
