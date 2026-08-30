@@ -1,12 +1,15 @@
 // Canonical machine-enforced runtime-module preflight for the ACPX
-// supervisor. The operator saves the structured output of
-// `openclaw plugins info acpx --json` to an owner-private file; this module
-// uniquely selects the dependency named exactly "acpx", validates the
-// resolved package (name, ACPX 0.11.2-or-newer version, dist/runtime.js
-// entry, and the authoritative capability exports), and binds the result
-// into an owner-private attestation. Config assembly consumes only that
-// attestation, so a caller never hand-copies or chooses `runtimeModule` and
-// the active plugin package root (`@openclaw/acpx`) can never be selected.
+// supervisor. The operator saves the raw JSON document that
+// `openclaw plugins info acpx --json` prints on stdout, unmodified, to an
+// owner-private file; this module consumes that raw document directly — no
+// caller reshaping. It uniquely selects the entry of the raw
+// `plugin.dependencyStatus.dependencies` array whose name is exactly
+// "acpx", validates the resolved package (name, ACPX 0.11.2-or-newer
+// version, dist/runtime.js entry, and the authoritative capability
+// exports), and binds the result into an owner-private attestation. Config
+// assembly consumes only that attestation, so a caller never hand-copies or
+// chooses `runtimeModule` and the active plugin package root (the raw
+// `plugin.rootDir`, package `@openclaw/acpx`) can never be selected.
 //
 // Fail-closed and evidence-minimal like the supervisor: every failure is one
 // bounded stable code; no rejected path, plugin-info payload, or free text is
@@ -22,9 +25,9 @@ import { fail, validateRuntimeModuleExports } from "./acpx-foreground-supervisor
 export const ACPX_RUNTIME_PREFLIGHT_SCHEMA_VERSION = "acpx-runtime-preflight.v1";
 export const ACPX_RUNTIME_ATTESTATION_SCHEMA_VERSION = "acpx-runtime-attestation.v1";
 // The runtime package is the dependency whose name is exactly this value —
-// never the active plugin package root (`@openclaw/acpx`), whose manifest
-// name differs and is rejected by the package-name gate below even when the
-// plugin root cannot be derived from the structured input.
+// never the active plugin package root (the raw `plugin.rootDir`, package
+// `@openclaw/acpx`), whose manifest name differs and is rejected by the
+// package-name gate below as defense in depth behind the root binding.
 export const ACPX_RUNTIME_DEPENDENCY_NAME = "acpx";
 export const ACPX_MINIMUM_RUNTIME_VERSION = "0.11.2";
 export const DEFAULT_MAX_ATTESTATION_AGE_MS = 600000;
@@ -36,11 +39,6 @@ const ATTESTATION_FUTURE_SKEW_MS = 1000;
 const MAX_PLUGIN_DEPENDENCIES = 1024;
 const MAX_PATH_LENGTH = 4096;
 const MAX_ATTESTATION_BYTES = 8192;
-// Top-level plugin-info keys that may carry the active plugin's own package
-// root. When one is present, a dependency resolving to that exact root is
-// rejected at selection time; the package-name gate stays authoritative when
-// none is present.
-const PLUGIN_ROOT_KEYS = Object.freeze(["path", "root", "packageRoot"]);
 const RELEASE_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const ATTESTATION_KEYS = Object.freeze([
@@ -93,16 +91,47 @@ export function isBoundedAttestationAge(value) {
   );
 }
 
-// Pure selection over the owner-private structured plugin information. The
-// only accepted source of `runtimeModule` is the absolute `resolvedPath` of
-// the dependency whose name is exactly "acpx": a missing exact match, more
-// than one exact match, a relative or malformed path, and a path equal to a
-// derivable active-plugin package root all fail closed.
+// Pure selection over the raw `openclaw plugins info acpx --json` document,
+// consumed exactly as the command prints it — no caller reshaping. The only
+// accepted source of `runtimeModule` is the absolute `resolvedPath` of the
+// `plugin.dependencyStatus.dependencies` entry whose name is exactly "acpx":
+// a missing exact match, more than one exact match, a relative or malformed
+// path, and a path equal to the active plugin package root all fail closed.
+// Any drift from that raw schema — including the pre-raw synthetic shape
+// that carried a top-level `dependencies` array — also fails closed with a
+// bounded code, so reshaping the document by hand is never an alternate
+// contract.
 export function selectAcpxRuntimeModule(pluginInfo) {
-  if (!isPlainObject(pluginInfo)) {
+  if (!isPlainObject(pluginInfo) || !isPlainObject(pluginInfo.plugin)) {
     fail("plugin_info_invalid");
   }
-  const dependencies = pluginInfo.dependencies;
+  const plugin = pluginInfo.plugin;
+  // The active plugin package root is bound from the raw fields that carry
+  // it: `plugin.rootDir` is mandatory, and the optional top-level
+  // `install.installPath` (null when the plugin is not an npm install) is
+  // bound too when present. A document that cannot state its own root is
+  // schema drift and fails closed rather than weakening the root gate.
+  if (!isBoundedAbsolutePath(plugin.rootDir)) {
+    fail("plugin_info_plugin_root_invalid");
+  }
+  const pluginRoots = [path.normalize(plugin.rootDir)];
+  const install = pluginInfo.install;
+  if (install !== undefined && install !== null) {
+    if (!isPlainObject(install)) {
+      fail("plugin_info_invalid");
+    }
+    if (install.installPath !== undefined && install.installPath !== null) {
+      if (!isBoundedAbsolutePath(install.installPath)) {
+        fail("plugin_info_plugin_root_invalid");
+      }
+      pluginRoots.push(path.normalize(install.installPath));
+    }
+  }
+  const dependencyStatus = plugin.dependencyStatus;
+  if (!isPlainObject(dependencyStatus)) {
+    fail("plugin_info_dependencies_invalid");
+  }
+  const dependencies = dependencyStatus.dependencies;
   if (
     !Array.isArray(dependencies) ||
     dependencies.length === 0 ||
@@ -130,14 +159,8 @@ export function selectAcpxRuntimeModule(pluginInfo) {
     fail("plugin_info_resolved_path_invalid");
   }
   const normalized = path.normalize(resolvedPath);
-  for (const key of PLUGIN_ROOT_KEYS) {
-    const candidate = pluginInfo[key];
-    if (
-      isBoundedAbsolutePath(candidate) &&
-      path.normalize(candidate) === normalized
-    ) {
-      fail("plugin_info_plugin_root_selected");
-    }
+  if (pluginRoots.includes(normalized)) {
+    fail("plugin_info_plugin_root_selected");
   }
   return normalized;
 }

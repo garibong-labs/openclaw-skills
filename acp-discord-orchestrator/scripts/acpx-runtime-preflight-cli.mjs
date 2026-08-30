@@ -6,12 +6,16 @@
 //
 // Closed actions under schema acpx-runtime-preflight.v1:
 //
-// - "attest": consume the owner-private structured output of
-//   `openclaw plugins info acpx --json` (pluginInfoFile), uniquely select the
-//   dependency named exactly "acpx", validate the resolved package (name,
-//   ACPX 0.11.2-or-newer version, dist/runtime.js entry, authoritative
-//   capability exports), and write the owner-private attestation
-//   (attestationFile, created fresh).
+// - "attest": consume the raw JSON document that
+//   `openclaw plugins info acpx --json` prints on stdout, saved unmodified
+//   to the owner-private pluginInfoFile — the document is used directly,
+//   never reshaped by the caller. Uniquely select the
+//   `plugin.dependencyStatus.dependencies` entry named exactly "acpx",
+//   reject the active plugin package root (the raw `plugin.rootDir`, plus
+//   `install.installPath` when present), validate the resolved package
+//   (name, ACPX 0.11.2-or-newer version, dist/runtime.js entry,
+//   authoritative capability exports), and write the owner-private
+//   attestation (attestationFile, created fresh).
 // - "assemble": re-verify the attestation fail-closed (absent, stale,
 //   mismatched, or invalid attestations are rejected), then write the final
 //   supervisor config (outputFile, created fresh) as the owner-prepared

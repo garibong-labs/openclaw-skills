@@ -48,13 +48,42 @@ function makeAcpxPackage(root, options = {}) {
   return root;
 }
 
+// Source-blind fixture mirroring the raw document `openclaw plugins info
+// acpx --json` prints on stdout: the dependency array lives at
+// `plugin.dependencyStatus.dependencies`, the active plugin package root at
+// `plugin.rootDir`, and the top-level `install` is null unless the plugin is
+// an npm install (then it carries `installPath`). The attest action consumes
+// this document directly, so the fixture keeps the real nesting.
 function makePluginInfo(pluginRoot, dependencies, extra = {}) {
+  const { plugin: pluginExtra, ...topExtra } = extra;
   return {
-    name: "@openclaw/acpx",
-    path: pluginRoot,
-    dependencies,
-    ...extra
+    workspaceDir: "/private/workspace",
+    install: null,
+    plugin: {
+      id: "acpx",
+      name: "ACPX Runtime",
+      packageName: "@openclaw/acpx",
+      version: "2026.7.1",
+      rootDir: pluginRoot,
+      status: "loaded",
+      dependencyStatus: {
+        hasDependencies: true,
+        installed: true,
+        requiredInstalled: true,
+        optionalInstalled: true,
+        missing: [],
+        missingOptional: [],
+        optionalDependencies: [],
+        dependencies
+      },
+      ...pluginExtra
+    },
+    ...topExtra
   };
+}
+
+function makeRawDependency(name, resolvedPath) {
+  return { name, spec: "^1.0.0", optional: false, installed: true, resolvedPath };
 }
 
 function writePrivateJson(filePath, value) {
@@ -81,33 +110,84 @@ async function runCliMain(inputFile, dependencies = {}) {
   return { exitCode, results, errors };
 }
 
-test("selects the exact nested acpx dependency by absolute resolvedPath", () => {
-  const pluginRoot = "/private/plugins/@openclaw/acpx";
-  const nested = "/private/plugins/@openclaw/acpx/node_modules/acpx";
+test("selects the exact acpx entry of the raw plugin.dependencyStatus.dependencies", () => {
+  const pluginRoot = "/private/npm/projects/openclaw-acpx/node_modules/@openclaw/acpx";
+  const nested = pluginRoot + "/node_modules/acpx";
   const selected = selectAcpxRuntimeModule(makePluginInfo(pluginRoot, [
-    { name: "@openclaw/plugin-sdk", resolvedPath: "/private/plugins/@openclaw/plugin-sdk" },
-    { name: "acpx", resolvedPath: nested },
-    { name: "acpx-utils", resolvedPath: "/private/plugins/acpx-utils" }
+    makeRawDependency("@agentclientprotocol/claude-agent-acp", pluginRoot + "/node_modules/@agentclientprotocol/claude-agent-acp"),
+    makeRawDependency("@zed-industries/codex-acp", pluginRoot + "/node_modules/@zed-industries/codex-acp"),
+    makeRawDependency("acpx", nested),
+    makeRawDependency("zod", pluginRoot + "/node_modules/zod")
   ]));
   assert.equal(selected, path.normalize(nested));
 });
 
-test("rejects the active plugin package root offered as the acpx dependency", () => {
+test("rejects the active plugin.rootDir offered as the acpx dependency", () => {
   const pluginRoot = "/private/plugins/@openclaw/acpx";
   assertFailsWith(
     () => selectAcpxRuntimeModule(makePluginInfo(pluginRoot, [
-      { name: "acpx", resolvedPath: pluginRoot }
+      makeRawDependency("acpx", pluginRoot)
     ])),
     "plugin_info_plugin_root_selected"
   );
 });
 
+test("rejects the install.installPath root offered as the acpx dependency", () => {
+  const installPath = "/private/npm/projects/openclaw-acpx";
+  assertFailsWith(
+    () => selectAcpxRuntimeModule(makePluginInfo("/private/plugins/@openclaw/acpx", [
+      makeRawDependency("acpx", installPath)
+    ], { install: { kind: "npm", installPath } })),
+    "plugin_info_plugin_root_selected"
+  );
+});
+
+test("fails closed when the raw document cannot state its own plugin root", () => {
+  const dependencies = [makeRawDependency("acpx", "/private/deps/acpx")];
+  for (const rootDir of [undefined, null, "", "relative/root", 42]) {
+    assertFailsWith(
+      () => selectAcpxRuntimeModule(makePluginInfo("/ignored", dependencies, {
+        plugin: { rootDir }
+      })),
+      "plugin_info_plugin_root_invalid"
+    );
+  }
+  assertFailsWith(
+    () => selectAcpxRuntimeModule(makePluginInfo("/private/plugins/@openclaw/acpx", dependencies, {
+      install: { kind: "npm", installPath: "relative/install" }
+    })),
+    "plugin_info_plugin_root_invalid"
+  );
+  assertFailsWith(
+    () => selectAcpxRuntimeModule(makePluginInfo("/private/plugins/@openclaw/acpx", dependencies, {
+      install: "not-an-object"
+    })),
+    "plugin_info_invalid"
+  );
+});
+
+test("regression: the old synthetic top-level shape fails closed, not as an alternate contract", () => {
+  // Before this fix the implementation read a synthetic top-level
+  // `dependencies` array and top-level `path`/`root`/`packageRoot` keys — a
+  // shape the real command never printed, which an operator could only
+  // satisfy by reshaping the JSON by hand. That shape must stay rejected so
+  // manual reshaping never becomes the contract.
+  const synthetic = {
+    name: "@openclaw/acpx",
+    path: "/private/plugins/@openclaw/acpx",
+    dependencies: [
+      { name: "acpx", resolvedPath: "/private/plugins/@openclaw/acpx/node_modules/acpx" }
+    ]
+  };
+  assertFailsWith(() => selectAcpxRuntimeModule(synthetic), "plugin_info_invalid");
+});
+
 test("rejects plugin info without an exact acpx dependency", () => {
   assertFailsWith(
     () => selectAcpxRuntimeModule(makePluginInfo("/private/plugins/@openclaw/acpx", [
-      { name: "@openclaw/acpx", resolvedPath: "/private/plugins/@openclaw/acpx" },
-      { name: "acpx-utils", resolvedPath: "/private/plugins/acpx-utils" },
-      { name: "Acpx", resolvedPath: "/private/plugins/acpx-cased" }
+      makeRawDependency("@openclaw/acpx", "/private/plugins/@openclaw/acpx-copy"),
+      makeRawDependency("acpx-utils", "/private/plugins/acpx-utils"),
+      makeRawDependency("Acpx", "/private/plugins/acpx-cased")
     ])),
     "plugin_info_dependency_missing"
   );
@@ -116,8 +196,8 @@ test("rejects plugin info without an exact acpx dependency", () => {
 test("rejects duplicate exact acpx dependency entries", () => {
   assertFailsWith(
     () => selectAcpxRuntimeModule(makePluginInfo("/private/plugins/@openclaw/acpx", [
-      { name: "acpx", resolvedPath: "/private/a/acpx" },
-      { name: "acpx", resolvedPath: "/private/b/acpx" }
+      makeRawDependency("acpx", "/private/a/acpx"),
+      makeRawDependency("acpx", "/private/b/acpx")
     ])),
     "plugin_info_dependency_duplicate"
   );
@@ -127,7 +207,7 @@ test("rejects relative and malformed resolved paths", () => {
   for (const resolvedPath of ["node_modules/acpx", "./acpx", "", 42, undefined, "/private/\0acpx"]) {
     assertFailsWith(
       () => selectAcpxRuntimeModule(makePluginInfo("/private/plugins/@openclaw/acpx", [
-        { name: "acpx", resolvedPath }
+        makeRawDependency("acpx", resolvedPath)
       ])),
       "plugin_info_resolved_path_invalid"
     );
@@ -137,18 +217,21 @@ test("rejects relative and malformed resolved paths", () => {
 test("rejects malformed plugin info shapes", () => {
   assertFailsWith(() => selectAcpxRuntimeModule(null), "plugin_info_invalid");
   assertFailsWith(() => selectAcpxRuntimeModule([]), "plugin_info_invalid");
-  assertFailsWith(
-    () => selectAcpxRuntimeModule({ dependencies: {} }),
-    "plugin_info_dependencies_invalid"
-  );
-  assertFailsWith(
-    () => selectAcpxRuntimeModule({ dependencies: [] }),
-    "plugin_info_dependencies_invalid"
-  );
-  assertFailsWith(
-    () => selectAcpxRuntimeModule({ dependencies: [{ resolvedPath: "/private/acpx" }] }),
-    "plugin_info_dependencies_invalid"
-  );
+  assertFailsWith(() => selectAcpxRuntimeModule({ plugin: null }), "plugin_info_invalid");
+  assertFailsWith(() => selectAcpxRuntimeModule({ plugin: [] }), "plugin_info_invalid");
+  const root = "/private/plugins/@openclaw/acpx";
+  for (const dependencyStatus of [undefined, null, "loaded", []]) {
+    assertFailsWith(
+      () => selectAcpxRuntimeModule(makePluginInfo(root, [], { plugin: { dependencyStatus } })),
+      "plugin_info_dependencies_invalid"
+    );
+  }
+  for (const dependencies of [undefined, {}, [], [{ resolvedPath: "/private/acpx" }]]) {
+    assertFailsWith(
+      () => selectAcpxRuntimeModule(makePluginInfo(root, dependencies)),
+      "plugin_info_dependencies_invalid"
+    );
+  }
 });
 
 test("validates a real runtime package and binds digests", async () => {
@@ -160,9 +243,11 @@ test("validates a real runtime package and binds digests", async () => {
   assert.match(inspection.runtimeEntrySha256, /^[0-9a-f]{64}$/);
 });
 
-test("rejects a plugin-root-shaped package even without a derivable root field", async () => {
+test("manifest-name gate rejects the plugin package as defense in depth", async () => {
   // The mistaken selection from the incident: the path resolves to the
-  // @openclaw/acpx plugin package, not the acpx runtime package.
+  // @openclaw/acpx plugin package, not the acpx runtime package. Even if
+  // such a path slipped past the raw plugin.rootDir comparison, the
+  // manifest name is not exactly "acpx" and validation fails closed.
   const root = makeAcpxPackage(makeRoot("acpx-preflight-pluginpkg-"), {
     name: "@openclaw/acpx",
     withEntry: false
