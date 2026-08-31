@@ -89,6 +89,12 @@ export const ACP_TERMINAL_REPORT_STATUSES = Object.freeze([
   'cancelled',
   'failed',
 ]);
+// Canonical 새 결과 bullet content when no ACP result completed since the last
+// successfully delivered intermediate report. The Δ counter and the 마지막
+// ACP 활동 age are independent by contract: fresh ACP activity with no newly
+// completed result renders `Δ0 · 새로 확인된 ACP 결과 없음` next to an
+// activity age of `0분 전`.
+export const ACP_REPORT_NO_NEW_RESULT = '새로 확인된 ACP 결과 없음';
 
 // The only valid phaseIndex → phaseName mappings for the 라운드 metadata line.
 export const ACP_REPORT_PHASES = Object.freeze({
@@ -623,17 +629,37 @@ function validateMiddleReport(report, expected) {
 }
 
 const REPORT_IDENTITY_INPUT_KEYS = Object.freeze([
-  'agent', 'model', 'roundIndex', 'repository', 'branch', 'timeKst', 'elapsed',
+  'agent', 'model', 'roundIndex', 'repository', 'branch', 'timeKst',
 ]);
+// The intermediate time line is structured, never free text: 전체/현재 단계
+// come from ACP elapsed bookkeeping, and 마지막 ACP 활동 is the activity age
+// of the latest normalized ACP model/tool/status/activity event
+// (`lastAcpActivityAt` at the transport boundary). Δ is independent of that
+// age: it counts only newly completed ACP results since the previous
+// successfully delivered intermediate report. The legacy free-text `elapsed`
+// key is deliberately absent here (still valid for the terminal 소요 line):
+// pre-existing intermediate inputs carrying it fail as an unsupported key
+// because the builder input shape is not a committed compatibility contract.
 const INTERMEDIATE_REPORT_INPUT_KEYS = Object.freeze([
   ...REPORT_IDENTITY_INPUT_KEYS,
-  'phaseIndex', 'executionState', 'newResult', 'inProgress', 'verification',
-  'next', 'issue',
+  'phaseIndex', 'totalMinutes', 'phaseMinutes', 'lastAcpActivityMinutesAgo',
+  'newResultDelta', 'newResult', 'executionState', 'inProgress',
+  'verification', 'next', 'issue',
 ]);
 const TERMINAL_REPORT_INPUT_KEYS = Object.freeze([
   ...REPORT_IDENTITY_INPUT_KEYS,
-  'status', 'summary', 'verification', 'result', 'next', 'externalAction',
+  'elapsed', 'status', 'summary', 'verification', 'result', 'next',
+  'externalAction',
 ]);
+const MAX_REPORT_MINUTES = 99999;
+const MAX_REPORT_RESULT_DELTA = 9999;
+
+function validateReportMinutes(value, label) {
+  if (!Number.isInteger(value) || value < 0 || value > MAX_REPORT_MINUTES) {
+    fail('invalid_reporting_report', `${label} must be an integer minute count between 0 and ${MAX_REPORT_MINUTES}`);
+  }
+  return value;
+}
 
 function validateReportBuilderIdentity(input, allowedKeys, label) {
   if (!isPlainObject(input)) {
@@ -680,7 +706,21 @@ function validateReportSlot(value, label) {
   return value;
 }
 
-/** Build and self-validate the canonical intermediate lifecycle report. */
+/**
+ * Build and self-validate the canonical intermediate lifecycle report.
+ *
+ * The ⏱️ time line is derived from three independent structured minute
+ * counts: 전체 (total ACP elapsed), 현재 단계 (current phase), and 마지막 ACP
+ * 활동 (age of the latest normalized ACP model/tool/status/activity event —
+ * the `lastAcpActivityAt` concept, deliberately not the ambiguous
+ * `lastAcpStateChangeAt`). The 새 결과 bullet is derived from
+ * `newResultDelta`, the count of ACP results completed since the previous
+ * successfully delivered intermediate report: `newResultDelta: 0` requires
+ * `newResult` to be omitted and renders the canonical
+ * `Δ0 · 새로 확인된 ACP 결과 없음` bullet, while a positive delta requires
+ * the free-text result summary and renders `Δ<N> · <newResult>`. Activity
+ * age and Δ are independent: `마지막 ACP 활동 0분 전` with `Δ0` is valid.
+ */
 export function buildAcpIntermediateReport(input) {
   const expected = validateReportBuilderIdentity(
     input,
@@ -691,17 +731,42 @@ export function buildAcpIntermediateReport(input) {
   if (!phaseName) {
     fail('invalid_reporting_report', 'input.phaseIndex must be a canonical report phase');
   }
+  const totalMinutes = validateReportMinutes(input.totalMinutes, 'input.totalMinutes');
+  const phaseMinutes = validateReportMinutes(input.phaseMinutes, 'input.phaseMinutes');
+  const activityAgeMinutes = validateReportMinutes(
+    input.lastAcpActivityMinutesAgo,
+    'input.lastAcpActivityMinutesAgo'
+  );
+  if (phaseMinutes > totalMinutes) {
+    fail('invalid_reporting_report', 'input.phaseMinutes must not exceed input.totalMinutes');
+  }
+  if (activityAgeMinutes > totalMinutes) {
+    fail('invalid_reporting_report', 'input.lastAcpActivityMinutesAgo must not exceed input.totalMinutes');
+  }
+  const delta = input.newResultDelta;
+  if (!Number.isInteger(delta) || delta < 0 || delta > MAX_REPORT_RESULT_DELTA) {
+    fail('invalid_reporting_report', `input.newResultDelta must be an integer between 0 and ${MAX_REPORT_RESULT_DELTA}`);
+  }
+  let newResultBullet;
+  if (delta === 0) {
+    if (input.newResult !== undefined) {
+      fail('invalid_reporting_report', 'input.newResult must be omitted when input.newResultDelta is 0');
+    }
+    newResultBullet = `Δ0 · ${ACP_REPORT_NO_NEW_RESULT}`;
+  } else {
+    newResultBullet = `Δ${delta} · ${validateReportSlot(input.newResult, 'input.newResult')}`;
+  }
   const lines = [
     `🔄 **ACP 중간 보고 · ${expected.timeKst} KST**`,
     '',
     `🤖 **ACP**: ${expected.agentLabel} · \`${expected.model}\``,
     `📍 **작업**: \`${expected.repository}\` · \`${expected.branch}\``,
     `🔢 **라운드**: ${expected.roundIndex} · ${input.phaseIndex}/4 ${phaseName}`,
-    `⏱️ **ACP 시간**: ${validateReportSlot(input.elapsed, 'input.elapsed')}`,
+    `⏱️ **ACP 시간**: 전체 ${totalMinutes}분 · 현재 단계 ${phaseMinutes}분 · 마지막 ACP 활동 ${activityAgeMinutes}분 전`,
     `🔁 **실행 상태**: ${validateReportSlot(input.executionState, 'input.executionState')}`,
     '',
     ACP_REPORT_SECTION_HEADERS[0],
-    `- ${validateReportSlot(input.newResult, 'input.newResult')}`,
+    `- ${newResultBullet}`,
     '',
     ACP_REPORT_SECTION_HEADERS[1],
     `- ${validateReportSlot(input.inProgress, 'input.inProgress')}`,

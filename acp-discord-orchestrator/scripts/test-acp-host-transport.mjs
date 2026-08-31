@@ -40,6 +40,7 @@ function publicationFixture(overrides = {}) {
     acknowledgedMessageIds: [],
     nextCadence: 1,
     nextDueAt: null,
+    resultBaselineSequence: 0,
     terminalSequence: null,
     terminalStatus: null,
     controlCursor: null,
@@ -506,6 +507,108 @@ test("intermediate acknowledgements accept both authorized success statuses and 
       assert.equal(afterAck.reportPublication.requiredAt, expectedNextDueAt);
     }
   }
+});
+
+test("intermediate boundary binds 마지막 ACP 활동 to ACP activity events and Δ to the delivered-report result cursor", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-activity-delta-"));
+  const dueAt = REPORT_CADENCE_MS;
+  const toolCompleted = { activity: "tool", toolKind: "execute", toolStatus: "completed" };
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-activity-delta",
+    events: [
+      event(1, "started", 0),
+      event(2, "activity", 120000, toolCompleted),
+      event(3, "activity", 300000, { activity: "model_output" }),
+      // Timer-driven progress bookkeeping is later than every ACP event but
+      // must not move the activity instant.
+      event(4, "progress", 590000, { evidenceAgeMs: 290000 })
+    ],
+    publication: publicationFixture({ nextDueAt: new Date(dueAt).toISOString() })
+  });
+  const due = statusHostTransport(fixture, { ...ACTIVE_TMUX, nowMs: dueAt, randomUUID: () => "delta-due" });
+  assert.equal(due.reportPublication.state, "report_required");
+  assert.equal(due.reportPublication.lastAcpActivityAt, new Date(300000).toISOString());
+  assert.equal(due.reportPublication.newResultDelta, 1);
+
+  // A later poll boundary alone moves neither value.
+  const polled = statusHostTransport({
+    ...fixture,
+    afterSequence: due.lastSequence,
+    serviceCursorAck: serviceAck(due, dueAt + 30000)
+  }, { ...ACTIVE_TMUX, nowMs: dueAt + 30000, randomUUID: () => "delta-poll" });
+  assert.equal(polled.reportPublication.state, "publication_pending");
+  assert.equal(polled.reportPublication.lastAcpActivityAt, new Date(300000).toISOString());
+  assert.equal(polled.reportPublication.newResultDelta, 1);
+
+  // A new completed result beyond this report's evidence boundary advances
+  // the activity instant but not this report's Δ: the two are independent.
+  fs.appendFileSync(
+    fixture.record.eventsFile,
+    JSON.stringify(event(5, "activity", dueAt + 40000, toolCompleted)) + "\n"
+  );
+  const advanced = statusHostTransport({
+    ...fixture,
+    afterSequence: due.lastSequence,
+    serviceCursorAck: serviceAck(polled, dueAt + 50000)
+  }, { ...ACTIVE_TMUX, nowMs: dueAt + 50000, randomUUID: () => "delta-advanced" });
+  assert.equal(advanced.reportPublication.lastAcpActivityAt, new Date(dueAt + 40000).toISOString());
+  assert.equal(advanced.reportPublication.newResultDelta, 1);
+
+  acknowledgeHostTransportReport({
+    ...fixture,
+    reportId: due.reportPublication.reportId,
+    reportKind: "intermediate",
+    cadence: 1,
+    receipt: {
+      conversationId: CONTROL_CONVERSATION_ID,
+      messageId: "100000000000000060",
+      deliveredAt: new Date(dueAt + 50000).toISOString(),
+      deliveryStatus: "delivered"
+    }
+  }, { nowMs: dueAt + 50000 });
+  // The delivery receipt advances only the result cursor, never the
+  // activity instant.
+  const persisted = JSON.parse(fs.readFileSync(fixture.transportFile, "utf8"));
+  assert.equal(persisted.publication.resultBaselineSequence, 4);
+
+  const secondDue = 2 * REPORT_CADENCE_MS;
+  const second = statusHostTransport({
+    ...fixture,
+    serviceCursorAck: serviceAck(advanced, secondDue)
+  }, { ...ACTIVE_TMUX, nowMs: secondDue, randomUUID: () => "delta-second" });
+  assert.equal(second.reportPublication.cadence, 2);
+  assert.equal(second.reportPublication.lastAcpActivityAt, new Date(dueAt + 40000).toISOString());
+  assert.equal(second.reportPublication.newResultDelta, 1);
+
+  acknowledgeHostTransportReport({
+    ...fixture,
+    reportId: second.reportPublication.reportId,
+    reportKind: "intermediate",
+    cadence: 2,
+    receipt: {
+      conversationId: CONTROL_CONVERSATION_ID,
+      messageId: "100000000000000061",
+      deliveredAt: new Date(secondDue).toISOString(),
+      deliveryStatus: "delivered"
+    }
+  }, { nowMs: secondDue });
+
+  // Regression: fresh ACP activity with no newly completed result — the
+  // boundary that renders 마지막 ACP 활동 0분 전 alongside Δ0 · 새로 확인된
+  // ACP 결과 없음.
+  const thirdDue = 3 * REPORT_CADENCE_MS;
+  fs.appendFileSync(
+    fixture.record.eventsFile,
+    JSON.stringify(event(6, "activity", thirdDue - 1000, { activity: "model_output" })) + "\n"
+  );
+  const third = statusHostTransport({
+    ...fixture,
+    serviceCursorAck: serviceAck(second, thirdDue)
+  }, { ...ACTIVE_TMUX, nowMs: thirdDue, randomUUID: () => "delta-third" });
+  assert.equal(third.reportPublication.cadence, 3);
+  assert.equal(third.reportPublication.lastAcpActivityAt, new Date(thirdDue - 1000).toISOString());
+  assert.equal(third.reportPublication.newResultDelta, 0);
 });
 
 test("terminal supersedes an overdue intermediate and requires exact terminal acknowledgement", () => {

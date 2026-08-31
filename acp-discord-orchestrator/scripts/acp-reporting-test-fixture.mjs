@@ -130,12 +130,19 @@ export function buildValidReporting({
     `🤖 **ACP**: ${agentLabel} · \`${model}\``,
     `📍 **작업**: \`${repository}\` · \`${branch}\``,
     `🔢 **라운드**: ${roundIndex} · 2/4 ${ACP_REPORT_PHASES[2]}`,
-    "⏱️ **ACP 시간**: 12분 경과",
+    "⏱️ **ACP 시간**: 전체 12분 · 현재 단계 4분 · 마지막 ACP 활동 0분 전",
     "🔁 **실행 상태**: 통합 검증이 계속되는 중",
     ""
   ];
   for (let i = 0; i < ACP_REPORT_SECTION_HEADERS.length; i += 1) {
-    reportLines.push(ACP_REPORT_SECTION_HEADERS[i], sectionBullets[i]);
+    // The 새 결과 bullet carries the structured Δ result counter, mirroring
+    // the builder's `newResultDelta` derivation, so the literal fallback
+    // stays byte-identical to builder output for well-formed bullets.
+    const bullet =
+      i === 0 && typeof sectionBullets[0] === "string" && sectionBullets[0].startsWith("- ")
+        ? `- Δ1 · ${sectionBullets[0].slice(2)}`
+        : sectionBullets[i];
+    reportLines.push(ACP_REPORT_SECTION_HEADERS[i], bullet);
     if (i < ACP_REPORT_SECTION_HEADERS.length - 1) {
       reportLines.push("");
     }
@@ -158,8 +165,11 @@ export function buildValidReporting({
         branch,
         timeKst: "18:45",
         phaseIndex: 2,
-        elapsed: "12분 경과",
+        totalMinutes: 12,
+        phaseMinutes: 4,
+        lastAcpActivityMinutesAgo: 0,
         executionState: "통합 검증이 계속되는 중",
+        newResultDelta: 1,
         newResult: sectionBullets[0].slice(2),
         inProgress: sectionBullets[1].slice(2),
         verification: sectionBullets[2].slice(2),

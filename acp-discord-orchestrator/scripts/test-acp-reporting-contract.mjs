@@ -1142,14 +1142,26 @@ const REPORT_BUILDER_IDENTITY = Object.freeze({
   repository: REPO,
   branch: BRANCH,
   timeKst: '19:10',
+});
+// The free-text elapsed slot survives only on the terminal 소요 line; the
+// intermediate time line is structured.
+const TERMINAL_BUILDER_IDENTITY = Object.freeze({
+  ...REPORT_BUILDER_IDENTITY,
   elapsed: '17분 경과',
+});
+const INTERMEDIATE_TIME_FIELDS = Object.freeze({
+  totalMinutes: 17,
+  phaseMinutes: 6,
+  lastAcpActivityMinutesAgo: 2,
 });
 
 test('canonical intermediate builder derives title, label, metadata order, and fixed sections', () => {
   const message = buildAcpIntermediateReport({
     ...REPORT_BUILDER_IDENTITY,
+    ...INTERMEDIATE_TIME_FIELDS,
     phaseIndex: 3,
     executionState: '자체 검증이 진행되는 중',
+    newResultDelta: 1,
     newResult: '게이트 구현 완료',
     inProgress: '통합 테스트 실행',
     verification: '집중 테스트 통과',
@@ -1161,11 +1173,11 @@ test('canonical intermediate builder derives title, label, metadata order, and f
     '🤖 **ACP**: Codex · `gpt-5-codex`',
     `📍 **작업**: \`${REPO}\` · \`${BRANCH}\``,
     '🔢 **라운드**: 2 · 3/4 자체 검증',
-    '⏱️ **ACP 시간**: 17분 경과',
+    '⏱️ **ACP 시간**: 전체 17분 · 현재 단계 6분 · 마지막 ACP 활동 2분 전',
     '🔁 **실행 상태**: 자체 검증이 진행되는 중',
     '',
     '✅ **새 결과**',
-    '- 게이트 구현 완료',
+    '- Δ1 · 게이트 구현 완료',
     '',
     '🛠️ **ACP 진행 중**',
     '- 통합 테스트 실행',
@@ -1180,7 +1192,7 @@ test('canonical intermediate builder derives title, label, metadata order, and f
 
 test('canonical completed builder is byte-exact with the established 20-line success contract', () => {
   const message = buildAcpTerminalReport({
-    ...REPORT_BUILDER_IDENTITY,
+    ...TERMINAL_BUILDER_IDENTITY,
     status: 'completed',
     summary: '요청 범위 구현 완료',
     verification: '전체 테스트 통과',
@@ -1214,7 +1226,7 @@ test('canonical completed builder is byte-exact with the established 20-line suc
 
 test('cancelled and failed terminal builders stay visibly distinct from success', () => {
   const report = (status) => buildAcpTerminalReport({
-    ...REPORT_BUILDER_IDENTITY,
+    ...TERMINAL_BUILDER_IDENTITY,
     status,
     summary: '터미널 경계 확인',
     verification: '상태 검증',
@@ -1235,8 +1247,10 @@ test('cancelled and failed terminal builders stay visibly distinct from success'
 test('report builders reject caller title, label, phase, status, and forbidden template drift', () => {
   const intermediate = {
     ...REPORT_BUILDER_IDENTITY,
+    ...INTERMEDIATE_TIME_FIELDS,
     phaseIndex: 2,
     executionState: '구현 중',
+    newResultDelta: 1,
     newResult: '결과',
     inProgress: '진행',
     verification: '검증',
@@ -1247,7 +1261,7 @@ test('report builders reject caller title, label, phase, status, and forbidden t
   expectContractError(() => buildAcpIntermediateReport({ ...intermediate, phaseIndex: 9 }), 'invalid_reporting_report');
   expectContractError(() => buildAcpIntermediateReport({ ...intermediate, next: 'git status 확인' }), 'invalid_reporting_forbidden_content');
   expectContractError(() => buildAcpTerminalReport({
-    ...REPORT_BUILDER_IDENTITY,
+    ...TERMINAL_BUILDER_IDENTITY,
     status: 'success',
     summary: '완료',
     verification: '통과',
@@ -1255,6 +1269,93 @@ test('report builders reject caller title, label, phase, status, and forbidden t
     next: '검토',
     externalAction: '없음',
   }), 'invalid_reporting_report');
+});
+
+test('intermediate builder derives the structured 시간 line and rejects ambiguous or incoherent time input', () => {
+  const valid = {
+    ...REPORT_BUILDER_IDENTITY,
+    ...INTERMEDIATE_TIME_FIELDS,
+    phaseIndex: 2,
+    executionState: '구현 중',
+    newResultDelta: 1,
+    newResult: '결과',
+    inProgress: '진행',
+    verification: '검증',
+    next: '다음',
+  };
+  // The pre-migration free-text elapsed key is ambiguous old input and the
+  // builder input shape is not a committed compatibility contract: reject.
+  expectContractError(() => buildAcpIntermediateReport({ ...valid, elapsed: '17분 경과' }), 'invalid_reporting_context');
+  // So is the ambiguous lastAcpStateChangeAt spelling of the activity age.
+  expectContractError(() => buildAcpIntermediateReport({ ...valid, lastAcpStateChangeAt: '2026-08-31T10:00:00.000Z' }), 'invalid_reporting_context');
+  for (const field of ['totalMinutes', 'phaseMinutes', 'lastAcpActivityMinutesAgo']) {
+    const missing = { ...valid };
+    delete missing[field];
+    expectContractError(() => buildAcpIntermediateReport(missing), 'invalid_reporting_report');
+    expectContractError(() => buildAcpIntermediateReport({ ...valid, [field]: -1 }), 'invalid_reporting_report');
+    expectContractError(() => buildAcpIntermediateReport({ ...valid, [field]: 3.5 }), 'invalid_reporting_report');
+    expectContractError(() => buildAcpIntermediateReport({ ...valid, [field]: '17분' }), 'invalid_reporting_report');
+  }
+  expectContractError(() => buildAcpIntermediateReport({ ...valid, phaseMinutes: 18 }), 'invalid_reporting_report');
+  expectContractError(() => buildAcpIntermediateReport({ ...valid, lastAcpActivityMinutesAgo: 18 }), 'invalid_reporting_report');
+});
+
+test('Δ counts newly completed results and requires the canonical no-result bullet at Δ0', () => {
+  const base = {
+    ...REPORT_BUILDER_IDENTITY,
+    ...INTERMEDIATE_TIME_FIELDS,
+    phaseIndex: 2,
+    executionState: '구현 중',
+    inProgress: '진행',
+    verification: '검증',
+    next: '다음',
+  };
+  const delta3 = buildAcpIntermediateReport({ ...base, newResultDelta: 3, newResult: '완료 항목 셋' });
+  assert.equal(delta3.includes('\n- Δ3 · 완료 항목 셋\n'), true);
+  expectContractError(() => buildAcpIntermediateReport({ ...base, newResultDelta: 0, newResult: '결과' }), 'invalid_reporting_report');
+  expectContractError(() => buildAcpIntermediateReport({ ...base, newResultDelta: 1 }), 'invalid_reporting_report');
+  expectContractError(() => buildAcpIntermediateReport({ ...base, newResultDelta: -1, newResult: '결과' }), 'invalid_reporting_report');
+  expectContractError(() => buildAcpIntermediateReport({ ...base, newResultDelta: '1', newResult: '결과' }), 'invalid_reporting_report');
+  const missingDelta = { ...base, newResult: '결과' };
+  expectContractError(() => buildAcpIntermediateReport(missingDelta), 'invalid_reporting_report');
+});
+
+test('regression: 마지막 ACP 활동 0분 전 validly coexists with Δ0 · 새로 확인된 ACP 결과 없음', () => {
+  // Activity age and Δ are independent: the run just produced normalized ACP
+  // activity (age 0), yet no result completed since the previous successfully
+  // delivered intermediate report (Δ0). Both statements share one report.
+  const message = buildAcpIntermediateReport({
+    ...REPORT_BUILDER_IDENTITY,
+    totalMinutes: 20,
+    phaseMinutes: 8,
+    lastAcpActivityMinutesAgo: 0,
+    phaseIndex: 2,
+    executionState: '범위 내 작업이 계속되는 중',
+    newResultDelta: 0,
+    inProgress: '긴 통합 테스트 실행',
+    verification: '이전 검증 유지',
+    next: '테스트 완료 대기',
+  });
+  const lines = message.split('\n');
+  assert.equal(lines[5], '⏱️ **ACP 시간**: 전체 20분 · 현재 단계 8분 · 마지막 ACP 활동 0분 전');
+  assert.equal(lines[9], '- Δ0 · 새로 확인된 ACP 결과 없음');
+  // The mirror case: a completed result increments Δ independently of a
+  // stale activity age.
+  const staleActivity = buildAcpIntermediateReport({
+    ...REPORT_BUILDER_IDENTITY,
+    totalMinutes: 20,
+    phaseMinutes: 8,
+    lastAcpActivityMinutesAgo: 5,
+    phaseIndex: 2,
+    executionState: '범위 내 작업이 계속되는 중',
+    newResultDelta: 2,
+    newResult: '완료된 결과 두 건',
+    inProgress: '다음 작업 준비',
+    verification: '검증 진행',
+    next: '다음 단계',
+  });
+  assert.equal(staleActivity.split('\n')[5], '⏱️ **ACP 시간**: 전체 20분 · 현재 단계 8분 · 마지막 ACP 활동 5분 전');
+  assert.equal(staleActivity.split('\n')[9], '- Δ2 · 완료된 결과 두 건');
 });
 
 test('report-message CLI builds both canonical kinds and rejects title drift', () => {
@@ -1268,9 +1369,10 @@ test('report-message CLI builds both canonical kinds and rejects title drift', (
     kind: 'intermediate',
     report: {
       ...REPORT_BUILDER_IDENTITY,
+      ...INTERMEDIATE_TIME_FIELDS,
       phaseIndex: 2,
       executionState: '구현 중',
-      newResult: '결과',
+      newResultDelta: 0,
       inProgress: '진행',
       verification: '검증',
       next: '다음',
@@ -1278,10 +1380,12 @@ test('report-message CLI builds both canonical kinds and rejects title drift', (
   });
   assert.equal(intermediate.status, 0);
   assert.equal(intermediate.stdout.startsWith('🔄 **ACP 중간 보고'), true);
+  assert.equal(intermediate.stdout.includes('마지막 ACP 활동 2분 전'), true);
+  assert.equal(intermediate.stdout.includes('- Δ0 · 새로 확인된 ACP 결과 없음'), true);
   const terminal = run({
     kind: 'terminal',
     report: {
-      ...REPORT_BUILDER_IDENTITY,
+      ...TERMINAL_BUILDER_IDENTITY,
       status: 'failed',
       summary: '실패 경계 확인',
       verification: '오류 확인',
@@ -1295,7 +1399,7 @@ test('report-message CLI builds both canonical kinds and rejects title drift', (
   const drift = run({
     kind: 'terminal',
     report: {
-      ...REPORT_BUILDER_IDENTITY,
+      ...TERMINAL_BUILDER_IDENTITY,
       status: 'completed',
       title: 'caller title',
       summary: '완료',
