@@ -84,6 +84,11 @@ export const ACP_REPORT_SECTION_HEADERS = Object.freeze([
   '⏭️ **ACP 다음**',
 ]);
 export const ACP_REPORT_ISSUE_HEADER = '⚠️ **이슈**';
+export const ACP_TERMINAL_REPORT_STATUSES = Object.freeze([
+  'completed',
+  'cancelled',
+  'failed',
+]);
 
 // The only valid phaseIndex → phaseName mappings for the 라운드 metadata line.
 export const ACP_REPORT_PHASES = Object.freeze({
@@ -615,6 +620,195 @@ function validateMiddleReport(report, expected) {
   for (const [index, label] of freeTextSlots) {
     assertNoForbiddenContent(lines[index], label);
   }
+}
+
+const REPORT_IDENTITY_INPUT_KEYS = Object.freeze([
+  'agent', 'model', 'roundIndex', 'repository', 'branch', 'timeKst', 'elapsed',
+]);
+const INTERMEDIATE_REPORT_INPUT_KEYS = Object.freeze([
+  ...REPORT_IDENTITY_INPUT_KEYS,
+  'phaseIndex', 'executionState', 'newResult', 'inProgress', 'verification',
+  'next', 'issue',
+]);
+const TERMINAL_REPORT_INPUT_KEYS = Object.freeze([
+  ...REPORT_IDENTITY_INPUT_KEYS,
+  'status', 'summary', 'verification', 'result', 'next', 'externalAction',
+]);
+
+function validateReportBuilderIdentity(input, allowedKeys, label) {
+  if (!isPlainObject(input)) {
+    fail('invalid_reporting_context', `${label} input must be a plain object`);
+  }
+  for (const key of Object.keys(input)) {
+    if (!allowedKeys.includes(key)) {
+      fail('invalid_reporting_context', `${label} input contains unsupported key "${describeKey(key)}"`);
+    }
+  }
+  const { agent, model, roundIndex, timeKst } = input;
+  assertCanonicalAgent(agent, 'input.agent');
+  if (!isValidModelString(model)) {
+    fail('invalid_reporting_context', 'input.model must be a non-empty single-line model string');
+  }
+  if (!Number.isInteger(roundIndex) || roundIndex < 1 || roundIndex > MAX_ROUND_INDEX) {
+    fail('invalid_reporting_round_index', `roundIndex must be a positive integer of at most ${MAX_ROUND_INDEX}`);
+  }
+  const repository = validateRepository(input.repository);
+  const branch = validateBranch(input.branch);
+  if (typeof timeKst !== 'string' || !TIME_KST_RE.test(timeKst)) {
+    fail('invalid_reporting_report', 'input.timeKst must be a 24-hour HH:MM time');
+  }
+  return {
+    agentLabel: ACP_AGENT_PRESENTATIONS[agent],
+    model,
+    roundIndex,
+    repository,
+    branch,
+    timeKst,
+  };
+}
+
+function validateReportSlot(value, label) {
+  if (
+    typeof value !== 'string' ||
+    !hasVisibleText(value) ||
+    SINGLE_LINE_CONTROL_RE.test(value) ||
+    value.includes('\n')
+  ) {
+    fail('invalid_reporting_report', `${label} must be visible single-line text`);
+  }
+  assertNoForbiddenContent(value, label);
+  return value;
+}
+
+/** Build and self-validate the canonical intermediate lifecycle report. */
+export function buildAcpIntermediateReport(input) {
+  const expected = validateReportBuilderIdentity(
+    input,
+    INTERMEDIATE_REPORT_INPUT_KEYS,
+    'intermediate-report'
+  );
+  const phaseName = ACP_REPORT_PHASES[input.phaseIndex];
+  if (!phaseName) {
+    fail('invalid_reporting_report', 'input.phaseIndex must be a canonical report phase');
+  }
+  const lines = [
+    `🔄 **ACP 중간 보고 · ${expected.timeKst} KST**`,
+    '',
+    `🤖 **ACP**: ${expected.agentLabel} · \`${expected.model}\``,
+    `📍 **작업**: \`${expected.repository}\` · \`${expected.branch}\``,
+    `🔢 **라운드**: ${expected.roundIndex} · ${input.phaseIndex}/4 ${phaseName}`,
+    `⏱️ **ACP 시간**: ${validateReportSlot(input.elapsed, 'input.elapsed')}`,
+    `🔁 **실행 상태**: ${validateReportSlot(input.executionState, 'input.executionState')}`,
+    '',
+    ACP_REPORT_SECTION_HEADERS[0],
+    `- ${validateReportSlot(input.newResult, 'input.newResult')}`,
+    '',
+    ACP_REPORT_SECTION_HEADERS[1],
+    `- ${validateReportSlot(input.inProgress, 'input.inProgress')}`,
+    '',
+    ACP_REPORT_SECTION_HEADERS[2],
+    `- ${validateReportSlot(input.verification, 'input.verification')}`,
+    '',
+    ACP_REPORT_SECTION_HEADERS[3],
+    `- ${validateReportSlot(input.next, 'input.next')}`,
+  ];
+  if (input.issue !== undefined) {
+    lines.push('', ACP_REPORT_ISSUE_HEADER, `- ${validateReportSlot(input.issue, 'input.issue')}`);
+  }
+  const report = lines.join('\n');
+  validateMiddleReport(report, expected);
+  return report;
+}
+
+const TERMINAL_TITLES = Object.freeze({
+  completed: '🏁 **ACP 완료 보고',
+  cancelled: '⛔ **ACP 취소 보고',
+  failed: '❌ **ACP 실패 보고',
+});
+
+const TERMINAL_OUTCOME_HEADERS = Object.freeze({
+  completed: '✅ **ACP 완료**',
+  cancelled: '⛔ **ACP 취소**',
+  failed: '❌ **ACP 실패**',
+});
+
+function validateTerminalReport(report, expected) {
+  if (report.length === 0 || report.length > MAX_DISCORD_MESSAGE_LENGTH || MULTILINE_CONTROL_RE.test(report)) {
+    fail('invalid_reporting_report', 'terminal report must be bounded text without control characters');
+  }
+  const lines = report.split('\n');
+  if (lines.length !== 20) {
+    fail('invalid_reporting_report', 'terminal report must match the exact 20-line template');
+  }
+  const exact = [
+    [0, `${TERMINAL_TITLES[expected.status]} · ${expected.timeKst} KST**`],
+    [1, ''],
+    [2, `🤖 **ACP**: ${expected.agentLabel} · \`${expected.model}\``],
+    [3, `📍 **작업**: \`${expected.repository}\` · \`${expected.branch}\``],
+    [4, `⏱️ **ACP 소요**: ${expected.elapsed} · 라운드 ${expected.roundIndex}`],
+    [5, ''],
+    [6, TERMINAL_OUTCOME_HEADERS[expected.status]],
+    [8, ''],
+    [9, '🧪 **ACP 자체 검증**'],
+    [11, ''],
+    [12, '📦 **결과**'],
+    [14, ''],
+    [15, '🔍 **다음**'],
+    [17, ''],
+    [18, '🔒 **외부 작업**'],
+  ];
+  for (const [index, value] of exact) {
+    if (lines[index] !== value) {
+      fail('invalid_reporting_report', `terminal report line ${index + 1} does not match the canonical template`);
+    }
+  }
+  for (const index of [7, 10, 13, 16, 19]) {
+    if (!isBulletLine(lines[index])) {
+      fail('invalid_reporting_report', 'terminal report sections require exactly one visible bullet');
+    }
+    assertNoForbiddenContent(lines[index], 'terminal report bullet');
+  }
+}
+
+/** Build and self-validate the canonical terminal lifecycle report. */
+export function buildAcpTerminalReport(input) {
+  const expected = validateReportBuilderIdentity(
+    input,
+    TERMINAL_REPORT_INPUT_KEYS,
+    'terminal-report'
+  );
+  if (!ACP_TERMINAL_REPORT_STATUSES.includes(input.status)) {
+    fail('invalid_reporting_report', 'input.status must be a canonical terminal status');
+  }
+  const terminal = {
+    ...expected,
+    status: input.status,
+    elapsed: validateReportSlot(input.elapsed, 'input.elapsed'),
+  };
+  const report = [
+    `${TERMINAL_TITLES[terminal.status]} · ${terminal.timeKst} KST**`,
+    '',
+    `🤖 **ACP**: ${terminal.agentLabel} · \`${terminal.model}\``,
+    `📍 **작업**: \`${terminal.repository}\` · \`${terminal.branch}\``,
+    `⏱️ **ACP 소요**: ${terminal.elapsed} · 라운드 ${terminal.roundIndex}`,
+    '',
+    TERMINAL_OUTCOME_HEADERS[terminal.status],
+    `- ${validateReportSlot(input.summary, 'input.summary')}`,
+    '',
+    '🧪 **ACP 자체 검증**',
+    `- ${validateReportSlot(input.verification, 'input.verification')}`,
+    '',
+    '📦 **결과**',
+    `- ${validateReportSlot(input.result, 'input.result')}`,
+    '',
+    '🔍 **다음**',
+    `- ${validateReportSlot(input.next, 'input.next')}`,
+    '',
+    '🔒 **외부 작업**',
+    `- ${validateReportSlot(input.externalAction, 'input.externalAction')}`,
+  ].join('\n');
+  validateTerminalReport(report, terminal);
+  return report;
 }
 
 function validateWatchdogMessage(message, expected) {

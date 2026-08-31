@@ -1,0 +1,18 @@
+{
+  "kind": "terminal",
+  "report": {
+    "agent": "AGENT_NAME",
+    "model": "MODEL_ID",
+    "roundIndex": 1,
+    "repository": "REPOSITORY_BASENAME",
+    "branch": "BRANCH_NAME",
+    "timeKst": "19:30",
+    "elapsed": "61분 경과",
+    "status": "completed",
+    "summary": "요청 범위 구현과 로컬 커밋 완료",
+    "verification": "필수 테스트 통과",
+    "result": "로컬 커밋 1개",
+    "next": "Eli 독립 검증 시작",
+    "externalAction": "없음"
+  }
+}

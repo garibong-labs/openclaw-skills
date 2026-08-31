@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 
 import {
   ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+  REPORT_CADENCE_MS,
+  acknowledgeHostTransportReport,
   activateHostTransport,
   prepareHostTransport,
   probeHostTransport,
@@ -15,10 +17,94 @@ import {
   statusHostTransport
 } from "./acp-host-transport.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
+import {
+  activateLifecycleLedger,
+  createLifecycleLedger,
+  loadLifecycleLedger,
+  recordLifecycleEvent
+} from "./acp-lifecycle-ledger.mjs";
 
 const CONTROL_CONVERSATION_ID = "100000000000000001";
 const START_MESSAGE_ID = "100000000000000002";
 const TRANSPORT_CLI = fileURLToPath(new URL("acp-host-transport-cli.mjs", import.meta.url));
+
+function publicationFixture(overrides = {}) {
+  return {
+    state: "receipt_acked",
+    kind: null,
+    cadence: 0,
+    reportId: null,
+    requiredAt: null,
+    evidenceThroughSequence: 0,
+    receiptMessageId: null,
+    acknowledgedMessageIds: [],
+    nextCadence: 1,
+    nextDueAt: null,
+    terminalSequence: null,
+    terminalStatus: null,
+    controlCursor: null,
+    controlCursorIssuedAt: null,
+    ...overrides
+  };
+}
+
+function reportingContextFixture() {
+  return {
+    agent: "codex",
+    model: "test-model",
+    roundIndex: 1,
+    repository: "openclaw-skills",
+    branch: "fix/acp-report-publication-state-machine",
+    controlConversationId: CONTROL_CONVERSATION_ID
+  };
+}
+
+function serviceAck(status, servicedAt) {
+  return {
+    cursor: status.serviceCursor,
+    conversationId: CONTROL_CONVERSATION_ID,
+    servicedAt: new Date(servicedAt).toISOString()
+  };
+}
+
+function writeStaticTransport({ root, handle, events, publication = publicationFixture(), exitCode = null }) {
+  if (process.platform !== "win32") fs.chmodSync(root, 0o700);
+  const prefix = path.join(root, `host-transport-${handle}`);
+  const transportFile = `${prefix}.json`;
+  const record = {
+    schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+    transportId: handle,
+    processHandle: handle,
+    configFile: path.join(root, "run.json"),
+    entryFile: path.join(root, "entry.mjs"),
+    eventsFile: `${prefix}.events.ndjson`,
+    stderrFile: `${prefix}.stderr.log`,
+    exitFile: `${prefix}.exit`,
+    environmentFile: `${prefix}.env.json`,
+    createdAt: new Date(0).toISOString(),
+    reportingContext: reportingContextFixture(),
+    publication
+  };
+  fs.writeFileSync(transportFile, JSON.stringify(record), { mode: 0o600 });
+  fs.writeFileSync(record.eventsFile, events.map((event) => JSON.stringify(event)).join("\n") + "\n", { mode: 0o600 });
+  if (exitCode !== null) fs.writeFileSync(record.exitFile, `${exitCode}\n`, { mode: 0o600 });
+  return { transportFile, processHandle: handle, record };
+}
+
+function event(sequence, type = "activity", timestampMs = sequence * 1000, extra = {}) {
+  return {
+    schemaVersion: "acp-discord-orchestrator.v1",
+    type,
+    sequence,
+    runId: "run-publication-test",
+    requestId: "request-publication-test",
+    timestamp: new Date(timestampMs).toISOString(),
+    elapsedMs: timestampMs,
+    ...extra
+  };
+}
+
+const ACTIVE_TMUX = { runTmux() { return { status: 0, stdout: "", stderr: "" }; } };
 
 function tmuxAvailable() {
   const result = spawnSync("tmux", ["-V"], { encoding: "utf8" });
@@ -93,8 +179,33 @@ export function createAcpRuntime() {
 }
 
 async function waitForExit(input) {
+  let prior;
   for (let index = 0; index < 100; index += 1) {
-    const status = statusHostTransport(input);
+    const nowMs = Date.now();
+    const status = statusHostTransport({
+      ...input,
+      ...(prior ? { serviceCursorAck: serviceAck(prior, nowMs) } : {})
+    }, { nowMs });
+    prior = status;
+    if (status.status === "terminal_publication_pending") {
+      acknowledgeHostTransportReport({
+        ...input,
+        reportId: status.reportPublication.reportId,
+        reportKind: "terminal",
+        cadence: 0,
+        receipt: {
+          conversationId: CONTROL_CONVERSATION_ID,
+          messageId: "100000000000000099",
+          deliveredAt: new Date(nowMs).toISOString(),
+          deliveryStatus: "delivered"
+        }
+      }, { nowMs });
+      const closedAt = nowMs + 1;
+      return statusHostTransport({
+        ...input,
+        serviceCursorAck: serviceAck(status, closedAt)
+      }, { nowMs: closedAt });
+    }
     if (status.status === "exited") {
       return status;
     }
@@ -160,7 +271,9 @@ test("status ignores an incomplete NDJSON tail until a later poll", () => {
     stderrFile: `${prefix}.stderr.log`,
     exitFile: `${prefix}.exit`,
     environmentFile: `${prefix}.env.json`,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    reportingContext: reportingContextFixture(),
+    publication: publicationFixture()
   };
   fs.writeFileSync(transportFile, JSON.stringify(record), { mode: 0o600 });
   fs.writeFileSync(record.eventsFile, '{"type":"activation_required"', { mode: 0o600 });
@@ -196,7 +309,9 @@ test("truncated status advances its cursor only through returned events", () => 
     stderrFile: `${prefix}.stderr.log`,
     exitFile: `${prefix}.exit`,
     environmentFile: `${prefix}.env.json`,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    reportingContext: reportingContextFixture(),
+    publication: publicationFixture()
   };
   fs.writeFileSync(transportFile, JSON.stringify(record), { mode: 0o600 });
   fs.writeFileSync(record.eventsFile, Array.from({ length: 66 }, (_, index) => JSON.stringify({
@@ -224,11 +339,345 @@ test("truncated status advances its cursor only through returned events", () => 
   const second = statusHostTransport({
     transportFile,
     processHandle: handle,
-    afterSequence: first.lastSequence
-  }, dependencies);
+    afterSequence: first.lastSequence,
+    serviceCursorAck: serviceAck(first, Date.now())
+  }, { ...dependencies, nowMs: Date.now() });
   assert.equal(second.events.length, 2);
   assert.equal(second.truncated, false);
   assert.equal(second.lastSequence, 66);
+});
+
+test("first cadence is required at exactly 600 seconds and freezes later evidence", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-publication-cadence-"));
+  const dueAt = REPORT_CADENCE_MS;
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-publication-cadence",
+    events: [event(1, "started", 0), event(2, "activity", dueAt)],
+    publication: publicationFixture({ nextDueAt: new Date(dueAt).toISOString() })
+  });
+  const before = statusHostTransport(fixture, { ...ACTIVE_TMUX, nowMs: dueAt - 1, randomUUID: () => "before" });
+  assert.equal(before.reportPublication, undefined);
+  const due = statusHostTransport({
+    ...fixture,
+    serviceCursorAck: serviceAck(before, dueAt)
+  }, { ...ACTIVE_TMUX, nowMs: dueAt, randomUUID: () => "due" });
+  assert.equal(due.reportPublication.state, "report_required");
+  assert.equal(due.reportPublication.kind, "intermediate");
+  assert.equal(due.reportPublication.cadence, 1);
+  assert.equal(due.lastSequence, 2);
+
+  fs.appendFileSync(fixture.record.eventsFile, JSON.stringify(event(3, "progress", dueAt + 1)) + "\n");
+  assert.throws(() => statusHostTransport(fixture, {
+    ...ACTIVE_TMUX,
+    nowMs: dueAt + 1
+  }), /host_transport_service_cursor_invalid/);
+  const blocked = statusHostTransport({
+    ...fixture,
+    afterSequence: due.lastSequence,
+    serviceCursorAck: serviceAck(due, dueAt + 1)
+  }, { ...ACTIVE_TMUX, nowMs: dueAt + 1, randomUUID: () => "blocked" });
+  assert.equal(blocked.reportPublication.state, "publication_pending");
+  assert.deepEqual(blocked.events, []);
+  assert.equal(blocked.lastSequence, 2);
+});
+
+test("report receipt validation stays blocked until exact destination delivery is acknowledged", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-publication-receipt-"));
+  const dueAt = REPORT_CADENCE_MS;
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-publication-receipt",
+    events: [event(1, "started", 0)],
+    publication: publicationFixture({ nextDueAt: new Date(dueAt).toISOString() })
+  });
+  const status = statusHostTransport(fixture, { ...ACTIVE_TMUX, nowMs: dueAt, randomUUID: () => "receipt" });
+  const base = {
+    ...fixture,
+    reportId: status.reportPublication.reportId,
+    reportKind: "intermediate",
+    cadence: 1
+  };
+  const validReceipt = {
+    conversationId: CONTROL_CONVERSATION_ID,
+    messageId: "100000000000000010",
+    deliveredAt: new Date(dueAt).toISOString(),
+    deliveryStatus: "delivered"
+  };
+  assert.throws(() => acknowledgeHostTransportReport(base, { nowMs: dueAt }), /host_transport_report_receipt_invalid/);
+  for (const deliveryStatus of ["failed", "queued", "pending", "", null, true]) {
+    assert.throws(() => acknowledgeHostTransportReport({
+      ...base,
+      receipt: { ...validReceipt, deliveryStatus }
+    }, { nowMs: dueAt }), /host_transport_report_receipt_invalid/);
+  }
+  assert.throws(() => acknowledgeHostTransportReport({ ...base, receipt: { ...validReceipt, conversationId: "999888777666555444" } }, { nowMs: dueAt }), /host_transport_report_receipt_invalid/);
+  assert.throws(() => acknowledgeHostTransportReport({ ...base, receipt: { ...validReceipt, deliveredAt: new Date(dueAt - 1).toISOString() } }, { nowMs: dueAt }), /host_transport_report_receipt_stale/);
+  const acked = acknowledgeHostTransportReport({ ...base, receipt: validReceipt }, { nowMs: dueAt });
+  assert.deepEqual(acked, {
+    schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+    type: "host_transport_report_acknowledged",
+    kind: "intermediate",
+    cadence: 1
+  });
+  assert.equal(JSON.stringify(acked).includes(validReceipt.messageId), false);
+  assert.throws(() => acknowledgeHostTransportReport({ ...base, receipt: validReceipt }, { nowMs: dueAt }), /host_transport_report_ack_duplicate/);
+
+  const nextDue = dueAt + REPORT_CADENCE_MS;
+  fs.appendFileSync(
+    fixture.record.eventsFile,
+    JSON.stringify(event(2, "activity", dueAt + 10, { elapsedMs: dueAt + 10 })) + "\n"
+  );
+  const unblocked = statusHostTransport({
+    ...fixture,
+    afterSequence: status.lastSequence,
+    serviceCursorAck: serviceAck(status, nextDue - 1)
+  }, { ...ACTIVE_TMUX, nowMs: nextDue - 1, randomUUID: () => "unblocked" });
+  assert.equal(unblocked.reportPublication.state, "receipt_acked");
+  assert.equal(unblocked.events.at(-1).elapsedMs, dueAt + 10);
+  const next = statusHostTransport({
+    ...fixture,
+    serviceCursorAck: serviceAck(unblocked, nextDue)
+  }, { ...ACTIVE_TMUX, nowMs: nextDue, randomUUID: () => "next" });
+  assert.equal(next.reportPublication.state, "report_required");
+  assert.equal(next.reportPublication.cadence, 2);
+  assert.equal(next.reportPublication.requiredAt, new Date(nextDue).toISOString());
+  assert.throws(() => acknowledgeHostTransportReport({
+    ...fixture,
+    reportId: next.reportPublication.reportId,
+    reportKind: "intermediate",
+    cadence: 2,
+    receipt: { ...validReceipt, deliveredAt: new Date(nextDue).toISOString() }
+  }, { nowMs: nextDue }), /host_transport_report_receipt_duplicate/);
+});
+
+test("intermediate acknowledgements accept both authorized success statuses and preserve elapsed cadence anchors", () => {
+  const dueAt = REPORT_CADENCE_MS;
+  const cases = [
+    { label: "on-time", deliveredAt: dueAt, deliveryStatus: "sent", nextAlreadyOverdue: false },
+    { label: "late", deliveredAt: dueAt + 4 * 60_000, deliveryStatus: "delivered", nextAlreadyOverdue: false },
+    { label: "already-overdue", deliveredAt: dueAt + 11 * 60_000, deliveryStatus: "sent", nextAlreadyOverdue: true },
+  ];
+  for (const [index, scenario] of cases.entries()) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `acp-cadence-anchor-${scenario.label}-`));
+    const fixture = writeStaticTransport({
+      root,
+      handle: `acp-cadence-anchor-${scenario.label}`,
+      events: [event(1, "started", 0)],
+      publication: publicationFixture({ nextDueAt: new Date(dueAt).toISOString() })
+    });
+    const due = statusHostTransport(fixture, {
+      ...ACTIVE_TMUX,
+      nowMs: dueAt,
+      randomUUID: () => `due-${scenario.label}`
+    });
+    acknowledgeHostTransportReport({
+      ...fixture,
+      reportId: due.reportPublication.reportId,
+      reportKind: "intermediate",
+      cadence: 1,
+      receipt: {
+        conversationId: CONTROL_CONVERSATION_ID,
+        messageId: `1000000000000001${index + 1}`,
+        deliveredAt: new Date(scenario.deliveredAt).toISOString(),
+        deliveryStatus: scenario.deliveryStatus
+      }
+    }, { nowMs: scenario.deliveredAt });
+
+    const persisted = JSON.parse(fs.readFileSync(fixture.transportFile, "utf8"));
+    const expectedNextDueAt = new Date(dueAt + REPORT_CADENCE_MS).toISOString();
+    assert.equal(persisted.publication.nextDueAt, expectedNextDueAt, scenario.label);
+
+    const afterAck = statusHostTransport({
+      ...fixture,
+      serviceCursorAck: serviceAck(due, scenario.deliveredAt)
+    }, {
+      ...ACTIVE_TMUX,
+      nowMs: scenario.deliveredAt,
+      randomUUID: () => `after-${scenario.label}`
+    });
+    assert.equal(
+      afterAck.reportPublication.state,
+      scenario.nextAlreadyOverdue ? "report_required" : "receipt_acked",
+      scenario.label
+    );
+    if (scenario.nextAlreadyOverdue) {
+      assert.equal(afterAck.reportPublication.cadence, 2);
+      assert.equal(afterAck.reportPublication.requiredAt, expectedNextDueAt);
+    }
+  }
+});
+
+test("terminal supersedes an overdue intermediate and requires exact terminal acknowledgement", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-publication-terminal-race-"));
+  const dueAt = REPORT_CADENCE_MS;
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-terminal-race",
+    events: [event(1, "started", 0), event(2, "activity", dueAt)],
+    publication: publicationFixture({ nextDueAt: new Date(dueAt).toISOString() })
+  });
+  const intermediate = statusHostTransport(fixture, { ...ACTIVE_TMUX, nowMs: dueAt, randomUUID: () => "middle" });
+  fs.appendFileSync(fixture.record.eventsFile, JSON.stringify(event(3, "progress", dueAt + 1)) + "\n");
+  fs.appendFileSync(fixture.record.eventsFile, JSON.stringify(event(4, "terminal", dueAt + 2, { status: "completed" })) + "\n");
+  const terminal = statusHostTransport({
+    ...fixture,
+    serviceCursorAck: serviceAck(intermediate, dueAt + 1)
+  }, { ...ACTIVE_TMUX, nowMs: dueAt + 2, randomUUID: () => "terminal" });
+  assert.equal(terminal.status, "terminal_publication_pending");
+  assert.equal(terminal.reportPublication.state, "report_required");
+  assert.equal(terminal.reportPublication.kind, "terminal");
+  assert.equal(terminal.reportPublication.cadence, 0);
+  assert.equal(terminal.events.at(-1).type, "terminal");
+  assert.equal(terminal.events.some((normalizedEvent) => normalizedEvent.type === "progress"), false);
+  const receipt = {
+    conversationId: CONTROL_CONVERSATION_ID,
+    messageId: "100000000000000020",
+    deliveredAt: new Date(dueAt + 2).toISOString(),
+    deliveryStatus: "delivered"
+  };
+  assert.throws(() => acknowledgeHostTransportReport({
+    ...fixture,
+    reportId: intermediate.reportPublication.reportId,
+    reportKind: "intermediate",
+    cadence: 1,
+    receipt
+  }, { nowMs: dueAt + 2 }), /host_transport_report_ack_mismatch/);
+  acknowledgeHostTransportReport({
+    ...fixture,
+    reportId: terminal.reportPublication.reportId,
+    reportKind: "terminal",
+    cadence: 0,
+    receipt
+  }, { nowMs: dueAt + 2 });
+  for (const normalizedEvent of terminal.events) {
+    const serialized = JSON.stringify(normalizedEvent);
+    assert.equal(serialized.includes(terminal.serviceCursor), false);
+    assert.equal(serialized.includes(terminal.reportPublication.reportId), false);
+    assert.equal(serialized.includes(fixture.processHandle), false);
+    assert.equal(serialized.includes(receipt.messageId), false);
+  }
+});
+
+test("terminal before ten minutes requires only terminal receipt", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-publication-early-terminal-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-early-terminal",
+    events: [event(1, "started", 0), event(2, "terminal", 599999, { status: "failed" })],
+    publication: publicationFixture({ nextDueAt: new Date(REPORT_CADENCE_MS).toISOString() })
+  });
+  const status = statusHostTransport(fixture, { ...ACTIVE_TMUX, nowMs: 599999, randomUUID: () => "early" });
+  assert.equal(status.reportPublication.kind, "terminal");
+  assert.equal(status.reportPublication.cadence, 0);
+  assert.equal(status.reportPublication.terminalStatus, "failed");
+});
+
+test("exit reconciliation remains terminal-publication-pending until terminal receipt acknowledgement", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-terminal-reconcile-"));
+  if (process.platform !== "win32") fs.chmodSync(root, 0o700);
+  const handle = "acp-terminal-reconcile";
+  const terminalEvent = event(2, "terminal", 5000, { status: "completed" });
+  const writer = createLifecycleLedger({
+    stateDir: root,
+    runId: terminalEvent.runId,
+    requestId: terminalEvent.requestId,
+    nowMs: 0
+  });
+  activateLifecycleLedger(writer, handle, 1);
+  recordLifecycleEvent(writer, terminalEvent, { expectedExitCode: 0, force: true });
+  const fixture = writeStaticTransport({
+    root,
+    handle,
+    events: [event(1, "started", 1), terminalEvent],
+    exitCode: 0
+  });
+  const nowMs = 5000;
+  const status = statusHostTransport(fixture, {
+    nowMs,
+    randomUUID: () => "terminal-reconcile",
+    runTmux() { return { status: 1, stdout: "", stderr: "" }; }
+  });
+  assert.equal(status.status, "terminal_publication_pending");
+  assert.equal(reconcileHostTransport(fixture).status, "terminal_publication_pending");
+  assert.equal(loadLifecycleLedger(writer.filePath).document.state, "exit_reconciled");
+  acknowledgeHostTransportReport({
+    ...fixture,
+    reportId: status.reportPublication.reportId,
+    reportKind: "terminal",
+    cadence: 0,
+    receipt: {
+      conversationId: CONTROL_CONVERSATION_ID,
+      messageId: "100000000000000040",
+      deliveredAt: new Date(nowMs).toISOString(),
+      deliveryStatus: "delivered"
+    }
+  }, { nowMs });
+  assert.equal(reconcileHostTransport(fixture).status, "exit_reconciled");
+});
+
+test("control service cursor prevents starvation and accepts only fresh exact-conversation attestation", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-service-cursor-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-service-cursor",
+    events: [event(1, "started", 0)]
+  });
+  const first = statusHostTransport(fixture, { ...ACTIVE_TMUX, nowMs: 1000, randomUUID: () => "first" });
+  assert.throws(() => statusHostTransport(fixture, { ...ACTIVE_TMUX, nowMs: 1001 }), /host_transport_service_cursor_invalid/);
+  assert.throws(() => statusHostTransport({
+    ...fixture,
+    serviceCursorAck: { ...serviceAck(first, 1001), conversationId: "999888777666555444" }
+  }, { ...ACTIVE_TMUX, nowMs: 1001 }), /host_transport_service_cursor_invalid/);
+  const second = statusHostTransport({
+    ...fixture,
+    serviceCursorAck: serviceAck(first, 1001)
+  }, { ...ACTIVE_TMUX, nowMs: 1001, randomUUID: () => "second" });
+  assert.equal(second.type, "host_transport_status");
+});
+
+test("ack-report CLI accepts only the private exact-key receipt shape and does not echo identifiers", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-ack-report-cli-"));
+  const nowMs = Date.now();
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-ack-report-cli",
+    events: [event(1, "started", nowMs - REPORT_CADENCE_MS)],
+    publication: publicationFixture({ nextDueAt: new Date(nowMs).toISOString() })
+  });
+  const status = statusHostTransport(fixture, {
+    ...ACTIVE_TMUX,
+    nowMs,
+    randomUUID: () => "ack-cli"
+  });
+  const messageId = "100000000000000050";
+  const inputFile = path.join(root, "ack.json");
+  fs.writeFileSync(inputFile, JSON.stringify({
+    schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+    action: "ack-report",
+    transportFile: fixture.transportFile,
+    processHandle: fixture.processHandle,
+    reportId: status.reportPublication.reportId,
+    reportKind: "intermediate",
+    cadence: 1,
+    receipt: {
+      conversationId: CONTROL_CONVERSATION_ID,
+      messageId,
+      deliveredAt: new Date(nowMs).toISOString(),
+      deliveryStatus: "delivered"
+    }
+  }), { mode: 0o600 });
+  const extraFile = path.join(root, "extra.json");
+  const extra = JSON.parse(fs.readFileSync(inputFile, "utf8"));
+  extra.receipt.source = "caller";
+  fs.writeFileSync(extraFile, JSON.stringify(extra), { mode: 0o600 });
+  const rejected = spawnSync(process.execPath, [TRANSPORT_CLI, "--input", extraFile], { encoding: "utf8" });
+  assert.equal(rejected.status, 64);
+  assert.equal(JSON.parse(rejected.stderr).code, "host_transport_report_receipt_invalid");
+  const result = spawnSync(process.execPath, [TRANSPORT_CLI, "--input", inputFile], { encoding: "utf8" });
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout.includes(messageId), false);
+  assert.equal(result.stdout.includes(CONTROL_CONVERSATION_ID), false);
 });
 
 test("launcher failures reconcile from exact transport terminal and exit evidence", () => {
@@ -249,7 +698,9 @@ test("launcher failures reconcile from exact transport terminal and exit evidenc
     stderrFile: `${prefix}.stderr.log`,
     exitFile: `${prefix}.exit`,
     environmentFile: `${prefix}.env.json`,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    reportingContext: reportingContextFixture(),
+    publication: publicationFixture()
   };
   fs.writeFileSync(transportFile, JSON.stringify(record), { mode: 0o600 });
   fs.writeFileSync(record.eventsFile, JSON.stringify({
@@ -259,10 +710,31 @@ test("launcher failures reconcile from exact transport terminal and exit evidenc
   }) + "\n", { mode: 0o600 });
   fs.writeFileSync(record.exitFile, "64\n", { mode: 0o600 });
 
-  assert.deepEqual(reconcileHostTransport({
+  const pending = reconcileHostTransport({
     transportFile,
     processHandle: handle
-  }), {
+  });
+  assert.equal(pending.status, "terminal_publication_pending");
+  const nowMs = Date.now();
+  const status = statusHostTransport({ transportFile, processHandle: handle }, {
+    nowMs,
+    randomUUID: () => "launcher-report",
+    runTmux() { return { status: 1, stdout: "", stderr: "" }; }
+  });
+  acknowledgeHostTransportReport({
+    transportFile,
+    processHandle: handle,
+    reportId: status.reportPublication.reportId,
+    reportKind: "terminal",
+    cadence: 0,
+    receipt: {
+      conversationId: CONTROL_CONVERSATION_ID,
+      messageId: "100000000000000030",
+      deliveredAt: new Date(nowMs).toISOString(),
+      deliveryStatus: "delivered"
+    }
+  }, { nowMs });
+  assert.deepEqual(reconcileHostTransport({ transportFile, processHandle: handle }), {
     schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
     type: "host_transport_reconciled",
     status: "pre_activation_exit_reconciled"

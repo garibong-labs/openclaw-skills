@@ -21,9 +21,13 @@ import {
 
 export const ACP_HOST_TRANSPORT_SCHEMA_VERSION = "acp-host-transport.v1";
 export const DEFAULT_TRANSPORT_EVENT_WAIT_MS = 5000;
+export const REPORT_CADENCE_MS = 600000;
+const REPORT_DELIVERY_SUCCESS_STATUSES = Object.freeze(["sent", "delivered"]);
+export const MAX_REPORT_RECEIPT_AGE_MS = 300000;
 
 const SAFE_HANDLE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const SAFE_EVENT_TYPE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const DECIMAL_ID = /^[0-9]{1,32}$/;
 const MAX_EVENT_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_RETURNED_EVENTS = 64;
 const PASSTHROUGH_ENV = new Set([
@@ -149,6 +153,105 @@ function writePrivateJson(filePath, value, flag = "wx") {
   }
 }
 
+function exactKeys(value, required) {
+  return isPlainObject(value) &&
+    Object.keys(value).length === required.length &&
+    required.every((key) => Object.hasOwn(value, key));
+}
+
+function validInstant(value) {
+  const milliseconds = typeof value === "string" ? Date.parse(value) : NaN;
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+function nowValue(dependencies) {
+  const value = dependencies.nowMs;
+  return typeof value === "function" ? value() : value ?? Date.now();
+}
+
+function newPrivateId(prefix, dependencies) {
+  const randomUUID = dependencies.randomUUID ?? crypto.randomUUID;
+  return `${prefix}-${randomUUID().replaceAll("-", "").slice(0, 24)}`;
+}
+
+function initialPublicationState() {
+  return {
+    state: "receipt_acked",
+    kind: null,
+    cadence: 0,
+    reportId: null,
+    requiredAt: null,
+    evidenceThroughSequence: 0,
+    receiptMessageId: null,
+    acknowledgedMessageIds: [],
+    nextCadence: 1,
+    nextDueAt: null,
+    terminalSequence: null,
+    terminalStatus: null,
+    controlCursor: null,
+    controlCursorIssuedAt: null
+  };
+}
+
+function validateReportingContext(value) {
+  if (!exactKeys(value, [
+    "agent", "model", "roundIndex", "repository", "branch", "controlConversationId"
+  ]) || !["claude", "codex"].includes(value.agent) ||
+    typeof value.model !== "string" || value.model.length < 1 || value.model.length > 256 ||
+    !Number.isSafeInteger(value.roundIndex) || value.roundIndex < 1 ||
+    typeof value.repository !== "string" || typeof value.branch !== "string" ||
+    typeof value.controlConversationId !== "string" || !DECIMAL_ID.test(value.controlConversationId)) {
+    transportFail("host_transport_record_invalid");
+  }
+  return value;
+}
+
+function validatePublication(value) {
+  const keys = [
+    "state", "kind", "cadence", "reportId", "requiredAt",
+    "evidenceThroughSequence", "receiptMessageId", "acknowledgedMessageIds", "nextCadence", "nextDueAt",
+    "terminalSequence", "terminalStatus", "controlCursor", "controlCursorIssuedAt"
+  ];
+  if (!exactKeys(value, keys) ||
+    !["report_required", "publication_pending", "receipt_acked"].includes(value.state) ||
+    ![null, "intermediate", "terminal"].includes(value.kind) ||
+    !Number.isSafeInteger(value.cadence) || value.cadence < 0 ||
+    !Number.isSafeInteger(value.evidenceThroughSequence) || value.evidenceThroughSequence < 0 ||
+    !Number.isSafeInteger(value.nextCadence) || value.nextCadence < 1 ||
+    (value.reportId !== null && !SAFE_HANDLE.test(value.reportId)) ||
+    (value.requiredAt !== null && !validInstant(value.requiredAt)) ||
+    (value.nextDueAt !== null && !validInstant(value.nextDueAt)) ||
+    (value.receiptMessageId !== null && !DECIMAL_ID.test(value.receiptMessageId)) ||
+    !Array.isArray(value.acknowledgedMessageIds) || value.acknowledgedMessageIds.length > 1024 ||
+    value.acknowledgedMessageIds.some((messageId) => typeof messageId !== "string" || !DECIMAL_ID.test(messageId)) ||
+    new Set(value.acknowledgedMessageIds).size !== value.acknowledgedMessageIds.length ||
+    (value.terminalSequence !== null && (!Number.isSafeInteger(value.terminalSequence) || value.terminalSequence < 1)) ||
+    ![null, "completed", "cancelled", "failed"].includes(value.terminalStatus) ||
+    (value.controlCursor !== null && !SAFE_HANDLE.test(value.controlCursor)) ||
+    (value.controlCursorIssuedAt !== null && !validInstant(value.controlCursorIssuedAt)) ||
+    ((value.controlCursor === null) !== (value.controlCursorIssuedAt === null))) {
+    transportFail("host_transport_record_invalid");
+  }
+  const hasReportIdentity = value.kind !== null && value.reportId !== null && value.requiredAt !== null;
+  const validKindShape = value.kind === null
+    ? value.cadence === 0 && value.reportId === null && value.requiredAt === null &&
+      value.receiptMessageId === null && value.terminalSequence === null && value.terminalStatus === null
+    : value.kind === "intermediate"
+      ? value.cadence >= 1 && value.terminalSequence === null && value.terminalStatus === null
+      : value.cadence === 0 && value.terminalSequence !== null && value.terminalStatus !== null;
+  const validStateShape = value.state === "receipt_acked"
+    ? value.kind === null || (hasReportIdentity && value.receiptMessageId !== null)
+    : hasReportIdentity && value.receiptMessageId === null;
+  if (!validKindShape || !validStateShape) {
+    transportFail("host_transport_record_invalid");
+  }
+  return value;
+}
+
+function persistTransportRecord(loaded) {
+  writePrivateJson(loaded.filePath, loaded.record, "w");
+}
+
 function runTmuxDefault(args, options = {}) {
   return spawnSync("tmux", args, {
     encoding: "utf8",
@@ -247,7 +350,9 @@ function parseTransportRecord(value) {
     "stderrFile",
     "exitFile",
     "environmentFile",
-    "createdAt"
+    "createdAt",
+    "reportingContext",
+    "publication"
   ];
   if (
     !isPlainObject(value) ||
@@ -272,6 +377,8 @@ function parseTransportRecord(value) {
   ]) {
     assertAbsolute(value[key], "host_transport_record_invalid");
   }
+  validateReportingContext(value.reportingContext);
+  validatePublication(value.publication);
   return value;
 }
 
@@ -447,7 +554,16 @@ export function prepareHostTransport(input, dependencies = {}) {
     stderrFile,
     exitFile,
     environmentFile,
-    createdAt: new Date(dependencies.nowMs ?? Date.now()).toISOString()
+    createdAt: new Date(nowValue(dependencies)).toISOString(),
+    reportingContext: {
+      agent: config.agent,
+      model: config.model ?? "runtime-default",
+      roundIndex: config.reporting.roundIndex,
+      repository: config.reporting.repository,
+      branch: config.reporting.branch,
+      controlConversationId: config.lifecycle.controlConversationId
+    },
+    publication: initialPublicationState()
   };
   const environment = dependencies.environment ?? process.env;
   writePrivateJson(environmentFile, selectChildEnvironment(
@@ -547,6 +663,16 @@ export async function activateHostTransport(input, dependencies = {}) {
   if (confirmed.event.type !== "activation_confirmed") {
     transportFail("host_transport_activation_rejected");
   }
+  const activatedAtMs = Date.parse(confirmed.event.timestamp);
+  const elapsedAtActivation = Number.isSafeInteger(confirmed.event.elapsedMs) && confirmed.event.elapsedMs >= 0
+    ? confirmed.event.elapsedMs
+    : 0;
+  const elapsedOriginMs = (Number.isFinite(activatedAtMs) ? activatedAtMs : nowValue(dependencies)) -
+    elapsedAtActivation;
+  loaded.record.publication.nextDueAt = new Date(
+    elapsedOriginMs + REPORT_CADENCE_MS
+  ).toISOString();
+  persistTransportRecord(loaded);
   return {
     schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
     type: "host_transport_activated",
@@ -555,6 +681,62 @@ export async function activateHostTransport(input, dependencies = {}) {
       path.dirname(loaded.record.eventsFile),
       confirmed.event.runId
     )
+  };
+}
+
+function validateServiceCursorAck(loaded, acknowledgement, nowMs) {
+  const publication = loaded.record.publication;
+  if (publication.controlCursor === null) {
+    if (acknowledgement !== undefined) {
+      transportFail("host_transport_service_cursor_unexpected");
+    }
+    return;
+  }
+  if (!exactKeys(acknowledgement, ["cursor", "conversationId", "servicedAt"]) ||
+    acknowledgement.cursor !== publication.controlCursor ||
+    acknowledgement.conversationId !== loaded.record.reportingContext.controlConversationId ||
+    !validInstant(acknowledgement.servicedAt)) {
+    transportFail("host_transport_service_cursor_invalid");
+  }
+  const servicedAt = Date.parse(acknowledgement.servicedAt);
+  const issuedAt = Date.parse(publication.controlCursorIssuedAt);
+  if (servicedAt < issuedAt || servicedAt > nowMs || nowMs - servicedAt > MAX_REPORT_RECEIPT_AGE_MS) {
+    transportFail("host_transport_service_cursor_stale");
+  }
+  publication.controlCursor = null;
+  publication.controlCursorIssuedAt = null;
+}
+
+function terminalStatus(event) {
+  return event.type === "terminal" && ["completed", "cancelled", "failed"].includes(event.status)
+    ? event.status
+    : "failed";
+}
+
+function requireReport(loaded, kind, cadence, requiredAtMs, evidenceThroughSequence, terminal = null, dependencies = {}) {
+  const publication = loaded.record.publication;
+  publication.state = "report_required";
+  publication.kind = kind;
+  publication.cadence = cadence;
+  publication.reportId = newPrivateId("report", dependencies);
+  publication.requiredAt = new Date(requiredAtMs).toISOString();
+  publication.evidenceThroughSequence = evidenceThroughSequence;
+  publication.receiptMessageId = null;
+  if (terminal) {
+    publication.terminalSequence = terminal.sequence;
+    publication.terminalStatus = terminalStatus(terminal);
+  }
+}
+
+function reportBoundary(publication, exposedState) {
+  if (publication.kind === null) return null;
+  return {
+    state: exposedState,
+    reportId: publication.reportId,
+    kind: publication.kind,
+    cadence: publication.cadence,
+    requiredAt: publication.requiredAt,
+    ...(publication.kind === "terminal" ? { terminalStatus: publication.terminalStatus } : {})
   };
 }
 
@@ -568,31 +750,133 @@ export function statusHostTransport(input, dependencies = {}) {
   if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
     transportFail("host_transport_cursor_invalid");
   }
+  const nowMs = nowValue(dependencies);
+  validateServiceCursorAck(loaded, input.serviceCursorAck, nowMs);
   const events = parseEvents(loaded.record.eventsFile);
-  const selected = events
-    .filter((event) => event.sequence > afterSequence)
-    .slice(0, MAX_RETURNED_EVENTS);
-  const latestSequence = events.at(-1)?.sequence ?? 0;
-  const returnedSequence = selected.at(-1)?.sequence ?? Math.min(afterSequence, latestSequence);
-  const exitCode = exitCodeFromFile(loaded.record.exitFile);
-  const active = sessionExists(dependencies.runTmux ?? runTmuxDefault, handle);
   const terminal = events.find((event) => [
     "terminal",
     "supervisor_error",
     "launcher_error"
   ].includes(event.type));
+  const publication = loaded.record.publication;
+  let exposedPublicationState = publication.state;
+  if (terminal && publication.terminalSequence !== terminal.sequence) {
+    // Canonical terminal evidence supersedes any overdue intermediate report.
+    const terminalEvidenceLimit = publication.kind === "intermediate" &&
+      publication.state !== "receipt_acked"
+      ? publication.evidenceThroughSequence
+      : terminal.sequence;
+    requireReport(loaded, "terminal", 0, Date.parse(terminal.timestamp) || nowMs, terminalEvidenceLimit, terminal, dependencies);
+    exposedPublicationState = "report_required";
+  } else if (
+    !terminal && publication.state === "receipt_acked" &&
+    publication.nextDueAt !== null && nowMs >= Date.parse(publication.nextDueAt)
+  ) {
+    requireReport(
+      loaded,
+      "intermediate",
+      publication.nextCadence,
+      Date.parse(publication.nextDueAt),
+      events.at(-1)?.sequence ?? 0,
+      null,
+      dependencies
+    );
+    exposedPublicationState = "report_required";
+  }
+  const evidenceLimit = publication.state === "receipt_acked"
+    ? Number.POSITIVE_INFINITY
+    : publication.evidenceThroughSequence;
+  const selected = events
+    .filter((event) => event.sequence > afterSequence)
+    .filter((event) => event.sequence <= evidenceLimit || event.sequence === publication.terminalSequence)
+    .slice(0, MAX_RETURNED_EVENTS);
+  const latestSequence = events.at(-1)?.sequence ?? 0;
+  const returnedSequence = selected.at(-1)?.sequence ?? (
+    publication.terminalSequence !== null && afterSequence >= publication.terminalSequence
+      ? Math.min(afterSequence, latestSequence)
+      : Math.min(afterSequence, latestSequence, evidenceLimit)
+  );
+  const exitCode = exitCodeFromFile(loaded.record.exitFile);
+  const active = sessionExists(dependencies.runTmux ?? runTmuxDefault, handle);
+  const cursor = newPrivateId("service", dependencies);
+  publication.controlCursor = cursor;
+  publication.controlCursorIssuedAt = new Date(nowMs).toISOString();
+  if (publication.state === "report_required") {
+    publication.state = "publication_pending";
+  }
+  persistTransportRecord(loaded);
+  const terminalPending = terminal && publication.kind === "terminal" && publication.state !== "receipt_acked";
   return {
     schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
     type: "host_transport_status",
-    status: active ? "active" : exitCode === null ? "unavailable" : "exited",
+    status: terminalPending
+      ? "terminal_publication_pending"
+      : active ? "active" : exitCode === null ? "unavailable" : "exited",
     processHandle: handle,
     // Advance only through evidence returned in this response. Jumping to the
     // file tail while `truncated` would make the next poll skip events.
     lastSequence: returnedSequence,
-    truncated: events.filter((event) => event.sequence > afterSequence).length > selected.length,
+    truncated: events.filter((event) =>
+      event.sequence > afterSequence &&
+      (event.sequence <= evidenceLimit || event.sequence === publication.terminalSequence)
+    ).length > selected.length,
     events: selected,
+    serviceCursor: cursor,
+    ...(reportBoundary(publication, exposedPublicationState)
+      ? { reportPublication: reportBoundary(publication, exposedPublicationState) }
+      : {}),
     ...(terminal ? { terminalType: terminal.type } : {}),
     ...(exitCode === null ? {} : { exitCode })
+  };
+}
+
+export function acknowledgeHostTransportReport(input, dependencies = {}) {
+  const loaded = loadHostTransportRecord(input.transportFile);
+  const handle = assertHandle(input.processHandle);
+  if (loaded.record.processHandle !== handle) {
+    transportFail("host_transport_handle_mismatch");
+  }
+  const publication = loaded.record.publication;
+  if (publication.state === "receipt_acked") {
+    transportFail("host_transport_report_ack_duplicate");
+  }
+  if (input.reportId !== publication.reportId || input.reportKind !== publication.kind || input.cadence !== publication.cadence) {
+    transportFail("host_transport_report_ack_mismatch");
+  }
+  const receipt = input.receipt;
+  if (!exactKeys(receipt, ["conversationId", "messageId", "deliveredAt", "deliveryStatus"]) ||
+    !REPORT_DELIVERY_SUCCESS_STATUSES.includes(receipt.deliveryStatus) ||
+    receipt.conversationId !== loaded.record.reportingContext.controlConversationId ||
+    typeof receipt.messageId !== "string" || !DECIMAL_ID.test(receipt.messageId) ||
+    !validInstant(receipt.deliveredAt)) {
+    transportFail("host_transport_report_receipt_invalid");
+  }
+  const nowMs = nowValue(dependencies);
+  const deliveredAt = Date.parse(receipt.deliveredAt);
+  if (publication.acknowledgedMessageIds.includes(receipt.messageId)) {
+    transportFail("host_transport_report_receipt_duplicate");
+  }
+  if (
+    deliveredAt < Date.parse(publication.requiredAt) || deliveredAt > nowMs ||
+    nowMs - deliveredAt > MAX_REPORT_RECEIPT_AGE_MS
+  ) {
+    transportFail("host_transport_report_receipt_stale");
+  }
+  publication.state = "receipt_acked";
+  publication.receiptMessageId = receipt.messageId;
+  publication.acknowledgedMessageIds.push(receipt.messageId);
+  if (publication.kind === "intermediate") {
+    publication.nextCadence = publication.cadence + 1;
+    publication.nextDueAt = new Date(
+      Date.parse(publication.requiredAt) + REPORT_CADENCE_MS
+    ).toISOString();
+  }
+  persistTransportRecord(loaded);
+  return {
+    schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+    type: "host_transport_report_acknowledged",
+    kind: publication.kind,
+    cadence: publication.cadence
   };
 }
 
@@ -611,10 +895,14 @@ export function reconcileHostTransport(input) {
     if (![22, 64].includes(exitCode)) {
       transportFail("host_transport_exit_mismatch");
     }
+    const terminalAcked = loaded.record.publication.kind === "terminal" &&
+      loaded.record.publication.state === "receipt_acked";
     return {
       schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
       type: "host_transport_reconciled",
-      status: "pre_activation_exit_reconciled"
+      status: terminalAcked
+        ? "pre_activation_exit_reconciled"
+        : "terminal_publication_pending"
     };
   }
   const runId = events.at(0)?.runId;
@@ -623,16 +911,20 @@ export function reconcileHostTransport(input) {
   }
   const ledgerFile = lifecycleLedgerPath(path.dirname(loaded.record.eventsFile), runId);
   const ledger = loadLifecycleLedger(ledgerFile).document;
-  const reconciled = reconcileLifecycleLedger({
-    ledgerFile,
-    processHandle: ledger.processHandle,
-    outcome: "exited",
-    exitCode
-  });
+  const reconciled = ledger.state === "exit_reconciled"
+    ? ledger
+    : reconcileLifecycleLedger({
+        ledgerFile,
+        processHandle: ledger.processHandle,
+        outcome: "exited",
+        exitCode
+      });
+  const terminalAcked = loaded.record.publication.kind === "terminal" &&
+    loaded.record.publication.state === "receipt_acked";
   return {
     schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
     type: "host_transport_reconciled",
-    status: reconciled.state
+    status: terminalAcked ? reconciled.state : "terminal_publication_pending"
   };
 }
 

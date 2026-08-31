@@ -18,6 +18,7 @@ import {
   ACP_REPORT_ISSUE_HEADER,
   ACP_REPORT_PHASES,
   ACP_REPORT_SECTION_HEADERS,
+  buildAcpIntermediateReport,
   buildAcpStartMessage
 } from "./acp-reporting-contract.mjs";
 
@@ -142,7 +143,35 @@ export function buildValidReporting({
   if (issueBullet) {
     reportLines.push("", ACP_REPORT_ISSUE_HEADER, issueBullet);
   }
-  const report = reportLines.join("\n");
+  let report;
+  if (
+    agentLabel === ACP_AGENT_PRESENTATIONS[agent] &&
+    sectionBullets.every((bullet) => typeof bullet === "string" && bullet.startsWith("- ")) &&
+    (issueBullet === null || (typeof issueBullet === "string" && issueBullet.startsWith("- ")))
+  ) {
+    try {
+      report = buildAcpIntermediateReport({
+        agent,
+        model,
+        roundIndex,
+        repository,
+        branch,
+        timeKst: "18:45",
+        phaseIndex: 2,
+        elapsed: "12분 경과",
+        executionState: "통합 검증이 계속되는 중",
+        newResult: sectionBullets[0].slice(2),
+        inProgress: sectionBullets[1].slice(2),
+        verification: sectionBullets[2].slice(2),
+        next: sectionBullets[3].slice(2),
+        ...(issueBullet === null ? {} : { issue: issueBullet.slice(2) })
+      });
+    } catch {
+      report = reportLines.join("\n");
+    }
+  } else {
+    report = reportLines.join("\n");
+  }
   return {
     schemaVersion,
     ...(schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V2 ? { agent } : {}),

@@ -3,11 +3,20 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   AcpReportingContractError,
+  buildAcpIntermediateReport,
   buildAcpStartMessage,
+  buildAcpTerminalReport,
   validateAcpReportingContract,
 } from './acp-reporting-contract.mjs';
+
+const REPORT_MESSAGE_CLI = fileURLToPath(new URL('acp-report-message-cli.mjs', import.meta.url));
 
 const REPO = 'openclaw-skills';
 const BRANCH = 'fix/acp-reporting-fail-closed-guard';
@@ -1124,4 +1133,178 @@ test('regression: hand-written round-1 title in a correction round fails; builde
   reporting.startMessage = built;
   reporting.startReceipt.message = built;
   validateAcpReportingContract(reporting, CONTEXT);
+});
+
+const REPORT_BUILDER_IDENTITY = Object.freeze({
+  agent: 'codex',
+  model: 'gpt-5-codex',
+  roundIndex: 2,
+  repository: REPO,
+  branch: BRANCH,
+  timeKst: '19:10',
+  elapsed: '17분 경과',
+});
+
+test('canonical intermediate builder derives title, label, metadata order, and fixed sections', () => {
+  const message = buildAcpIntermediateReport({
+    ...REPORT_BUILDER_IDENTITY,
+    phaseIndex: 3,
+    executionState: '자체 검증이 진행되는 중',
+    newResult: '게이트 구현 완료',
+    inProgress: '통합 테스트 실행',
+    verification: '집중 테스트 통과',
+    next: '전체 회귀 테스트 실행',
+  });
+  assert.equal(message, [
+    '🔄 **ACP 중간 보고 · 19:10 KST**',
+    '',
+    '🤖 **ACP**: Codex · `gpt-5-codex`',
+    `📍 **작업**: \`${REPO}\` · \`${BRANCH}\``,
+    '🔢 **라운드**: 2 · 3/4 자체 검증',
+    '⏱️ **ACP 시간**: 17분 경과',
+    '🔁 **실행 상태**: 자체 검증이 진행되는 중',
+    '',
+    '✅ **새 결과**',
+    '- 게이트 구현 완료',
+    '',
+    '🛠️ **ACP 진행 중**',
+    '- 통합 테스트 실행',
+    '',
+    '🧪 **ACP 자체 검증**',
+    '- 집중 테스트 통과',
+    '',
+    '⏭️ **ACP 다음**',
+    '- 전체 회귀 테스트 실행',
+  ].join('\n'));
+});
+
+test('canonical completed builder is byte-exact with the established 20-line success contract', () => {
+  const message = buildAcpTerminalReport({
+    ...REPORT_BUILDER_IDENTITY,
+    status: 'completed',
+    summary: '요청 범위 구현 완료',
+    verification: '전체 테스트 통과',
+    result: '로컬 커밋 1개 · 변경 파일 9개',
+    next: 'Eli 독립 검증 시작',
+    externalAction: '없음',
+  });
+  assert.equal(message, [
+    '🏁 **ACP 완료 보고 · 19:10 KST**',
+    '',
+    '🤖 **ACP**: Codex · `gpt-5-codex`',
+    `📍 **작업**: \`${REPO}\` · \`${BRANCH}\``,
+    '⏱️ **ACP 소요**: 17분 경과 · 라운드 2',
+    '',
+    '✅ **ACP 완료**',
+    '- 요청 범위 구현 완료',
+    '',
+    '🧪 **ACP 자체 검증**',
+    '- 전체 테스트 통과',
+    '',
+    '📦 **결과**',
+    '- 로컬 커밋 1개 · 변경 파일 9개',
+    '',
+    '🔍 **다음**',
+    '- Eli 독립 검증 시작',
+    '',
+    '🔒 **외부 작업**',
+    '- 없음',
+  ].join('\n'));
+});
+
+test('cancelled and failed terminal builders stay visibly distinct from success', () => {
+  const report = (status) => buildAcpTerminalReport({
+    ...REPORT_BUILDER_IDENTITY,
+    status,
+    summary: '터미널 경계 확인',
+    verification: '상태 검증',
+    result: '변경 없음',
+    next: '원인 검토',
+    externalAction: '없음',
+  });
+  const cancelled = report('cancelled');
+  const failed = report('failed');
+  assert.equal(cancelled.startsWith('⛔ **ACP 취소 보고 · 19:10 KST**'), true);
+  assert.equal(cancelled.includes('\n⛔ **ACP 취소**\n'), true);
+  assert.equal(failed.startsWith('❌ **ACP 실패 보고 · 19:10 KST**'), true);
+  assert.equal(failed.includes('\n❌ **ACP 실패**\n'), true);
+  assert.equal(cancelled.includes('🏁 **ACP 완료 보고'), false);
+  assert.equal(failed.includes('🏁 **ACP 완료 보고'), false);
+});
+
+test('report builders reject caller title, label, phase, status, and forbidden template drift', () => {
+  const intermediate = {
+    ...REPORT_BUILDER_IDENTITY,
+    phaseIndex: 2,
+    executionState: '구현 중',
+    newResult: '결과',
+    inProgress: '진행',
+    verification: '검증',
+    next: '다음',
+  };
+  expectContractError(() => buildAcpIntermediateReport({ ...intermediate, title: 'spoof' }), 'invalid_reporting_context');
+  expectContractError(() => buildAcpIntermediateReport({ ...intermediate, agentLabel: 'Claude Code' }), 'invalid_reporting_context');
+  expectContractError(() => buildAcpIntermediateReport({ ...intermediate, phaseIndex: 9 }), 'invalid_reporting_report');
+  expectContractError(() => buildAcpIntermediateReport({ ...intermediate, next: 'git status 확인' }), 'invalid_reporting_forbidden_content');
+  expectContractError(() => buildAcpTerminalReport({
+    ...REPORT_BUILDER_IDENTITY,
+    status: 'success',
+    summary: '완료',
+    verification: '통과',
+    result: '결과',
+    next: '검토',
+    externalAction: '없음',
+  }), 'invalid_reporting_report');
+});
+
+test('report-message CLI builds both canonical kinds and rejects title drift', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acp-report-builder-cli-'));
+  const run = (value) => {
+    const inputFile = path.join(root, `${Math.random()}.json`);
+    fs.writeFileSync(inputFile, JSON.stringify(value), { mode: 0o600 });
+    return spawnSync(process.execPath, [REPORT_MESSAGE_CLI, '--input', inputFile], { encoding: 'utf8' });
+  };
+  const intermediate = run({
+    kind: 'intermediate',
+    report: {
+      ...REPORT_BUILDER_IDENTITY,
+      phaseIndex: 2,
+      executionState: '구현 중',
+      newResult: '결과',
+      inProgress: '진행',
+      verification: '검증',
+      next: '다음',
+    },
+  });
+  assert.equal(intermediate.status, 0);
+  assert.equal(intermediate.stdout.startsWith('🔄 **ACP 중간 보고'), true);
+  const terminal = run({
+    kind: 'terminal',
+    report: {
+      ...REPORT_BUILDER_IDENTITY,
+      status: 'failed',
+      summary: '실패 경계 확인',
+      verification: '오류 확인',
+      result: '변경 없음',
+      next: '원인 검토',
+      externalAction: '없음',
+    },
+  });
+  assert.equal(terminal.status, 0);
+  assert.equal(terminal.stdout.startsWith('❌ **ACP 실패 보고'), true);
+  const drift = run({
+    kind: 'terminal',
+    report: {
+      ...REPORT_BUILDER_IDENTITY,
+      status: 'completed',
+      title: 'caller title',
+      summary: '완료',
+      verification: '검증',
+      result: '결과',
+      next: '검토',
+      externalAction: '없음',
+    },
+  });
+  assert.equal(drift.status, 64);
+  assert.equal(JSON.parse(drift.stderr).code, 'invalid_reporting_context');
 });
