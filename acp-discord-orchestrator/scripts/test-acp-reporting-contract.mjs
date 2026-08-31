@@ -3,11 +3,21 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   AcpReportingContractError,
+  buildAcpIntermediateReport,
   buildAcpStartMessage,
+  buildAcpTerminalReport,
   validateAcpReportingContract,
 } from './acp-reporting-contract.mjs';
+import { readReportMessageInput } from './acp-report-message-cli.mjs';
+
+const REPORT_MESSAGE_CLI = fileURLToPath(new URL('acp-report-message-cli.mjs', import.meta.url));
 
 const REPO = 'openclaw-skills';
 const BRANCH = 'fix/acp-reporting-fail-closed-guard';
@@ -1124,4 +1134,373 @@ test('regression: hand-written round-1 title in a correction round fails; builde
   reporting.startMessage = built;
   reporting.startReceipt.message = built;
   validateAcpReportingContract(reporting, CONTEXT);
+});
+
+const REPORT_BUILDER_IDENTITY = Object.freeze({
+  agent: 'codex',
+  model: 'gpt-5-codex',
+  roundIndex: 2,
+  repository: REPO,
+  branch: BRANCH,
+  timeKst: '19:10',
+});
+// The free-text elapsed slot survives only on the terminal 소요 line; the
+// intermediate time line is structured.
+const TERMINAL_BUILDER_IDENTITY = Object.freeze({
+  ...REPORT_BUILDER_IDENTITY,
+  elapsed: '17분 경과',
+});
+const INTERMEDIATE_TIME_FIELDS = Object.freeze({
+  totalMinutes: 17,
+  phaseMinutes: 6,
+  lastAcpActivityMinutesAgo: 2,
+});
+
+test('canonical intermediate builder derives title, label, metadata order, and fixed sections', () => {
+  const message = buildAcpIntermediateReport({
+    ...REPORT_BUILDER_IDENTITY,
+    ...INTERMEDIATE_TIME_FIELDS,
+    phaseIndex: 3,
+    executionState: '자체 검증이 진행되는 중',
+    newResultDelta: 1,
+    newResult: '게이트 구현 완료',
+    inProgress: '통합 테스트 실행',
+    verification: '집중 테스트 통과',
+    next: '전체 회귀 테스트 실행',
+  });
+  assert.equal(message, [
+    '🔄 **ACP 중간 보고 · 19:10 KST**',
+    '',
+    '🤖 **ACP**: Codex · `gpt-5-codex`',
+    `📍 **작업**: \`${REPO}\` · \`${BRANCH}\``,
+    '🔢 **라운드**: 2 · 3/4 자체 검증',
+    '⏱️ **ACP 시간**: 전체 17분 · 현재 단계 6분 · 마지막 ACP 활동 2분 전',
+    '🔁 **실행 상태**: 자체 검증이 진행되는 중',
+    '',
+    '✅ **새 결과**',
+    '- Δ1 · 게이트 구현 완료',
+    '',
+    '🛠️ **ACP 진행 중**',
+    '- 통합 테스트 실행',
+    '',
+    '🧪 **ACP 자체 검증**',
+    '- 집중 테스트 통과',
+    '',
+    '⏭️ **ACP 다음**',
+    '- 전체 회귀 테스트 실행',
+  ].join('\n'));
+});
+
+test('canonical completed builder is byte-exact with the established 20-line success contract', () => {
+  const message = buildAcpTerminalReport({
+    ...TERMINAL_BUILDER_IDENTITY,
+    status: 'completed',
+    summary: '요청 범위 구현 완료',
+    verification: '전체 테스트 통과',
+    result: '로컬 커밋 1개 · 변경 파일 9개',
+    next: 'Eli 독립 검증 시작',
+    externalAction: '없음',
+  });
+  assert.equal(message, [
+    '🏁 **ACP 완료 보고 · 19:10 KST**',
+    '',
+    '🤖 **ACP**: Codex · `gpt-5-codex`',
+    `📍 **작업**: \`${REPO}\` · \`${BRANCH}\``,
+    '⏱️ **ACP 소요**: 17분 경과 · 라운드 2',
+    '',
+    '✅ **ACP 완료**',
+    '- 요청 범위 구현 완료',
+    '',
+    '🧪 **ACP 자체 검증**',
+    '- 전체 테스트 통과',
+    '',
+    '📦 **결과**',
+    '- 로컬 커밋 1개 · 변경 파일 9개',
+    '',
+    '🔍 **다음**',
+    '- Eli 독립 검증 시작',
+    '',
+    '🔒 **외부 작업**',
+    '- 없음',
+  ].join('\n'));
+});
+
+test('cancelled and failed terminal builders stay visibly distinct from success', () => {
+  const report = (status) => buildAcpTerminalReport({
+    ...TERMINAL_BUILDER_IDENTITY,
+    status,
+    summary: '터미널 경계 확인',
+    verification: '상태 검증',
+    result: '변경 없음',
+    next: '원인 검토',
+    externalAction: '없음',
+  });
+  const cancelled = report('cancelled');
+  const failed = report('failed');
+  assert.equal(cancelled.startsWith('⛔ **ACP 취소 보고 · 19:10 KST**'), true);
+  assert.equal(cancelled.includes('\n⛔ **ACP 취소**\n'), true);
+  assert.equal(failed.startsWith('❌ **ACP 실패 보고 · 19:10 KST**'), true);
+  assert.equal(failed.includes('\n❌ **ACP 실패**\n'), true);
+  assert.equal(cancelled.includes('🏁 **ACP 완료 보고'), false);
+  assert.equal(failed.includes('🏁 **ACP 완료 보고'), false);
+});
+
+test('report builders reject caller title, label, phase, status, and forbidden template drift', () => {
+  const intermediate = {
+    ...REPORT_BUILDER_IDENTITY,
+    ...INTERMEDIATE_TIME_FIELDS,
+    phaseIndex: 2,
+    executionState: '구현 중',
+    newResultDelta: 1,
+    newResult: '결과',
+    inProgress: '진행',
+    verification: '검증',
+    next: '다음',
+  };
+  expectContractError(() => buildAcpIntermediateReport({ ...intermediate, title: 'spoof' }), 'invalid_reporting_context');
+  expectContractError(() => buildAcpIntermediateReport({ ...intermediate, agentLabel: 'Claude Code' }), 'invalid_reporting_context');
+  expectContractError(() => buildAcpIntermediateReport({ ...intermediate, phaseIndex: 9 }), 'invalid_reporting_report');
+  expectContractError(() => buildAcpIntermediateReport({ ...intermediate, next: 'git status 확인' }), 'invalid_reporting_forbidden_content');
+  expectContractError(() => buildAcpTerminalReport({
+    ...TERMINAL_BUILDER_IDENTITY,
+    status: 'success',
+    summary: '완료',
+    verification: '통과',
+    result: '결과',
+    next: '검토',
+    externalAction: '없음',
+  }), 'invalid_reporting_report');
+});
+
+test('intermediate builder derives the structured 시간 line and rejects ambiguous or incoherent time input', () => {
+  const valid = {
+    ...REPORT_BUILDER_IDENTITY,
+    ...INTERMEDIATE_TIME_FIELDS,
+    phaseIndex: 2,
+    executionState: '구현 중',
+    newResultDelta: 1,
+    newResult: '결과',
+    inProgress: '진행',
+    verification: '검증',
+    next: '다음',
+  };
+  // The pre-migration free-text elapsed key is ambiguous old input and the
+  // builder input shape is not a committed compatibility contract: reject.
+  expectContractError(() => buildAcpIntermediateReport({ ...valid, elapsed: '17분 경과' }), 'invalid_reporting_context');
+  // So is the ambiguous lastAcpStateChangeAt spelling of the activity age.
+  expectContractError(() => buildAcpIntermediateReport({ ...valid, lastAcpStateChangeAt: '2026-08-31T10:00:00.000Z' }), 'invalid_reporting_context');
+  for (const field of ['totalMinutes', 'phaseMinutes', 'lastAcpActivityMinutesAgo']) {
+    const missing = { ...valid };
+    delete missing[field];
+    expectContractError(() => buildAcpIntermediateReport(missing), 'invalid_reporting_report');
+    expectContractError(() => buildAcpIntermediateReport({ ...valid, [field]: -1 }), 'invalid_reporting_report');
+    expectContractError(() => buildAcpIntermediateReport({ ...valid, [field]: 3.5 }), 'invalid_reporting_report');
+    expectContractError(() => buildAcpIntermediateReport({ ...valid, [field]: '17분' }), 'invalid_reporting_report');
+  }
+  expectContractError(() => buildAcpIntermediateReport({ ...valid, phaseMinutes: 18 }), 'invalid_reporting_report');
+  expectContractError(() => buildAcpIntermediateReport({ ...valid, lastAcpActivityMinutesAgo: 18 }), 'invalid_reporting_report');
+});
+
+test('Δ counts newly completed results and requires the canonical no-result bullet at Δ0', () => {
+  const base = {
+    ...REPORT_BUILDER_IDENTITY,
+    ...INTERMEDIATE_TIME_FIELDS,
+    phaseIndex: 2,
+    executionState: '구현 중',
+    inProgress: '진행',
+    verification: '검증',
+    next: '다음',
+  };
+  const delta3 = buildAcpIntermediateReport({ ...base, newResultDelta: 3, newResult: '완료 항목 셋' });
+  assert.equal(delta3.includes('\n- Δ3 · 완료 항목 셋\n'), true);
+  expectContractError(() => buildAcpIntermediateReport({ ...base, newResultDelta: 0, newResult: '결과' }), 'invalid_reporting_report');
+  expectContractError(() => buildAcpIntermediateReport({ ...base, newResultDelta: 1 }), 'invalid_reporting_report');
+  expectContractError(() => buildAcpIntermediateReport({ ...base, newResultDelta: -1, newResult: '결과' }), 'invalid_reporting_report');
+  expectContractError(() => buildAcpIntermediateReport({ ...base, newResultDelta: '1', newResult: '결과' }), 'invalid_reporting_report');
+  const missingDelta = { ...base, newResult: '결과' };
+  expectContractError(() => buildAcpIntermediateReport(missingDelta), 'invalid_reporting_report');
+});
+
+test('regression: 마지막 ACP 활동 0분 전 validly coexists with Δ0 · 새로 확인된 ACP 결과 없음', () => {
+  // Activity age and Δ are independent: the run just produced normalized ACP
+  // activity (age 0), yet no result completed since the previous successfully
+  // delivered intermediate report (Δ0). Both statements share one report.
+  const message = buildAcpIntermediateReport({
+    ...REPORT_BUILDER_IDENTITY,
+    totalMinutes: 20,
+    phaseMinutes: 8,
+    lastAcpActivityMinutesAgo: 0,
+    phaseIndex: 2,
+    executionState: '범위 내 작업이 계속되는 중',
+    newResultDelta: 0,
+    inProgress: '긴 통합 테스트 실행',
+    verification: '이전 검증 유지',
+    next: '테스트 완료 대기',
+  });
+  const lines = message.split('\n');
+  assert.equal(lines[5], '⏱️ **ACP 시간**: 전체 20분 · 현재 단계 8분 · 마지막 ACP 활동 0분 전');
+  assert.equal(lines[9], '- Δ0 · 새로 확인된 ACP 결과 없음');
+  // The mirror case: a completed result increments Δ independently of a
+  // stale activity age.
+  const staleActivity = buildAcpIntermediateReport({
+    ...REPORT_BUILDER_IDENTITY,
+    totalMinutes: 20,
+    phaseMinutes: 8,
+    lastAcpActivityMinutesAgo: 5,
+    phaseIndex: 2,
+    executionState: '범위 내 작업이 계속되는 중',
+    newResultDelta: 2,
+    newResult: '완료된 결과 두 건',
+    inProgress: '다음 작업 준비',
+    verification: '검증 진행',
+    next: '다음 단계',
+  });
+  assert.equal(staleActivity.split('\n')[5], '⏱️ **ACP 시간**: 전체 20분 · 현재 단계 8분 · 마지막 ACP 활동 5분 전');
+  assert.equal(staleActivity.split('\n')[9], '- Δ2 · 완료된 결과 두 건');
+});
+
+test('report-message CLI builds both canonical kinds and rejects title drift', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acp-report-builder-cli-'));
+  const run = (value) => {
+    const inputFile = path.join(root, `${Math.random()}.json`);
+    fs.writeFileSync(inputFile, JSON.stringify(value), { mode: 0o600 });
+    return spawnSync(process.execPath, [REPORT_MESSAGE_CLI, '--input', inputFile], { encoding: 'utf8' });
+  };
+  const intermediate = run({
+    kind: 'intermediate',
+    report: {
+      ...REPORT_BUILDER_IDENTITY,
+      ...INTERMEDIATE_TIME_FIELDS,
+      phaseIndex: 2,
+      executionState: '구현 중',
+      newResultDelta: 0,
+      inProgress: '진행',
+      verification: '검증',
+      next: '다음',
+    },
+  });
+  assert.equal(intermediate.status, 0);
+  assert.equal(intermediate.stdout.startsWith('🔄 **ACP 중간 보고'), true);
+  assert.equal(intermediate.stdout.includes('마지막 ACP 활동 2분 전'), true);
+  assert.equal(intermediate.stdout.includes('- Δ0 · 새로 확인된 ACP 결과 없음'), true);
+  const terminal = run({
+    kind: 'terminal',
+    report: {
+      ...TERMINAL_BUILDER_IDENTITY,
+      status: 'failed',
+      summary: '실패 경계 확인',
+      verification: '오류 확인',
+      result: '변경 없음',
+      next: '원인 검토',
+      externalAction: '없음',
+    },
+  });
+  assert.equal(terminal.status, 0);
+  assert.equal(terminal.stdout.startsWith('❌ **ACP 실패 보고'), true);
+  const drift = run({
+    kind: 'terminal',
+    report: {
+      ...TERMINAL_BUILDER_IDENTITY,
+      status: 'completed',
+      title: 'caller title',
+      summary: '완료',
+      verification: '검증',
+      result: '결과',
+      next: '검토',
+      externalAction: '없음',
+    },
+  });
+  assert.equal(drift.status, 64);
+  assert.equal(JSON.parse(drift.stderr).code, 'invalid_reporting_context');
+});
+
+test('report builders allow Claude runtime default but require explicit non-Claude models', () => {
+  const intermediate = {
+    ...REPORT_BUILDER_IDENTITY,
+    ...INTERMEDIATE_TIME_FIELDS,
+    agent: 'claude',
+    phaseIndex: 2,
+    executionState: '구현 중',
+    newResultDelta: 0,
+    inProgress: '진행',
+    verification: '검증',
+    next: '다음',
+  };
+  delete intermediate.model;
+  const claude = buildAcpIntermediateReport(intermediate);
+  assert.equal(claude.includes('Claude Code · `runtime-default`'), true);
+  const terminal = {
+    ...TERMINAL_BUILDER_IDENTITY,
+    agent: 'claude',
+    status: 'completed',
+    summary: '완료',
+    verification: '검증',
+    result: '결과',
+    next: '확인',
+    externalAction: '없음',
+  };
+  delete terminal.model;
+  assert.equal(buildAcpTerminalReport(terminal).includes('Claude Code · `runtime-default`'), true);
+
+  const codexMissing = { ...intermediate, agent: 'codex' };
+  expectContractError(() => buildAcpIntermediateReport(codexMissing), 'invalid_reporting_context');
+  expectContractError(() => buildAcpIntermediateReport({
+    ...codexMissing,
+    model: 'runtime-default',
+  }), 'invalid_reporting_context');
+  expectContractError(() => buildAcpTerminalReport({ ...terminal, agent: 'codex' }), 'invalid_reporting_context');
+  expectContractError(() => buildAcpStartMessage({
+    agent: 'codex',
+    model: 'runtime-default',
+    roundIndex: 1,
+    repository: REPO,
+    branch: BRANCH,
+    timeKst: '12:34',
+    scope: '범위 확인',
+    externalAction: '없음',
+  }), 'invalid_reporting_context');
+});
+
+test('phaseIndex accepts only integer own properties of the canonical phase map', () => {
+  const base = {
+    ...REPORT_BUILDER_IDENTITY,
+    ...INTERMEDIATE_TIME_FIELDS,
+    executionState: '구현 중',
+    newResultDelta: 0,
+    inProgress: '진행',
+    verification: '검증',
+    next: '다음',
+  };
+  for (const phaseIndex of ['2', 'toString', 2.5, 0, 5]) {
+    expectContractError(
+      () => buildAcpIntermediateReport({ ...base, phaseIndex }),
+      'invalid_reporting_report'
+    );
+  }
+  assert.equal(buildAcpIntermediateReport({ ...base, phaseIndex: 2 }).includes('2/4 구현'), true);
+});
+
+test('report input reader distinguishes empty, oversized, unreadable, and invalid JSON files', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acp-report-reader-'));
+  const empty = path.join(root, 'empty.json');
+  const oversized = path.join(root, 'oversized.json');
+  const invalid = path.join(root, 'invalid.json');
+  const readable = path.join(root, 'readable.json');
+  fs.writeFileSync(empty, '', { mode: 0o600 });
+  fs.writeFileSync(oversized, 'x'.repeat(65537), { mode: 0o600 });
+  fs.writeFileSync(invalid, '{', { mode: 0o600 });
+  fs.writeFileSync(readable, '{}', { mode: 0o600 });
+  assert.throws(() => readReportMessageInput(empty), /invalid_input_file_empty/);
+  assert.throws(() => readReportMessageInput(oversized), /invalid_input_file_too_large/);
+  assert.throws(() => readReportMessageInput(invalid), /invalid_input_json/);
+  assert.throws(() => readReportMessageInput(readable, {
+    fileSystem: {
+      lstatSync: (filePath) => fs.lstatSync(filePath),
+      readFileSync() {
+        const error = new Error('synthetic unreadable');
+        error.code = 'EACCES';
+        throw error;
+      },
+    },
+  }), /invalid_input_file_unreadable/);
 });

@@ -18,6 +18,7 @@ import {
   ACP_REPORT_ISSUE_HEADER,
   ACP_REPORT_PHASES,
   ACP_REPORT_SECTION_HEADERS,
+  buildAcpIntermediateReport,
   buildAcpStartMessage
 } from "./acp-reporting-contract.mjs";
 
@@ -32,32 +33,19 @@ const DEFAULT_SECTION_BULLETS = Object.freeze([
 ]);
 
 const FIXTURE_START_TIME_KST = "18:30";
+const FIXTURE_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9_.:/@+-]*(?:\[[A-Za-z0-9]+\])?$/;
 
-// Canonical path: the production builder. Returns null when the fixture
-// inputs are not the builder's valid shape (spoofed label, screened bullet,
-// non-canonical agent, …) so the caller falls back to literal assembly.
-function tryBuildStartMessage({ agent, agentLabel, model, roundIndex, repository, branch, scopeBullet }) {
-  if (
-    agentLabel !== ACP_AGENT_PRESENTATIONS[agent] ||
-    typeof scopeBullet !== "string" ||
-    !scopeBullet.startsWith("- ")
-  ) {
-    return null;
-  }
-  try {
-    return buildAcpStartMessage({
-      agent,
-      model,
-      roundIndex,
-      repository,
-      branch,
-      timeKst: FIXTURE_START_TIME_KST,
-      scope: scopeBullet.slice(2),
-      externalAction: "없음"
-    });
-  } catch {
-    return null;
-  }
+function buildCanonicalStartFixture({ agent, model, roundIndex, repository, branch, scopeBullet }) {
+  return buildAcpStartMessage({
+    agent,
+    model,
+    roundIndex,
+    repository,
+    branch,
+    timeKst: FIXTURE_START_TIME_KST,
+    scope: scopeBullet.slice(2),
+    externalAction: "없음"
+  });
 }
 
 // Literal fallback for deliberately invalid bundles, byte-identical to the
@@ -120,21 +108,34 @@ export function buildValidReporting({
   // scopeBullet, a non-canonical agent) cannot pass the fail-closed builder
   // and fall back to literal assembly: the contract under test, not this
   // fixture, must be what rejects them.
-  const startMessage =
-    tryBuildStartMessage({ agent, agentLabel, model, roundIndex, repository, branch, scopeBullet }) ??
-    buildLiteralStartMessage({ agentLabel, model, roundIndex, repository, branch, scopeBullet });
+  const deliberatelyInvalidStartFixture =
+    agentLabel !== ACP_AGENT_PRESENTATIONS[agent] ||
+    scopeBullet !== "- 통합 픽스처 검증" ||
+    typeof model !== "string" || model.length > 256 ||
+    !FIXTURE_MODEL_ID.test(model) ||
+    (agent !== "claude" && model === "runtime-default");
+  const startMessage = deliberatelyInvalidStartFixture
+    ? buildLiteralStartMessage({ agentLabel, model, roundIndex, repository, branch, scopeBullet })
+    : buildCanonicalStartFixture({ agent, model, roundIndex, repository, branch, scopeBullet });
   const reportLines = [
     "🔄 **ACP 중간 보고 · 18:45 KST**",
     "",
     `🤖 **ACP**: ${agentLabel} · \`${model}\``,
     `📍 **작업**: \`${repository}\` · \`${branch}\``,
     `🔢 **라운드**: ${roundIndex} · 2/4 ${ACP_REPORT_PHASES[2]}`,
-    "⏱️ **ACP 시간**: 12분 경과",
+    "⏱️ **ACP 시간**: 전체 12분 · 현재 단계 4분 · 마지막 ACP 활동 0분 전",
     "🔁 **실행 상태**: 통합 검증이 계속되는 중",
     ""
   ];
   for (let i = 0; i < ACP_REPORT_SECTION_HEADERS.length; i += 1) {
-    reportLines.push(ACP_REPORT_SECTION_HEADERS[i], sectionBullets[i]);
+    // The 새 결과 bullet carries the structured Δ result counter, mirroring
+    // the builder's `newResultDelta` derivation, so the literal fallback
+    // stays byte-identical to builder output for well-formed bullets.
+    const bullet =
+      i === 0 && typeof sectionBullets[0] === "string" && sectionBullets[0].startsWith("- ")
+        ? `- Δ1 · ${sectionBullets[0].slice(2)}`
+        : sectionBullets[i];
+    reportLines.push(ACP_REPORT_SECTION_HEADERS[i], bullet);
     if (i < ACP_REPORT_SECTION_HEADERS.length - 1) {
       reportLines.push("");
     }
@@ -142,7 +143,37 @@ export function buildValidReporting({
   if (issueBullet) {
     reportLines.push("", ACP_REPORT_ISSUE_HEADER, issueBullet);
   }
-  const report = reportLines.join("\n");
+  let report;
+  if (
+    agentLabel === ACP_AGENT_PRESENTATIONS[agent] &&
+    !deliberatelyInvalidStartFixture &&
+    sectionBullets.every((bullet) => typeof bullet === "string" && bullet.startsWith("- ")) &&
+    (issueBullet === null || (typeof issueBullet === "string" && issueBullet.startsWith("- ")))
+  ) {
+    // Inputs admitted by this branch are intended to be valid. Let a builder
+    // regression fail loudly instead of silently replacing canonical output.
+    report = buildAcpIntermediateReport({
+      agent,
+      model,
+      roundIndex,
+      repository,
+      branch,
+      timeKst: "18:45",
+      phaseIndex: 2,
+      totalMinutes: 12,
+      phaseMinutes: 4,
+      lastAcpActivityMinutesAgo: 0,
+      executionState: "통합 검증이 계속되는 중",
+      newResultDelta: 1,
+      newResult: sectionBullets[0].slice(2),
+      inProgress: sectionBullets[1].slice(2),
+      verification: sectionBullets[2].slice(2),
+      next: sectionBullets[3].slice(2),
+      ...(issueBullet === null ? {} : { issue: issueBullet.slice(2) })
+    });
+  } else {
+    report = reportLines.join("\n");
+  }
   return {
     schemaVersion,
     ...(schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V2 ? { agent } : {}),

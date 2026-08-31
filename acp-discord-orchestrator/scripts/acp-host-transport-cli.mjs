@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+  acknowledgeHostTransportReport,
   activateHostTransport,
   cancelHostTransport,
   prepareHostTransport,
@@ -36,7 +37,10 @@ function exitCodeFor(code) {
     code === "host_transport_action_invalid" ||
     code === "host_transport_handle_invalid" ||
     code === "host_transport_handle_mismatch" ||
-    code === "host_transport_cursor_invalid"
+    code === "host_transport_cursor_invalid" ||
+    code.startsWith("host_transport_service_cursor_") ||
+    code.startsWith("host_transport_report_ack_") ||
+    code.startsWith("host_transport_report_receipt_")
     ? INVALID_INPUT_EXIT
     : TRANSPORT_ERROR_EXIT;
 }
@@ -107,8 +111,23 @@ async function dispatch(input) {
     return activateHostTransport(input);
   }
   if (input.action === "status") {
-    assertExactKeys(input, [...base, "transportFile", "processHandle"], ["afterSequence"]);
+    assertExactKeys(input, [...base, "transportFile", "processHandle"], [
+      "afterSequence", "serviceCursorAck", "reissueServiceCursor"
+    ]);
     return statusHostTransport(input);
+  }
+  if (input.action === "ack-report") {
+    assertExactKeys(input, [
+      ...base,
+      "transportFile",
+      "processHandle",
+      "reportId",
+      "reportKind",
+      "cadence",
+      "report",
+      "receipt"
+    ]);
+    return acknowledgeHostTransportReport(input);
   }
   if (input.action === "reconcile") {
     assertExactKeys(input, [...base, "transportFile", "processHandle"]);

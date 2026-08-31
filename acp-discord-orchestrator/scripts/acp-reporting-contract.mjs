@@ -84,6 +84,18 @@ export const ACP_REPORT_SECTION_HEADERS = Object.freeze([
   '⏭️ **ACP 다음**',
 ]);
 export const ACP_REPORT_ISSUE_HEADER = '⚠️ **이슈**';
+export const ACP_TERMINAL_REPORT_STATUSES = Object.freeze([
+  'completed',
+  'cancelled',
+  'failed',
+]);
+// Canonical 새 결과 bullet content when no material ACP result completed since
+// the last successfully delivered intermediate report. The Δ counter and the
+// 마지막 ACP 활동 age are independent by contract: fresh ACP activity (reads,
+// edits, searches, command completions) with no newly completed material
+// result renders `Δ0 · 새로 확인된 ACP 결과 없음` next to an activity age of
+// `0분 전`.
+export const ACP_REPORT_NO_NEW_RESULT = '새로 확인된 ACP 결과 없음';
 
 // The only valid phaseIndex → phaseName mappings for the 라운드 metadata line.
 export const ACP_REPORT_PHASES = Object.freeze({
@@ -281,6 +293,9 @@ function validateContext(context) {
   } else if (!isValidModelString(model)) {
     fail('invalid_reporting_context', 'context.model must be omitted or a non-empty single-line model string');
   } else {
+    if (agent !== 'claude' && model === ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL) {
+      fail('invalid_reporting_context', 'context.model must name the explicit effective model for this agent');
+    }
     resolvedModel = model;
   }
   if (typeof controlConversationId !== 'string' || !DECIMAL_ID_RE.test(controlConversationId)) {
@@ -506,6 +521,9 @@ export function buildAcpStartMessage(input) {
   } else if (!isValidModelString(model)) {
     fail('invalid_reporting_context', 'input.model must be omitted or a non-empty single-line model string');
   } else {
+    if (agent !== 'claude' && model === ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL) {
+      fail('invalid_reporting_context', 'input.model must name the explicit effective model for this agent');
+    }
     resolvedModel = model;
   }
   if (!Number.isInteger(roundIndex) || roundIndex < 1 || roundIndex > MAX_ROUND_INDEX) {
@@ -615,6 +633,275 @@ function validateMiddleReport(report, expected) {
   for (const [index, label] of freeTextSlots) {
     assertNoForbiddenContent(lines[index], label);
   }
+}
+
+const REPORT_IDENTITY_INPUT_KEYS = Object.freeze([
+  'agent', 'model', 'roundIndex', 'repository', 'branch', 'timeKst',
+]);
+// The intermediate time line is structured, never free text: 전체/현재 단계
+// come from ACP elapsed bookkeeping, and 마지막 ACP 활동 is the activity age
+// of the latest normalized ACP model/tool/status/activity event
+// (`lastAcpActivityAt` at the transport boundary). Δ is independent of that
+// age and belongs to the owner-confirmed reporting snapshot, never to the
+// transport: `newResultDelta` counts material ACP results completed since the
+// previous successfully delivered intermediate report, and the owner advances
+// that semantic result cursor only after a verified delivery receipt. Raw
+// tool completions (reads, edits, searches, command runs) are activity, never
+// a material-result classifier. The legacy free-text `elapsed` key is
+// deliberately absent here (still valid for the terminal 소요 line):
+// pre-existing intermediate inputs carrying it fail as an unsupported key
+// because the builder input shape is not a committed compatibility contract.
+const INTERMEDIATE_REPORT_INPUT_KEYS = Object.freeze([
+  ...REPORT_IDENTITY_INPUT_KEYS,
+  'phaseIndex', 'totalMinutes', 'phaseMinutes', 'lastAcpActivityMinutesAgo',
+  'newResultDelta', 'newResult', 'executionState', 'inProgress',
+  'verification', 'next', 'issue',
+]);
+const TERMINAL_REPORT_INPUT_KEYS = Object.freeze([
+  ...REPORT_IDENTITY_INPUT_KEYS,
+  'elapsed', 'status', 'summary', 'verification', 'result', 'next',
+  'externalAction',
+]);
+const MAX_REPORT_MINUTES = 99999;
+const MAX_REPORT_RESULT_DELTA = 9999;
+
+function validateReportMinutes(value, label) {
+  if (!Number.isInteger(value) || value < 0 || value > MAX_REPORT_MINUTES) {
+    fail('invalid_reporting_report', `${label} must be an integer minute count between 0 and ${MAX_REPORT_MINUTES}`);
+  }
+  return value;
+}
+
+function validateReportBuilderIdentity(input, allowedKeys, label) {
+  if (!isPlainObject(input)) {
+    fail('invalid_reporting_context', `${label} input must be a plain object`);
+  }
+  for (const key of Object.keys(input)) {
+    if (!allowedKeys.includes(key)) {
+      fail('invalid_reporting_context', `${label} input contains unsupported key "${describeKey(key)}"`);
+    }
+  }
+  const { agent, model, roundIndex, timeKst } = input;
+  assertCanonicalAgent(agent, 'input.agent');
+  let resolvedModel;
+  if (model === undefined) {
+    if (agent !== 'claude') {
+      fail('invalid_reporting_context', 'input.model is required for this agent and must name the run effective model');
+    }
+    resolvedModel = ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL;
+  } else if (!isValidModelString(model)) {
+    fail('invalid_reporting_context', 'input.model must be omitted or a non-empty single-line model string');
+  } else {
+    if (agent !== 'claude' && model === ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL) {
+      fail('invalid_reporting_context', 'input.model must name the explicit effective model for this agent');
+    }
+    resolvedModel = model;
+  }
+  if (!Number.isInteger(roundIndex) || roundIndex < 1 || roundIndex > MAX_ROUND_INDEX) {
+    fail('invalid_reporting_round_index', `roundIndex must be a positive integer of at most ${MAX_ROUND_INDEX}`);
+  }
+  const repository = validateRepository(input.repository);
+  const branch = validateBranch(input.branch);
+  if (typeof timeKst !== 'string' || !TIME_KST_RE.test(timeKst)) {
+    fail('invalid_reporting_report', 'input.timeKst must be a 24-hour HH:MM time');
+  }
+  return {
+    agentLabel: ACP_AGENT_PRESENTATIONS[agent],
+    model: resolvedModel,
+    roundIndex,
+    repository,
+    branch,
+    timeKst,
+  };
+}
+
+function validateReportSlot(value, label) {
+  if (
+    typeof value !== 'string' ||
+    !hasVisibleText(value) ||
+    SINGLE_LINE_CONTROL_RE.test(value) ||
+    value.includes('\n')
+  ) {
+    fail('invalid_reporting_report', `${label} must be visible single-line text`);
+  }
+  assertNoForbiddenContent(value, label);
+  return value;
+}
+
+/**
+ * Build and self-validate the canonical intermediate lifecycle report.
+ *
+ * The ⏱️ time line is derived from three independent structured minute
+ * counts: 전체 (total ACP elapsed), 현재 단계 (current phase), and 마지막 ACP
+ * 활동 (age of the latest normalized ACP model/tool/status/activity event —
+ * the `lastAcpActivityAt` concept, deliberately not the ambiguous
+ * `lastAcpStateChangeAt`). The 새 결과 bullet is derived from
+ * `newResultDelta`, an owner-owned semantic count the transport cannot
+ * infer: it counts material ACP results completed since the previous
+ * successfully delivered intermediate report, and the owner advances its
+ * result cursor only after a verified delivery receipt — a raw tool
+ * completion never counts as a material result. `newResultDelta: 0` requires
+ * `newResult` to be omitted and renders the canonical
+ * `Δ0 · 새로 확인된 ACP 결과 없음` bullet, while a positive delta requires
+ * the free-text result summary and renders `Δ<N> · <newResult>`. Activity
+ * age and Δ are independent: `마지막 ACP 활동 0분 전` with `Δ0` is valid.
+ */
+export function buildAcpIntermediateReport(input) {
+  const expected = validateReportBuilderIdentity(
+    input,
+    INTERMEDIATE_REPORT_INPUT_KEYS,
+    'intermediate-report'
+  );
+  const phaseName = Number.isInteger(input.phaseIndex) &&
+    Object.hasOwn(ACP_REPORT_PHASES, input.phaseIndex)
+    ? ACP_REPORT_PHASES[input.phaseIndex]
+    : undefined;
+  if (phaseName === undefined) {
+    fail('invalid_reporting_report', 'input.phaseIndex must be a canonical report phase');
+  }
+  const totalMinutes = validateReportMinutes(input.totalMinutes, 'input.totalMinutes');
+  const phaseMinutes = validateReportMinutes(input.phaseMinutes, 'input.phaseMinutes');
+  const activityAgeMinutes = validateReportMinutes(
+    input.lastAcpActivityMinutesAgo,
+    'input.lastAcpActivityMinutesAgo'
+  );
+  if (phaseMinutes > totalMinutes) {
+    fail('invalid_reporting_report', 'input.phaseMinutes must not exceed input.totalMinutes');
+  }
+  if (activityAgeMinutes > totalMinutes) {
+    fail('invalid_reporting_report', 'input.lastAcpActivityMinutesAgo must not exceed input.totalMinutes');
+  }
+  const delta = input.newResultDelta;
+  if (!Number.isInteger(delta) || delta < 0 || delta > MAX_REPORT_RESULT_DELTA) {
+    fail('invalid_reporting_report', `input.newResultDelta must be an integer between 0 and ${MAX_REPORT_RESULT_DELTA}`);
+  }
+  let newResultBullet;
+  if (delta === 0) {
+    if (input.newResult !== undefined) {
+      fail('invalid_reporting_report', 'input.newResult must be omitted when input.newResultDelta is 0');
+    }
+    newResultBullet = `Δ0 · ${ACP_REPORT_NO_NEW_RESULT}`;
+  } else {
+    newResultBullet = `Δ${delta} · ${validateReportSlot(input.newResult, 'input.newResult')}`;
+  }
+  const lines = [
+    `🔄 **ACP 중간 보고 · ${expected.timeKst} KST**`,
+    '',
+    `🤖 **ACP**: ${expected.agentLabel} · \`${expected.model}\``,
+    `📍 **작업**: \`${expected.repository}\` · \`${expected.branch}\``,
+    `🔢 **라운드**: ${expected.roundIndex} · ${input.phaseIndex}/4 ${phaseName}`,
+    `⏱️ **ACP 시간**: 전체 ${totalMinutes}분 · 현재 단계 ${phaseMinutes}분 · 마지막 ACP 활동 ${activityAgeMinutes}분 전`,
+    `🔁 **실행 상태**: ${validateReportSlot(input.executionState, 'input.executionState')}`,
+    '',
+    ACP_REPORT_SECTION_HEADERS[0],
+    `- ${newResultBullet}`,
+    '',
+    ACP_REPORT_SECTION_HEADERS[1],
+    `- ${validateReportSlot(input.inProgress, 'input.inProgress')}`,
+    '',
+    ACP_REPORT_SECTION_HEADERS[2],
+    `- ${validateReportSlot(input.verification, 'input.verification')}`,
+    '',
+    ACP_REPORT_SECTION_HEADERS[3],
+    `- ${validateReportSlot(input.next, 'input.next')}`,
+  ];
+  if (input.issue !== undefined) {
+    lines.push('', ACP_REPORT_ISSUE_HEADER, `- ${validateReportSlot(input.issue, 'input.issue')}`);
+  }
+  const report = lines.join('\n');
+  validateMiddleReport(report, expected);
+  return report;
+}
+
+const TERMINAL_TITLES = Object.freeze({
+  completed: '🏁 **ACP 완료 보고',
+  cancelled: '⛔ **ACP 취소 보고',
+  failed: '❌ **ACP 실패 보고',
+});
+
+const TERMINAL_OUTCOME_HEADERS = Object.freeze({
+  completed: '✅ **ACP 완료**',
+  cancelled: '⛔ **ACP 취소**',
+  failed: '❌ **ACP 실패**',
+});
+
+function validateTerminalReport(report, expected) {
+  if (report.length === 0 || report.length > MAX_DISCORD_MESSAGE_LENGTH || MULTILINE_CONTROL_RE.test(report)) {
+    fail('invalid_reporting_report', 'terminal report must be bounded text without control characters');
+  }
+  const lines = report.split('\n');
+  if (lines.length !== 20) {
+    fail('invalid_reporting_report', 'terminal report must match the exact 20-line template');
+  }
+  const exact = [
+    [0, `${TERMINAL_TITLES[expected.status]} · ${expected.timeKst} KST**`],
+    [1, ''],
+    [2, `🤖 **ACP**: ${expected.agentLabel} · \`${expected.model}\``],
+    [3, `📍 **작업**: \`${expected.repository}\` · \`${expected.branch}\``],
+    [4, `⏱️ **ACP 소요**: ${expected.elapsed} · 라운드 ${expected.roundIndex}`],
+    [5, ''],
+    [6, TERMINAL_OUTCOME_HEADERS[expected.status]],
+    [8, ''],
+    [9, '🧪 **ACP 자체 검증**'],
+    [11, ''],
+    [12, '📦 **결과**'],
+    [14, ''],
+    [15, '🔍 **다음**'],
+    [17, ''],
+    [18, '🔒 **외부 작업**'],
+  ];
+  for (const [index, value] of exact) {
+    if (lines[index] !== value) {
+      fail('invalid_reporting_report', `terminal report line ${index + 1} does not match the canonical template`);
+    }
+  }
+  for (const index of [7, 10, 13, 16, 19]) {
+    if (!isBulletLine(lines[index])) {
+      fail('invalid_reporting_report', 'terminal report sections require exactly one visible bullet');
+    }
+    assertNoForbiddenContent(lines[index], 'terminal report bullet');
+  }
+}
+
+/** Build and self-validate the canonical terminal lifecycle report. */
+export function buildAcpTerminalReport(input) {
+  const expected = validateReportBuilderIdentity(
+    input,
+    TERMINAL_REPORT_INPUT_KEYS,
+    'terminal-report'
+  );
+  if (!ACP_TERMINAL_REPORT_STATUSES.includes(input.status)) {
+    fail('invalid_reporting_report', 'input.status must be a canonical terminal status');
+  }
+  const terminal = {
+    ...expected,
+    status: input.status,
+    elapsed: validateReportSlot(input.elapsed, 'input.elapsed'),
+  };
+  const report = [
+    `${TERMINAL_TITLES[terminal.status]} · ${terminal.timeKst} KST**`,
+    '',
+    `🤖 **ACP**: ${terminal.agentLabel} · \`${terminal.model}\``,
+    `📍 **작업**: \`${terminal.repository}\` · \`${terminal.branch}\``,
+    `⏱️ **ACP 소요**: ${terminal.elapsed} · 라운드 ${terminal.roundIndex}`,
+    '',
+    TERMINAL_OUTCOME_HEADERS[terminal.status],
+    `- ${validateReportSlot(input.summary, 'input.summary')}`,
+    '',
+    '🧪 **ACP 자체 검증**',
+    `- ${validateReportSlot(input.verification, 'input.verification')}`,
+    '',
+    '📦 **결과**',
+    `- ${validateReportSlot(input.result, 'input.result')}`,
+    '',
+    '🔍 **다음**',
+    `- ${validateReportSlot(input.next, 'input.next')}`,
+    '',
+    '🔒 **외부 작업**',
+    `- ${validateReportSlot(input.externalAction, 'input.externalAction')}`,
+  ].join('\n');
+  validateTerminalReport(report, terminal);
+  return report;
 }
 
 function validateWatchdogMessage(message, expected) {

@@ -54,7 +54,7 @@
         "kind": "agentTurn",
         "toolsAllow": [],
         "timeoutSeconds": 45,
-        "message": "다음 구분자 사이의 메시지만 그대로 반환해. 앞말·뒷말·설명·코드펜스·바꿔쓰기·두 번째 메시지를 추가하지 마.\n\n---BEGIN ACP REPORT---\n🔄 **ACP 중간 보고 · 18:45 KST**\n\n🤖 **ACP**: AGENT_DISPLAY_NAME · `MODEL_ID`\n📍 **작업**: `REPOSITORY_BASENAME` · `BRANCH_NAME`\n🔢 **라운드**: 1 · 2/4 구현\n⏱️ **ACP 시간**: 12분 경과\n🔁 **실행 상태**: 범위 내 작업이 계속되는 중\n\n✅ **새 결과**\n- 완료된 결과 한 줄\n\n🛠️ **ACP 진행 중**\n- 진행 중인 작업 한 줄\n\n🧪 **ACP 자체 검증**\n- 자체 검증 결과 한 줄\n\n⏭️ **ACP 다음**\n- 다음 단계 한 줄\n---END ACP REPORT---"
+        "message": "다음 구분자 사이의 메시지만 그대로 반환해. 앞말·뒷말·설명·코드펜스·바꿔쓰기·두 번째 메시지를 추가하지 마.\n\n---BEGIN ACP REPORT---\n🔄 **ACP 중간 보고 · 18:45 KST**\n\n🤖 **ACP**: AGENT_DISPLAY_NAME · `MODEL_ID`\n📍 **작업**: `REPOSITORY_BASENAME` · `BRANCH_NAME`\n🔢 **라운드**: 1 · 2/4 구현\n⏱️ **ACP 시간**: 전체 12분 · 현재 단계 4분 · 마지막 ACP 활동 0분 전\n🔁 **실행 상태**: 범위 내 작업이 계속되는 중\n\n✅ **새 결과**\n- Δ1 · 완료된 결과 한 줄\n\n🛠️ **ACP 진행 중**\n- 진행 중인 작업 한 줄\n\n🧪 **ACP 자체 검증**\n- 자체 검증 결과 한 줄\n\n⏭️ **ACP 다음**\n- 다음 단계 한 줄\n---END ACP REPORT---"
       }
     }
   },
