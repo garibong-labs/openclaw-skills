@@ -89,11 +89,12 @@ export const ACP_TERMINAL_REPORT_STATUSES = Object.freeze([
   'cancelled',
   'failed',
 ]);
-// Canonical 새 결과 bullet content when no ACP result completed since the last
-// successfully delivered intermediate report. The Δ counter and the 마지막
-// ACP 활동 age are independent by contract: fresh ACP activity with no newly
-// completed result renders `Δ0 · 새로 확인된 ACP 결과 없음` next to an
-// activity age of `0분 전`.
+// Canonical 새 결과 bullet content when no material ACP result completed since
+// the last successfully delivered intermediate report. The Δ counter and the
+// 마지막 ACP 활동 age are independent by contract: fresh ACP activity (reads,
+// edits, searches, command completions) with no newly completed material
+// result renders `Δ0 · 새로 확인된 ACP 결과 없음` next to an activity age of
+// `0분 전`.
 export const ACP_REPORT_NO_NEW_RESULT = '새로 확인된 ACP 결과 없음';
 
 // The only valid phaseIndex → phaseName mappings for the 라운드 metadata line.
@@ -635,9 +636,13 @@ const REPORT_IDENTITY_INPUT_KEYS = Object.freeze([
 // come from ACP elapsed bookkeeping, and 마지막 ACP 활동 is the activity age
 // of the latest normalized ACP model/tool/status/activity event
 // (`lastAcpActivityAt` at the transport boundary). Δ is independent of that
-// age: it counts only newly completed ACP results since the previous
-// successfully delivered intermediate report. The legacy free-text `elapsed`
-// key is deliberately absent here (still valid for the terminal 소요 line):
+// age and belongs to the owner-confirmed reporting snapshot, never to the
+// transport: `newResultDelta` counts material ACP results completed since the
+// previous successfully delivered intermediate report, and the owner advances
+// that semantic result cursor only after a verified delivery receipt. Raw
+// tool completions (reads, edits, searches, command runs) are activity, never
+// a material-result classifier. The legacy free-text `elapsed` key is
+// deliberately absent here (still valid for the terminal 소요 line):
 // pre-existing intermediate inputs carrying it fail as an unsupported key
 // because the builder input shape is not a committed compatibility contract.
 const INTERMEDIATE_REPORT_INPUT_KEYS = Object.freeze([
@@ -714,8 +719,11 @@ function validateReportSlot(value, label) {
  * 활동 (age of the latest normalized ACP model/tool/status/activity event —
  * the `lastAcpActivityAt` concept, deliberately not the ambiguous
  * `lastAcpStateChangeAt`). The 새 결과 bullet is derived from
- * `newResultDelta`, the count of ACP results completed since the previous
- * successfully delivered intermediate report: `newResultDelta: 0` requires
+ * `newResultDelta`, an owner-owned semantic count the transport cannot
+ * infer: it counts material ACP results completed since the previous
+ * successfully delivered intermediate report, and the owner advances its
+ * result cursor only after a verified delivery receipt — a raw tool
+ * completion never counts as a material result. `newResultDelta: 0` requires
  * `newResult` to be omitted and renders the canonical
  * `Δ0 · 새로 확인된 ACP 결과 없음` bullet, while a positive delta requires
  * the free-text result summary and renders `Δ<N> · <newResult>`. Activity

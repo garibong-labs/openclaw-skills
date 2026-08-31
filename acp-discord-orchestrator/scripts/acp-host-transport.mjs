@@ -186,7 +186,6 @@ function initialPublicationState() {
     acknowledgedMessageIds: [],
     nextCadence: 1,
     nextDueAt: null,
-    resultBaselineSequence: 0,
     terminalSequence: null,
     terminalStatus: null,
     controlCursor: null,
@@ -194,19 +193,19 @@ function initialPublicationState() {
   };
 }
 
-// Event types that count as ACP activity for the public 마지막 ACP 활동 age:
-// the normalized model/tool/status/activity events of the exact execution
-// handle, with the supervisor's own activation/started lifecycle marks as
-// the pre-runtime floor. Deliberately excluded: timer-driven `progress`
+// The public 마지막 ACP 활동 age is bound to normalized ACP activity events
+// only — envelope `type: "activity"`, the model/tool/status activity of the
+// exact execution handle. Host lifecycle/control marks (`activation_confirmed`,
+// `started`) are not ACP activity, and neither are timer-driven `progress`
 // bookkeeping, transport poll boundaries, report rendering and delivery
-// receipts, owner-side work, and the delta/result-cursor update — none of
-// these may move (or reset) the activity instant.
-const ACP_ACTIVITY_EVENT_TYPES = new Set(["activation_confirmed", "started", "activity"]);
-
+// receipts, phase bookkeeping, or owner-side work — none of these may move
+// (or substitute for) the activity instant. With no normalized ACP activity
+// event yet, the value stays a fail-closed null instead of borrowing a
+// lifecycle timestamp.
 function lastAcpActivityInstant(events) {
   let lastMs = null;
   for (const event of events) {
-    if (!ACP_ACTIVITY_EVENT_TYPES.has(event.type)) {
+    if (event.type !== "activity") {
       continue;
     }
     const milliseconds = Date.parse(event.timestamp);
@@ -215,21 +214,6 @@ function lastAcpActivityInstant(events) {
     }
   }
   return lastMs === null ? null : new Date(lastMs).toISOString();
-}
-
-// Δ for the current intermediate report identity: completed ACP results
-// (normalized tool events with a completed status) strictly after the last
-// successfully delivered intermediate report's evidence boundary and within
-// this report's own evidence boundary. Independent of the activity instant
-// above: activity without a newly completed result keeps Δ at 0.
-function newlyCompletedResultCount(events, publication) {
-  return events.filter((event) =>
-    event.type === "activity" &&
-    event.activity === "tool" &&
-    event.toolStatus === "completed" &&
-    event.sequence > publication.resultBaselineSequence &&
-    event.sequence <= publication.evidenceThroughSequence
-  ).length;
 }
 
 function validateReportingContext(value) {
@@ -249,7 +233,7 @@ function validatePublication(value) {
   const keys = [
     "state", "kind", "cadence", "reportId", "requiredAt",
     "evidenceThroughSequence", "receiptMessageId", "acknowledgedMessageIds", "nextCadence", "nextDueAt",
-    "resultBaselineSequence", "terminalSequence", "terminalStatus", "controlCursor", "controlCursorIssuedAt"
+    "terminalSequence", "terminalStatus", "controlCursor", "controlCursorIssuedAt"
   ];
   if (!exactKeys(value, keys) ||
     !["report_required", "publication_pending", "receipt_acked"].includes(value.state) ||
@@ -257,7 +241,6 @@ function validatePublication(value) {
     !Number.isSafeInteger(value.cadence) || value.cadence < 0 ||
     !Number.isSafeInteger(value.evidenceThroughSequence) || value.evidenceThroughSequence < 0 ||
     !Number.isSafeInteger(value.nextCadence) || value.nextCadence < 1 ||
-    !Number.isSafeInteger(value.resultBaselineSequence) || value.resultBaselineSequence < 0 ||
     (value.reportId !== null && !SAFE_HANDLE.test(value.reportId)) ||
     (value.requiredAt !== null && !validInstant(value.requiredAt)) ||
     (value.nextDueAt !== null && !validInstant(value.nextDueAt)) ||
@@ -275,12 +258,10 @@ function validatePublication(value) {
   const hasReportIdentity = value.kind !== null && value.reportId !== null && value.requiredAt !== null;
   const validKindShape = value.kind === null
     ? value.cadence === 0 && value.reportId === null && value.requiredAt === null &&
-      value.receiptMessageId === null && value.terminalSequence === null && value.terminalStatus === null &&
-      value.resultBaselineSequence === 0
-    : (value.kind === "intermediate"
-        ? value.cadence >= 1 && value.terminalSequence === null && value.terminalStatus === null
-        : value.cadence === 0 && value.terminalSequence !== null && value.terminalStatus !== null) &&
-      value.resultBaselineSequence <= value.evidenceThroughSequence;
+      value.receiptMessageId === null && value.terminalSequence === null && value.terminalStatus === null
+    : value.kind === "intermediate"
+      ? value.cadence >= 1 && value.terminalSequence === null && value.terminalStatus === null
+      : value.cadence === 0 && value.terminalSequence !== null && value.terminalStatus !== null;
   const validStateShape = value.state === "receipt_acked"
     ? value.kind === null || (hasReportIdentity && value.receiptMessageId !== null)
     : hasReportIdentity && value.receiptMessageId === null;
@@ -781,13 +762,14 @@ function reportBoundary(publication, exposedState, events) {
     ...(publication.kind === "terminal"
       ? { terminalStatus: publication.terminalStatus }
       : {
-          // Derived fresh from the exact handle's event log on every status:
-          // the activity instant only moves forward with new normalized ACP
-          // events, and Δ stays anchored to the delivered-report cursor, so
-          // neither value is reset by a poll, a receipt, or the other's
-          // update.
-          lastAcpActivityAt: lastAcpActivityInstant(events),
-          newResultDelta: newlyCompletedResultCount(events, publication)
+          // Recomputed from the exact handle's event log on every status, so
+          // a poll, a receipt, or bookkeeping can never reset it. It is the
+          // only derived value here: the transport sees raw normalized
+          // events and cannot classify material result artifacts (a
+          // completed tool call is activity, never a result), so the public
+          // Δ count and its result cursor live in the owner-confirmed
+          // reporting snapshot, not on this boundary.
+          lastAcpActivityAt: lastAcpActivityInstant(events)
         })
   };
 }
@@ -922,11 +904,6 @@ export function acknowledgeHostTransportReport(input, dependencies = {}) {
     publication.nextDueAt = new Date(
       Date.parse(publication.requiredAt) + REPORT_CADENCE_MS
     ).toISOString();
-    // The Δ baseline advances only here — on a successfully delivered
-    // intermediate report — to this report's own evidence boundary. It is a
-    // result cursor, not an activity marker: the 마지막 ACP 활동 instant is
-    // derived from the event log and is untouched by this acknowledgement.
-    publication.resultBaselineSequence = publication.evidenceThroughSequence;
   }
   persistTransportRecord(loaded);
   return {

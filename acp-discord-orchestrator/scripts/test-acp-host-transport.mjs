@@ -40,7 +40,6 @@ function publicationFixture(overrides = {}) {
     acknowledgedMessageIds: [],
     nextCadence: 1,
     nextDueAt: null,
-    resultBaselineSequence: 0,
     terminalSequence: null,
     terminalStatus: null,
     controlCursor: null,
@@ -509,51 +508,56 @@ test("intermediate acknowledgements accept both authorized success statuses and 
   }
 });
 
-test("intermediate boundary binds 마지막 ACP 활동 to ACP activity events and Δ to the delivered-report result cursor", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-activity-delta-"));
+test("intermediate boundary binds 마지막 ACP 활동 to normalized ACP activity events and exposes no Δ result count", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-activity-instant-"));
   const dueAt = REPORT_CADENCE_MS;
-  const toolCompleted = { activity: "tool", toolKind: "execute", toolStatus: "completed" };
   const fixture = writeStaticTransport({
     root,
-    handle: "acp-activity-delta",
+    handle: "acp-activity-instant",
     events: [
-      event(1, "started", 0),
-      event(2, "activity", 120000, toolCompleted),
-      event(3, "activity", 300000, { activity: "model_output" }),
+      event(1, "activation_confirmed", 0),
+      event(2, "started", 1000),
+      // Completed read/edit/execute tool events are activity evidence and
+      // must advance the activity instant — but they are not material
+      // results, so they may never create a Δ count at this boundary.
+      event(3, "activity", 120000, { activity: "tool", toolKind: "read", toolStatus: "completed" }),
+      event(4, "activity", 180000, { activity: "tool", toolKind: "edit", toolStatus: "completed" }),
+      event(5, "activity", 240000, { activity: "tool", toolKind: "execute", toolStatus: "completed" }),
+      event(6, "activity", 300000, { activity: "model_output" }),
       // Timer-driven progress bookkeeping is later than every ACP event but
       // must not move the activity instant.
-      event(4, "progress", 590000, { evidenceAgeMs: 290000 })
+      event(7, "progress", 590000, { evidenceAgeMs: 290000 })
     ],
     publication: publicationFixture({ nextDueAt: new Date(dueAt).toISOString() })
   });
-  const due = statusHostTransport(fixture, { ...ACTIVE_TMUX, nowMs: dueAt, randomUUID: () => "delta-due" });
+  const due = statusHostTransport(fixture, { ...ACTIVE_TMUX, nowMs: dueAt, randomUUID: () => "activity-due" });
   assert.equal(due.reportPublication.state, "report_required");
   assert.equal(due.reportPublication.lastAcpActivityAt, new Date(300000).toISOString());
-  assert.equal(due.reportPublication.newResultDelta, 1);
+  assert.equal("newResultDelta" in due.reportPublication, false);
+  assert.equal("resultBaselineSequence" in JSON.parse(fs.readFileSync(fixture.transportFile, "utf8")).publication, false);
 
-  // A later poll boundary alone moves neither value.
+  // A later poll boundary alone does not move the activity instant.
   const polled = statusHostTransport({
     ...fixture,
     afterSequence: due.lastSequence,
     serviceCursorAck: serviceAck(due, dueAt + 30000)
-  }, { ...ACTIVE_TMUX, nowMs: dueAt + 30000, randomUUID: () => "delta-poll" });
+  }, { ...ACTIVE_TMUX, nowMs: dueAt + 30000, randomUUID: () => "activity-poll" });
   assert.equal(polled.reportPublication.state, "publication_pending");
   assert.equal(polled.reportPublication.lastAcpActivityAt, new Date(300000).toISOString());
-  assert.equal(polled.reportPublication.newResultDelta, 1);
 
-  // A new completed result beyond this report's evidence boundary advances
-  // the activity instant but not this report's Δ: the two are independent.
+  // A later completed tool event advances the activity instant — and still
+  // surfaces no Δ, because raw tool completion is never a material result.
   fs.appendFileSync(
     fixture.record.eventsFile,
-    JSON.stringify(event(5, "activity", dueAt + 40000, toolCompleted)) + "\n"
+    JSON.stringify(event(8, "activity", dueAt + 40000, { activity: "tool", toolKind: "execute", toolStatus: "completed" })) + "\n"
   );
   const advanced = statusHostTransport({
     ...fixture,
     afterSequence: due.lastSequence,
     serviceCursorAck: serviceAck(polled, dueAt + 50000)
-  }, { ...ACTIVE_TMUX, nowMs: dueAt + 50000, randomUUID: () => "delta-advanced" });
+  }, { ...ACTIVE_TMUX, nowMs: dueAt + 50000, randomUUID: () => "activity-advanced" });
   assert.equal(advanced.reportPublication.lastAcpActivityAt, new Date(dueAt + 40000).toISOString());
-  assert.equal(advanced.reportPublication.newResultDelta, 1);
+  assert.equal("newResultDelta" in advanced.reportPublication, false);
 
   acknowledgeHostTransportReport({
     ...fixture,
@@ -567,48 +571,41 @@ test("intermediate boundary binds 마지막 ACP 활동 to ACP activity events an
       deliveryStatus: "delivered"
     }
   }, { nowMs: dueAt + 50000 });
-  // The delivery receipt advances only the result cursor, never the
-  // activity instant.
-  const persisted = JSON.parse(fs.readFileSync(fixture.transportFile, "utf8"));
-  assert.equal(persisted.publication.resultBaselineSequence, 4);
+  // The delivery receipt keeps no result cursor and touches no activity
+  // bookkeeping: the record's publication state stays free of any Δ
+  // derivation source.
+  const acked = JSON.parse(fs.readFileSync(fixture.transportFile, "utf8"));
+  assert.equal("resultBaselineSequence" in acked.publication, false);
 
   const secondDue = 2 * REPORT_CADENCE_MS;
   const second = statusHostTransport({
     ...fixture,
     serviceCursorAck: serviceAck(advanced, secondDue)
-  }, { ...ACTIVE_TMUX, nowMs: secondDue, randomUUID: () => "delta-second" });
+  }, { ...ACTIVE_TMUX, nowMs: secondDue, randomUUID: () => "activity-second" });
   assert.equal(second.reportPublication.cadence, 2);
   assert.equal(second.reportPublication.lastAcpActivityAt, new Date(dueAt + 40000).toISOString());
-  assert.equal(second.reportPublication.newResultDelta, 1);
+  assert.equal("newResultDelta" in second.reportPublication, false);
+});
 
-  acknowledgeHostTransportReport({
-    ...fixture,
-    reportId: second.reportPublication.reportId,
-    reportKind: "intermediate",
-    cadence: 2,
-    receipt: {
-      conversationId: CONTROL_CONVERSATION_ID,
-      messageId: "100000000000000061",
-      deliveredAt: new Date(secondDue).toISOString(),
-      deliveryStatus: "delivered"
-    }
-  }, { nowMs: secondDue });
-
-  // Regression: fresh ACP activity with no newly completed result — the
-  // boundary that renders 마지막 ACP 활동 0분 전 alongside Δ0 · 새로 확인된
-  // ACP 결과 없음.
-  const thirdDue = 3 * REPORT_CADENCE_MS;
-  fs.appendFileSync(
-    fixture.record.eventsFile,
-    JSON.stringify(event(6, "activity", thirdDue - 1000, { activity: "model_output" })) + "\n"
-  );
-  const third = statusHostTransport({
-    ...fixture,
-    serviceCursorAck: serviceAck(second, thirdDue)
-  }, { ...ACTIVE_TMUX, nowMs: thirdDue, randomUUID: () => "delta-third" });
-  assert.equal(third.reportPublication.cadence, 3);
-  assert.equal(third.reportPublication.lastAcpActivityAt, new Date(thirdDue - 1000).toISOString());
-  assert.equal(third.reportPublication.newResultDelta, 0);
+test("마지막 ACP 활동 stays fail-closed missing without a normalized ACP activity event", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-activity-missing-"));
+  const dueAt = REPORT_CADENCE_MS;
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-activity-missing",
+    events: [
+      // Host lifecycle/control marks are not ACP activity and never
+      // substitute for a missing activity instant.
+      event(1, "activation_confirmed", 0),
+      event(2, "started", 1000),
+      event(3, "progress", 590000, { evidenceAgeMs: 589000 })
+    ],
+    publication: publicationFixture({ nextDueAt: new Date(dueAt).toISOString() })
+  });
+  const due = statusHostTransport(fixture, { ...ACTIVE_TMUX, nowMs: dueAt, randomUUID: () => "activity-missing" });
+  assert.equal(due.reportPublication.state, "report_required");
+  assert.equal(due.reportPublication.lastAcpActivityAt, null);
+  assert.equal("newResultDelta" in due.reportPublication, false);
 });
 
 test("terminal supersedes an overdue intermediate and requires exact terminal acknowledgement", () => {
