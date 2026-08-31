@@ -111,7 +111,9 @@ async function dispatch(input) {
     return activateHostTransport(input);
   }
   if (input.action === "status") {
-    assertExactKeys(input, [...base, "transportFile", "processHandle"], ["afterSequence", "serviceCursorAck"]);
+    assertExactKeys(input, [...base, "transportFile", "processHandle"], [
+      "afterSequence", "serviceCursorAck", "reissueServiceCursor"
+    ]);
     return statusHostTransport(input);
   }
   if (input.action === "ack-report") {
@@ -122,6 +124,7 @@ async function dispatch(input) {
       "reportId",
       "reportKind",
       "cadence",
+      "report",
       "receipt"
     ]);
     return acknowledgeHostTransportReport(input);

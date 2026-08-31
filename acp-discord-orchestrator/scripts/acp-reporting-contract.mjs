@@ -293,6 +293,9 @@ function validateContext(context) {
   } else if (!isValidModelString(model)) {
     fail('invalid_reporting_context', 'context.model must be omitted or a non-empty single-line model string');
   } else {
+    if (agent !== 'claude' && model === ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL) {
+      fail('invalid_reporting_context', 'context.model must name the explicit effective model for this agent');
+    }
     resolvedModel = model;
   }
   if (typeof controlConversationId !== 'string' || !DECIMAL_ID_RE.test(controlConversationId)) {
@@ -518,6 +521,9 @@ export function buildAcpStartMessage(input) {
   } else if (!isValidModelString(model)) {
     fail('invalid_reporting_context', 'input.model must be omitted or a non-empty single-line model string');
   } else {
+    if (agent !== 'claude' && model === ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL) {
+      fail('invalid_reporting_context', 'input.model must name the explicit effective model for this agent');
+    }
     resolvedModel = model;
   }
   if (!Number.isInteger(roundIndex) || roundIndex < 1 || roundIndex > MAX_ROUND_INDEX) {
@@ -677,8 +683,19 @@ function validateReportBuilderIdentity(input, allowedKeys, label) {
   }
   const { agent, model, roundIndex, timeKst } = input;
   assertCanonicalAgent(agent, 'input.agent');
-  if (!isValidModelString(model)) {
-    fail('invalid_reporting_context', 'input.model must be a non-empty single-line model string');
+  let resolvedModel;
+  if (model === undefined) {
+    if (agent !== 'claude') {
+      fail('invalid_reporting_context', 'input.model is required for this agent and must name the run effective model');
+    }
+    resolvedModel = ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL;
+  } else if (!isValidModelString(model)) {
+    fail('invalid_reporting_context', 'input.model must be omitted or a non-empty single-line model string');
+  } else {
+    if (agent !== 'claude' && model === ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL) {
+      fail('invalid_reporting_context', 'input.model must name the explicit effective model for this agent');
+    }
+    resolvedModel = model;
   }
   if (!Number.isInteger(roundIndex) || roundIndex < 1 || roundIndex > MAX_ROUND_INDEX) {
     fail('invalid_reporting_round_index', `roundIndex must be a positive integer of at most ${MAX_ROUND_INDEX}`);
@@ -690,7 +707,7 @@ function validateReportBuilderIdentity(input, allowedKeys, label) {
   }
   return {
     agentLabel: ACP_AGENT_PRESENTATIONS[agent],
-    model,
+    model: resolvedModel,
     roundIndex,
     repository,
     branch,
@@ -735,8 +752,11 @@ export function buildAcpIntermediateReport(input) {
     INTERMEDIATE_REPORT_INPUT_KEYS,
     'intermediate-report'
   );
-  const phaseName = ACP_REPORT_PHASES[input.phaseIndex];
-  if (!phaseName) {
+  const phaseName = Number.isInteger(input.phaseIndex) &&
+    Object.hasOwn(ACP_REPORT_PHASES, input.phaseIndex)
+    ? ACP_REPORT_PHASES[input.phaseIndex]
+    : undefined;
+  if (phaseName === undefined) {
     fail('invalid_reporting_report', 'input.phaseIndex must be a canonical report phase');
   }
   const totalMinutes = validateReportMinutes(input.totalMinutes, 'input.totalMinutes');

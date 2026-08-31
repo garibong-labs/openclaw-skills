@@ -3,13 +3,14 @@
 // validated public message. It has no Discord credentials and performs no
 // delivery; publication receipts remain caller attestations at the transport.
 
-import fs from "node:fs";
-import path from "node:path";
-
 import {
   buildAcpIntermediateReport,
   buildAcpTerminalReport
 } from "./acp-reporting-contract.mjs";
+import {
+  parsePrivateJsonInputCli,
+  readPrivateJsonInput
+} from "./acp-private-json-input.mjs";
 import {
   EXIT_CODES,
   SCHEMA_VERSION,
@@ -20,34 +21,12 @@ import {
 
 export const MAX_REPORT_MESSAGE_INPUT_BYTES = 65536;
 
-function readInput(argv) {
-  if (argv.length !== 2 || argv[0] !== "--input") {
-    fail("usage");
-  }
-  const inputPath = argv[1];
-  if (typeof inputPath !== "string" || !path.isAbsolute(inputPath)) {
-    fail("invalid_input_path_not_absolute");
-  }
-  let stat;
-  try {
-    stat = fs.lstatSync(path.normalize(inputPath));
-  } catch (error) {
-    fail(error && error.code === "ENOENT" ? "invalid_input_file_missing" : "invalid_input_file_unreadable");
-  }
-  if (stat.isSymbolicLink()) fail("invalid_input_file_symlink");
-  if (!stat.isFile()) fail("invalid_input_file_not_regular");
-  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
-    fail("invalid_input_file_permissions");
-  }
-  if (stat.size < 1 || stat.size > MAX_REPORT_MESSAGE_INPUT_BYTES) {
-    fail("invalid_input_file_too_large");
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(fs.readFileSync(inputPath, "utf8"));
-  } catch {
-    fail("invalid_input_json");
-  }
+export function readReportMessageInput(inputPath, dependencies = {}) {
+  const parsed = readPrivateJsonInput(inputPath, {
+    maxBytes: MAX_REPORT_MESSAGE_INPUT_BYTES,
+    fail,
+    fileSystem: dependencies.fileSystem
+  });
   if (
     !parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
     Object.keys(parsed).length !== 2 ||
@@ -62,7 +41,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const writeMessage = dependencies.writeMessage ?? ((value) => process.stdout.write(value));
   const writeEvent = dependencies.writeEvent ?? ((value) => process.stderr.write(JSON.stringify(value) + "\n"));
   try {
-    const input = readInput(argv);
+    const input = readReportMessageInput(parsePrivateJsonInputCli(argv, fail), dependencies);
     const message = input.kind === "intermediate"
       ? buildAcpIntermediateReport(input.report)
       : input.kind === "terminal"

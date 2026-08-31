@@ -18,18 +18,25 @@ import {
   SCHEMA_VERSION as ACP_FOREGROUND_SCHEMA_VERSION,
   loadSupervisorConfig
 } from "./acpx-foreground-supervisor.mjs";
+import {
+  ACP_SUPPORTED_AGENTS,
+  buildAcpIntermediateReport,
+  buildAcpTerminalReport
+} from "./acp-reporting-contract.mjs";
 
 export const ACP_HOST_TRANSPORT_SCHEMA_VERSION = "acp-host-transport.v1";
 export const DEFAULT_TRANSPORT_EVENT_WAIT_MS = 5000;
 export const REPORT_CADENCE_MS = 600000;
 const REPORT_DELIVERY_SUCCESS_STATUSES = Object.freeze(["sent", "delivered"]);
 export const MAX_REPORT_RECEIPT_AGE_MS = 300000;
+export const MAX_SERVICE_CURSOR_REISSUES = 3;
 
 const SAFE_HANDLE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const SAFE_EVENT_TYPE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const DECIMAL_ID = /^[0-9]{1,32}$/;
 const MAX_EVENT_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_RETURNED_EVENTS = 64;
+const MAX_ACKNOWLEDGED_MESSAGE_IDS = 64;
 const PASSTHROUGH_ENV = new Set([
   "HOME",
   "PATH",
@@ -153,6 +160,29 @@ function writePrivateJson(filePath, value, flag = "wx") {
   }
 }
 
+function replacePrivateJsonAtomically(filePath, value) {
+  const temporary = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${crypto.randomUUID()}.tmp`
+  );
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + "\n", {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx"
+    });
+    if (process.platform !== "win32") fs.chmodSync(temporary, 0o600);
+    fs.renameSync(temporary, filePath);
+  } catch {
+    try {
+      fs.unlinkSync(temporary);
+    } catch {
+      // Best-effort cleanup of the private sibling temp only.
+    }
+    transportFail("host_transport_record_write_failed");
+  }
+}
+
 function exactKeys(value, required) {
   return isPlainObject(value) &&
     Object.keys(value).length === required.length &&
@@ -189,7 +219,8 @@ function initialPublicationState() {
     terminalSequence: null,
     terminalStatus: null,
     controlCursor: null,
-    controlCursorIssuedAt: null
+    controlCursorIssuedAt: null,
+    controlCursorReissues: 0
   };
 }
 
@@ -219,7 +250,7 @@ function lastAcpActivityInstant(events) {
 function validateReportingContext(value) {
   if (!exactKeys(value, [
     "agent", "model", "roundIndex", "repository", "branch", "controlConversationId"
-  ]) || !["claude", "codex"].includes(value.agent) ||
+  ]) || !ACP_SUPPORTED_AGENTS.includes(value.agent) ||
     typeof value.model !== "string" || value.model.length < 1 || value.model.length > 256 ||
     !Number.isSafeInteger(value.roundIndex) || value.roundIndex < 1 ||
     typeof value.repository !== "string" || typeof value.branch !== "string" ||
@@ -233,7 +264,8 @@ function validatePublication(value) {
   const keys = [
     "state", "kind", "cadence", "reportId", "requiredAt",
     "evidenceThroughSequence", "receiptMessageId", "acknowledgedMessageIds", "nextCadence", "nextDueAt",
-    "terminalSequence", "terminalStatus", "controlCursor", "controlCursorIssuedAt"
+    "terminalSequence", "terminalStatus", "controlCursor", "controlCursorIssuedAt",
+    "controlCursorReissues"
   ];
   if (!exactKeys(value, keys) ||
     !["report_required", "publication_pending", "receipt_acked"].includes(value.state) ||
@@ -245,14 +277,18 @@ function validatePublication(value) {
     (value.requiredAt !== null && !validInstant(value.requiredAt)) ||
     (value.nextDueAt !== null && !validInstant(value.nextDueAt)) ||
     (value.receiptMessageId !== null && !DECIMAL_ID.test(value.receiptMessageId)) ||
-    !Array.isArray(value.acknowledgedMessageIds) || value.acknowledgedMessageIds.length > 1024 ||
+    !Array.isArray(value.acknowledgedMessageIds) ||
+    value.acknowledgedMessageIds.length > MAX_ACKNOWLEDGED_MESSAGE_IDS ||
     value.acknowledgedMessageIds.some((messageId) => typeof messageId !== "string" || !DECIMAL_ID.test(messageId)) ||
     new Set(value.acknowledgedMessageIds).size !== value.acknowledgedMessageIds.length ||
     (value.terminalSequence !== null && (!Number.isSafeInteger(value.terminalSequence) || value.terminalSequence < 1)) ||
     ![null, "completed", "cancelled", "failed"].includes(value.terminalStatus) ||
     (value.controlCursor !== null && !SAFE_HANDLE.test(value.controlCursor)) ||
     (value.controlCursorIssuedAt !== null && !validInstant(value.controlCursorIssuedAt)) ||
-    ((value.controlCursor === null) !== (value.controlCursorIssuedAt === null))) {
+    ((value.controlCursor === null) !== (value.controlCursorIssuedAt === null)) ||
+    !Number.isSafeInteger(value.controlCursorReissues) ||
+    value.controlCursorReissues < 0 || value.controlCursorReissues > MAX_SERVICE_CURSOR_REISSUES ||
+    (value.controlCursor === null && value.controlCursorReissues !== 0)) {
     transportFail("host_transport_record_invalid");
   }
   const hasReportIdentity = value.kind !== null && value.reportId !== null && value.requiredAt !== null;
@@ -272,7 +308,7 @@ function validatePublication(value) {
 }
 
 function persistTransportRecord(loaded) {
-  writePrivateJson(loaded.filePath, loaded.record, "w");
+  replacePrivateJsonAtomically(loaded.filePath, loaded.record);
 }
 
 function runTmuxDefault(args, options = {}) {
@@ -707,13 +743,29 @@ export async function activateHostTransport(input, dependencies = {}) {
   };
 }
 
-function validateServiceCursorAck(loaded, acknowledgement, nowMs) {
+function validateServiceCursorAck(loaded, acknowledgement, reissue, nowMs) {
   const publication = loaded.record.publication;
+  if (reissue !== undefined && reissue !== true) {
+    transportFail("host_transport_service_cursor_reissue_invalid");
+  }
   if (publication.controlCursor === null) {
-    if (acknowledgement !== undefined) {
+    if (acknowledgement !== undefined || reissue === true) {
       transportFail("host_transport_service_cursor_unexpected");
     }
-    return;
+    return false;
+  }
+  if (reissue === true) {
+    if (acknowledgement !== undefined) {
+      transportFail("host_transport_service_cursor_reissue_invalid");
+    }
+    if (nowMs - Date.parse(publication.controlCursorIssuedAt) > MAX_REPORT_RECEIPT_AGE_MS) {
+      transportFail("host_transport_service_cursor_reissue_expired");
+    }
+    if (publication.controlCursorReissues >= MAX_SERVICE_CURSOR_REISSUES) {
+      transportFail("host_transport_service_cursor_reissue_exhausted");
+    }
+    publication.controlCursorReissues += 1;
+    return true;
   }
   if (!exactKeys(acknowledgement, ["cursor", "conversationId", "servicedAt"]) ||
     acknowledgement.cursor !== publication.controlCursor ||
@@ -728,6 +780,8 @@ function validateServiceCursorAck(loaded, acknowledgement, nowMs) {
   }
   publication.controlCursor = null;
   publication.controlCursorIssuedAt = null;
+  publication.controlCursorReissues = 0;
+  return false;
 }
 
 function terminalStatus(event) {
@@ -736,7 +790,7 @@ function terminalStatus(event) {
     : "failed";
 }
 
-function requireReport(loaded, kind, cadence, requiredAtMs, evidenceThroughSequence, terminal = null, dependencies = {}) {
+export function requireReport(loaded, kind, cadence, requiredAtMs, evidenceThroughSequence, terminal = null, dependencies = {}) {
   const publication = loaded.record.publication;
   publication.state = "report_required";
   publication.kind = kind;
@@ -748,6 +802,11 @@ function requireReport(loaded, kind, cadence, requiredAtMs, evidenceThroughSeque
   if (terminal) {
     publication.terminalSequence = terminal.sequence;
     publication.terminalStatus = terminalStatus(terminal);
+  } else {
+    // An intermediate writer must always produce the shape accepted by
+    // validatePublication, even if it is reused against mutated test state.
+    publication.terminalSequence = null;
+    publication.terminalStatus = null;
   }
 }
 
@@ -785,7 +844,12 @@ export function statusHostTransport(input, dependencies = {}) {
     transportFail("host_transport_cursor_invalid");
   }
   const nowMs = nowValue(dependencies);
-  validateServiceCursorAck(loaded, input.serviceCursorAck, nowMs);
+  const reissuingCursor = validateServiceCursorAck(
+    loaded,
+    input.serviceCursorAck,
+    input.reissueServiceCursor,
+    nowMs
+  );
   const events = parseEvents(loaded.record.eventsFile);
   const terminal = events.find((event) => [
     "terminal",
@@ -800,7 +864,16 @@ export function statusHostTransport(input, dependencies = {}) {
       publication.state !== "receipt_acked"
       ? publication.evidenceThroughSequence
       : terminal.sequence;
-    requireReport(loaded, "terminal", 0, Date.parse(terminal.timestamp) || nowMs, terminalEvidenceLimit, terminal, dependencies);
+    const terminalTimestampMs = Date.parse(terminal.timestamp);
+    requireReport(
+      loaded,
+      "terminal",
+      0,
+      Number.isFinite(terminalTimestampMs) ? terminalTimestampMs : nowMs,
+      terminalEvidenceLimit,
+      terminal,
+      dependencies
+    );
     exposedPublicationState = "report_required";
   } else if (
     !terminal && publication.state === "receipt_acked" &&
@@ -824,22 +897,33 @@ export function statusHostTransport(input, dependencies = {}) {
     .filter((event) => event.sequence > afterSequence)
     .filter((event) => event.sequence <= evidenceLimit || event.sequence === publication.terminalSequence)
     .slice(0, MAX_RETURNED_EVENTS);
-  const latestSequence = events.at(-1)?.sequence ?? 0;
-  const returnedSequence = selected.at(-1)?.sequence ?? (
-    publication.terminalSequence !== null && afterSequence >= publication.terminalSequence
-      ? Math.min(afterSequence, latestSequence)
-      : Math.min(afterSequence, latestSequence, evidenceLimit)
-  );
+  const selectedSequences = new Set(selected.map((event) => event.sequence));
+  let returnedSequence = afterSequence;
+  // A terminal may be exposed out of order while an intermediate boundary
+  // hides newer evidence. Advance only across the consecutive event-log
+  // prefix actually returned; after terminal receipt acknowledgement the
+  // lifted boundary makes the hidden gap available to the next poll.
+  for (const event of events) {
+    if (event.sequence <= afterSequence) continue;
+    if (!selectedSequences.has(event.sequence)) break;
+    returnedSequence = event.sequence;
+  }
   const exitCode = exitCodeFromFile(loaded.record.exitFile);
   const active = sessionExists(dependencies.runTmux ?? runTmuxDefault, handle);
-  const cursor = newPrivateId("service", dependencies);
-  publication.controlCursor = cursor;
-  publication.controlCursorIssuedAt = new Date(nowMs).toISOString();
+  const cursor = reissuingCursor
+    ? publication.controlCursor
+    : newPrivateId("service", dependencies);
+  if (!reissuingCursor) {
+    publication.controlCursor = cursor;
+    publication.controlCursorIssuedAt = new Date(nowMs).toISOString();
+    publication.controlCursorReissues = 0;
+  }
   if (publication.state === "report_required") {
     publication.state = "publication_pending";
   }
   persistTransportRecord(loaded);
   const terminalPending = terminal && publication.kind === "terminal" && publication.state !== "receipt_acked";
+  const boundary = reportBoundary(publication, exposedPublicationState, events);
   return {
     schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
     type: "host_transport_status",
@@ -856,12 +940,32 @@ export function statusHostTransport(input, dependencies = {}) {
     ).length > selected.length,
     events: selected,
     serviceCursor: cursor,
-    ...(reportBoundary(publication, exposedPublicationState, events)
-      ? { reportPublication: reportBoundary(publication, exposedPublicationState, events) }
-      : {}),
+    ...(boundary ? { reportPublication: boundary } : {}),
     ...(terminal ? { terminalType: terminal.type } : {}),
     ...(exitCode === null ? {} : { exitCode })
   };
+}
+
+function canonicalAcknowledgedReport(record, publication, report) {
+  if (!isPlainObject(report)) {
+    transportFail("host_transport_report_ack_invalid_report");
+  }
+  const context = record.reportingContext;
+  for (const key of ["agent", "model", "roundIndex", "repository", "branch"]) {
+    if (report[key] !== context[key]) {
+      transportFail("host_transport_report_ack_identity_mismatch");
+    }
+  }
+  if (publication.kind === "terminal" && report.status !== publication.terminalStatus) {
+    transportFail("host_transport_report_ack_identity_mismatch");
+  }
+  try {
+    return publication.kind === "intermediate"
+      ? buildAcpIntermediateReport(report)
+      : buildAcpTerminalReport(report);
+  } catch {
+    transportFail("host_transport_report_ack_invalid_report");
+  }
 }
 
 export function acknowledgeHostTransportReport(input, dependencies = {}) {
@@ -872,16 +976,21 @@ export function acknowledgeHostTransportReport(input, dependencies = {}) {
   }
   const publication = loaded.record.publication;
   if (publication.state === "receipt_acked") {
-    transportFail("host_transport_report_ack_duplicate");
+    transportFail(publication.kind === null
+      ? "host_transport_report_not_required"
+      : "host_transport_report_ack_duplicate");
   }
   if (input.reportId !== publication.reportId || input.reportKind !== publication.kind || input.cadence !== publication.cadence) {
     transportFail("host_transport_report_ack_mismatch");
   }
+  const canonicalReport = canonicalAcknowledgedReport(loaded.record, publication, input.report);
+  const canonicalDigest = crypto.createHash("sha256").update(canonicalReport, "utf8").digest("hex");
   const receipt = input.receipt;
-  if (!exactKeys(receipt, ["conversationId", "messageId", "deliveredAt", "deliveryStatus"]) ||
+  if (!exactKeys(receipt, ["conversationId", "messageId", "deliveredAt", "deliveryStatus", "messageDigest"]) ||
     !REPORT_DELIVERY_SUCCESS_STATUSES.includes(receipt.deliveryStatus) ||
     receipt.conversationId !== loaded.record.reportingContext.controlConversationId ||
     typeof receipt.messageId !== "string" || !DECIMAL_ID.test(receipt.messageId) ||
+    receipt.messageDigest !== canonicalDigest ||
     !validInstant(receipt.deliveredAt)) {
     transportFail("host_transport_report_receipt_invalid");
   }
@@ -898,11 +1007,18 @@ export function acknowledgeHostTransportReport(input, dependencies = {}) {
   }
   publication.state = "receipt_acked";
   publication.receiptMessageId = receipt.messageId;
-  publication.acknowledgedMessageIds.push(receipt.messageId);
+  publication.acknowledgedMessageIds = [
+    ...publication.acknowledgedMessageIds,
+    receipt.messageId
+  ].slice(-MAX_ACKNOWLEDGED_MESSAGE_IDS);
+  let skippedCadences = 0;
   if (publication.kind === "intermediate") {
-    publication.nextCadence = publication.cadence + 1;
+    skippedCadences = Math.max(0, Math.floor(
+      (nowMs - Date.parse(publication.requiredAt)) / REPORT_CADENCE_MS
+    ));
+    publication.nextCadence = publication.cadence + skippedCadences + 1;
     publication.nextDueAt = new Date(
-      Date.parse(publication.requiredAt) + REPORT_CADENCE_MS
+      Date.parse(publication.requiredAt) + ((skippedCadences + 1) * REPORT_CADENCE_MS)
     ).toISOString();
   }
   persistTransportRecord(loaded);
@@ -910,7 +1026,8 @@ export function acknowledgeHostTransportReport(input, dependencies = {}) {
     schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
     type: "host_transport_report_acknowledged",
     kind: publication.kind,
-    cadence: publication.cadence
+    cadence: publication.cadence,
+    skippedCadences
   };
 }
 
@@ -945,20 +1062,35 @@ export function reconcileHostTransport(input) {
   }
   const ledgerFile = lifecycleLedgerPath(path.dirname(loaded.record.eventsFile), runId);
   const ledger = loadLifecycleLedger(ledgerFile).document;
+  const terminalAcked = loaded.record.publication.kind === "terminal" &&
+    loaded.record.publication.state === "receipt_acked";
+  // Publication is part of completion, not a presentation afterthought: do
+  // not irreversibly close the private lifecycle ledger until the canonical
+  // terminal message receipt has been acknowledged.
+  if (!terminalAcked) {
+    return {
+      schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+      type: "host_transport_reconciled",
+      status: "terminal_publication_pending"
+    };
+  }
   const reconciled = ledger.state === "exit_reconciled"
-    ? ledger
+    ? reconcileLifecycleLedger({
+        ledgerFile,
+        processHandle: ledger.processHandle,
+        outcome: "exited",
+        exitCode
+      })
     : reconcileLifecycleLedger({
         ledgerFile,
         processHandle: ledger.processHandle,
         outcome: "exited",
         exitCode
       });
-  const terminalAcked = loaded.record.publication.kind === "terminal" &&
-    loaded.record.publication.state === "receipt_acked";
   return {
     schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
     type: "host_transport_reconciled",
-    status: terminalAcked ? reconciled.state : "terminal_publication_pending"
+    status: reconciled.state
   };
 }
 

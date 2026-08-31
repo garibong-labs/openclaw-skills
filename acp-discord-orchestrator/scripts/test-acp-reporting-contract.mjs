@@ -15,6 +15,7 @@ import {
   buildAcpTerminalReport,
   validateAcpReportingContract,
 } from './acp-reporting-contract.mjs';
+import { readReportMessageInput } from './acp-report-message-cli.mjs';
 
 const REPORT_MESSAGE_CLI = fileURLToPath(new URL('acp-report-message-cli.mjs', import.meta.url));
 
@@ -1411,4 +1412,95 @@ test('report-message CLI builds both canonical kinds and rejects title drift', (
   });
   assert.equal(drift.status, 64);
   assert.equal(JSON.parse(drift.stderr).code, 'invalid_reporting_context');
+});
+
+test('report builders allow Claude runtime default but require explicit non-Claude models', () => {
+  const intermediate = {
+    ...REPORT_BUILDER_IDENTITY,
+    ...INTERMEDIATE_TIME_FIELDS,
+    agent: 'claude',
+    phaseIndex: 2,
+    executionState: '구현 중',
+    newResultDelta: 0,
+    inProgress: '진행',
+    verification: '검증',
+    next: '다음',
+  };
+  delete intermediate.model;
+  const claude = buildAcpIntermediateReport(intermediate);
+  assert.equal(claude.includes('Claude Code · `runtime-default`'), true);
+  const terminal = {
+    ...TERMINAL_BUILDER_IDENTITY,
+    agent: 'claude',
+    status: 'completed',
+    summary: '완료',
+    verification: '검증',
+    result: '결과',
+    next: '확인',
+    externalAction: '없음',
+  };
+  delete terminal.model;
+  assert.equal(buildAcpTerminalReport(terminal).includes('Claude Code · `runtime-default`'), true);
+
+  const codexMissing = { ...intermediate, agent: 'codex' };
+  expectContractError(() => buildAcpIntermediateReport(codexMissing), 'invalid_reporting_context');
+  expectContractError(() => buildAcpIntermediateReport({
+    ...codexMissing,
+    model: 'runtime-default',
+  }), 'invalid_reporting_context');
+  expectContractError(() => buildAcpTerminalReport({ ...terminal, agent: 'codex' }), 'invalid_reporting_context');
+  expectContractError(() => buildAcpStartMessage({
+    agent: 'codex',
+    model: 'runtime-default',
+    roundIndex: 1,
+    repository: REPO,
+    branch: BRANCH,
+    timeKst: '12:34',
+    scope: '범위 확인',
+    externalAction: '없음',
+  }), 'invalid_reporting_context');
+});
+
+test('phaseIndex accepts only integer own properties of the canonical phase map', () => {
+  const base = {
+    ...REPORT_BUILDER_IDENTITY,
+    ...INTERMEDIATE_TIME_FIELDS,
+    executionState: '구현 중',
+    newResultDelta: 0,
+    inProgress: '진행',
+    verification: '검증',
+    next: '다음',
+  };
+  for (const phaseIndex of ['2', 'toString', 2.5, 0, 5]) {
+    expectContractError(
+      () => buildAcpIntermediateReport({ ...base, phaseIndex }),
+      'invalid_reporting_report'
+    );
+  }
+  assert.equal(buildAcpIntermediateReport({ ...base, phaseIndex: 2 }).includes('2/4 구현'), true);
+});
+
+test('report input reader distinguishes empty, oversized, unreadable, and invalid JSON files', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acp-report-reader-'));
+  const empty = path.join(root, 'empty.json');
+  const oversized = path.join(root, 'oversized.json');
+  const invalid = path.join(root, 'invalid.json');
+  const readable = path.join(root, 'readable.json');
+  fs.writeFileSync(empty, '', { mode: 0o600 });
+  fs.writeFileSync(oversized, 'x'.repeat(65537), { mode: 0o600 });
+  fs.writeFileSync(invalid, '{', { mode: 0o600 });
+  fs.writeFileSync(readable, '{}', { mode: 0o600 });
+  assert.throws(() => readReportMessageInput(empty), /invalid_input_file_empty/);
+  assert.throws(() => readReportMessageInput(oversized), /invalid_input_file_too_large/);
+  assert.throws(() => readReportMessageInput(invalid), /invalid_input_json/);
+  assert.throws(() => readReportMessageInput(readable, {
+    fileSystem: {
+      lstatSync: (filePath) => fs.lstatSync(filePath),
+      readFileSync() {
+        const error = new Error('synthetic unreadable');
+        error.code = 'EACCES';
+        throw error;
+      },
+    },
+  }), /invalid_input_file_unreadable/);
 });

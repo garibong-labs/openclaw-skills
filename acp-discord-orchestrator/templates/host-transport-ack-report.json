@@ -1,0 +1,31 @@
+{
+  "schemaVersion": "acp-host-transport.v1",
+  "action": "ack-report",
+  "transportFile": "/absolute/private/transport.json",
+  "processHandle": "EXACT_HOST_HANDLE",
+  "reportId": "EXACT_REPORT_ID",
+  "reportKind": "terminal",
+  "cadence": 0,
+  "report": {
+    "agent": "codex",
+    "model": "MODEL_ID",
+    "roundIndex": 2,
+    "repository": "REPOSITORY_BASENAME",
+    "branch": "BRANCH_NAME",
+    "timeKst": "19:30",
+    "elapsed": "61분 경과",
+    "status": "completed",
+    "summary": "요청 범위 구현과 로컬 커밋 완료",
+    "verification": "필수 테스트 통과",
+    "result": "로컬 커밋 1개",
+    "next": "소유자 독립 검증 시작",
+    "externalAction": "없음"
+  },
+  "receipt": {
+    "conversationId": "100000000000000001",
+    "messageId": "100000000000000002",
+    "deliveredAt": "2026-08-31T10:00:05.000Z",
+    "deliveryStatus": "delivered",
+    "messageDigest": "CANONICAL_REPORT_SHA256"
+  }
+}

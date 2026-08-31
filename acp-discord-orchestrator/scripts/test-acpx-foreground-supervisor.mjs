@@ -376,6 +376,20 @@ test("runtime mutation waits for activation from the retained host handle", asyn
   });
   assert.equal(reconciled.state, "exit_reconciled");
   assert.equal(reconciled.exitReconciliation.status, "confirmed");
+  const verifiedAgain = reconcileLifecycleLedger({
+    ledgerFile,
+    processHandle: "tracked-session-42",
+    outcome: "exited",
+    exitCode: EXIT_CODES.completed,
+    nowMs: Date.now() + 1
+  });
+  assert.deepEqual(verifiedAgain.exitReconciliation, reconciled.exitReconciliation);
+  assert.throws(() => reconcileLifecycleLedger({
+    ledgerFile,
+    processHandle: "tracked-session-42",
+    outcome: "exited",
+    exitCode: EXIT_CODES.failed
+  }), /lifecycle_exit_code_mismatch/);
 });
 
 test("missing activation exits before runtime access with a terminal ledger intent", async () => {
@@ -511,11 +525,18 @@ test("dead handle without terminal evidence reconciles only as tracking_lost", (
   assert.equal(reconciled.state, "tracking_lost");
   assert.equal(reconciled.trackingFault.code, "tracking_lost");
   assert.equal(reconciled.exitReconciliation.status, "tracking_lost");
-  assert.throws(() => reconcileLifecycleLedger({
+  const verifiedAgain = reconcileLifecycleLedger({
     ledgerFile: writer.filePath,
     processHandle: "tracked-session-99",
     outcome: "tracking_lost"
-  }), /lifecycle_already_reconciled/);
+  });
+  assert.equal(verifiedAgain.state, "tracking_lost");
+  assert.throws(() => reconcileLifecycleLedger({
+    ledgerFile: writer.filePath,
+    processHandle: "tracked-session-99",
+    outcome: "exited",
+    exitCode: EXIT_CODES.completed
+  }), /lifecycle_tracking_lost/);
 });
 
 test("lifecycle ledger loader rejects impossible states and unbounded nested shapes", () => {

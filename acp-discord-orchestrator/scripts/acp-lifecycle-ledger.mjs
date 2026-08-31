@@ -571,8 +571,27 @@ export function reconcileLifecycleLedger({
     // rather than accepting a guessed host handle that was never bound.
     ledgerFail("lifecycle_handle_unexpected");
   }
-  if (loaded.document.state === "exit_reconciled" || loaded.document.state === "tracking_lost") {
-    ledgerFail("lifecycle_already_reconciled");
+  if (loaded.document.state === "exit_reconciled") {
+    if (outcome !== "exited") {
+      ledgerFail("lifecycle_reconciliation_outcome_mismatch");
+    }
+    if (!MAPPED_EXIT_CODES.has(exitCode)) {
+      ledgerFail("lifecycle_exit_code_invalid");
+    }
+    const stored = loaded.document.exitReconciliation;
+    if (stored.expectedExitCode !== exitCode || stored.exitCode !== exitCode) {
+      ledgerFail("lifecycle_exit_code_mismatch");
+    }
+    return loaded.document;
+  }
+  if (loaded.document.state === "tracking_lost") {
+    if (outcome !== "tracking_lost") {
+      ledgerFail("lifecycle_tracking_lost");
+    }
+    if (exitCode !== undefined) {
+      ledgerFail("lifecycle_exit_code_unexpected");
+    }
+    return loaded.document;
   }
   const observedAt = new Date(nowMs).toISOString();
   if (outcome === "exited") {
