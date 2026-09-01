@@ -2180,6 +2180,10 @@ test("codex omitted model resolves to the explicit medium default on every surfa
   assert.equal(started.model, CODEX_DEFAULT_MODEL_IDENTITY);
   assert.equal(started.reasoningEffort, CODEX_DEFAULT_REASONING_EFFORT);
   assert.equal("model" in state.ensureInput.sessionOptions, false);
+  // codex-acp advertises id `reasoning_effort`, category `thought_level`,
+  // and select values such as `medium`. Using the category as the id was the
+  // production mismatch this literal regression guard must catch.
+  assert.equal(CODEX_REASONING_CONFIG_KEY, "reasoning_effort");
   assert.deepEqual(
     state.configOptionInputs.map(({ key, value }) => ({ key, value })),
     [
@@ -2538,11 +2542,16 @@ test("public docs describe separate Codex model and reasoning config", () => {
     new URL("../references/runtime-contract.md", import.meta.url),
     "utf8"
   );
+  const ackTemplate = JSON.parse(fs.readFileSync(
+    new URL("../templates/host-transport-ack-report.json", import.meta.url),
+    "utf8"
+  ));
 
   for (const doc of [skill, contract]) {
     assert.match(doc, /gpt-5\.6-sol/);
     assert.match(doc, /reasoningEffort/);
     assert.match(doc, /medium/);
+    assert.match(doc, /reasoning_effort/);
     assert.match(doc, /thought_level/);
     assert.match(doc, /codex_model_config_apply_failed/);
     assert.match(doc, /codex_reasoning_config_apply_failed/);
@@ -2561,6 +2570,10 @@ test("public docs describe separate Codex model and reasoning config", () => {
   assert.match(skill, /anthropic\/claude-fable-5/);
   assert.match(contract, /claude-fable-5\[1m\]/);
   assert.match(contract, /sessionOptions\.model/);
+  assert.equal(
+    ackTemplate.receipt.deliveredAt,
+    "2026-08-31T10:00:05.000000+00:00"
+  );
 });
 
 test("metadata containing forbidden-pattern words loads while free-text slots stay screened", () => {

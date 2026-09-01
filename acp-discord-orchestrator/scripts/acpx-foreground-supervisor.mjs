@@ -48,10 +48,13 @@ export const CODEX_AGENT = "codex";
 // makes ACPX compare it against the base model option and fail before prompt
 // start with ACP_MODEL_UNSUPPORTED. Public reporting still uses the composed
 // identity below, but that display value is never sent as the runtime model.
+// The reasoning option's advertised id is `reasoning_effort`; its category is
+// `thought_level`. ACP session/set_config_option takes the id and one advertised
+// option value (for example `medium`), never the category label.
 export const CODEX_DEFAULT_MODEL = "gpt-5.6-sol";
 export const CODEX_DEFAULT_REASONING_EFFORT = "medium";
 export const CODEX_MODEL_CONFIG_KEY = "model";
-export const CODEX_REASONING_CONFIG_KEY = "thought_level";
+export const CODEX_REASONING_CONFIG_KEY = "reasoning_effort";
 export const CODEX_DEFAULT_MODEL_IDENTITY =
   `${CODEX_DEFAULT_MODEL}[${CODEX_DEFAULT_REASONING_EFFORT}]`;
 // The OpenClaw provider/catalog namespace prefix for Claude models. OpenClaw

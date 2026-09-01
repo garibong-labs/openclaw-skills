@@ -24,7 +24,7 @@
   "receipt": {
     "conversationId": "100000000000000001",
     "messageId": "100000000000000002",
-    "deliveredAt": "2026-08-31T10:00:05.000Z",
+    "deliveredAt": "2026-08-31T10:00:05.000000+00:00",
     "deliveryStatus": "delivered",
     "messageDigest": "CANONICAL_REPORT_SHA256"
   }
