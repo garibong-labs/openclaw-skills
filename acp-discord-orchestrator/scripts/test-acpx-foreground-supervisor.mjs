@@ -22,8 +22,12 @@ import {
   CLAUDE_OAUTH_TOKEN_ENV,
   CLAUDE_PROVIDER_INJECTION_ENV,
   CODEX_DEFAULT_MODEL,
+  CODEX_DEFAULT_MODEL_IDENTITY,
+  CODEX_DEFAULT_REASONING_EFFORT,
   CODEX_IMPLICIT_ENV_CONTRACT,
+  CODEX_MODEL_CONFIG_KEY,
   CODEX_PATH_ENV,
+  CODEX_REASONING_CONFIG_KEY,
   DEFAULT_HOST_ACTIVATION_TIMEOUT_MS,
   EXIT_CODES,
   assertCanonicalSupportedAgent,
@@ -42,6 +46,8 @@ import {
   parseHostActivationLine,
   reconcileLifecycleLedger,
   resolveConfiguredModel,
+  resolveConfiguredReasoningEffort,
+  modelReportingIdentity,
   runClaudeSupervisorPreflight,
   runCodexSupervisorPreflight,
   runReportingPreflight,
@@ -110,13 +116,20 @@ function parsedLifecycle(overrides = {}, receiptOverrides = {}) {
 // is ever validated).
 function validReporting(lifecycle = rawLifecycle(), options = {}) {
   const receipt = (lifecycle && lifecycle.startReceipt) || {};
+  const agent = options.agent ?? "codex";
+  const model = "model" in options
+    ? options.model
+    : agent === "codex"
+      ? `test-model[${CODEX_DEFAULT_REASONING_EFFORT}]`
+      : "test-model";
   return buildValidReporting({
     controlConversationId:
       (lifecycle && lifecycle.controlConversationId) ?? CONTROL_CONVERSATION_ID,
     receiptConversationId: receipt.conversationId ?? CONTROL_CONVERSATION_ID,
     messageId: receipt.messageId ?? START_MESSAGE_ID,
     deliveredAt: receipt.deliveredAt ?? PARSED_DELIVERED_AT,
-    agent: "codex",
+    agent,
+    model,
     ...options
   });
 }
@@ -145,9 +158,32 @@ function makeConfig(root, overrides = {}) {
   // generic (non-Claude) fixture agent is the supported canonical "codex".
   const lifecycle = "lifecycle" in overrides ? overrides.lifecycle : parsedLifecycle();
   const agent = "agent" in overrides ? overrides.agent : "codex";
+  const reportingAgent = reportingAgentFor(agent);
+  const configuredModel = "model" in overrides ? overrides.model : "test-model";
+  const configuredReasoningEffort = "reasoningEffort" in overrides
+    ? overrides.reasoningEffort
+    : agent === "codex"
+      ? CODEX_DEFAULT_REASONING_EFFORT
+      : undefined;
+  const fixtureModel = configuredModel === undefined
+    ? reportingAgent === "codex"
+      ? CODEX_DEFAULT_MODEL
+      : "runtime-default"
+    : typeof configuredModel === "string"
+      ? configuredModel
+      : "test-model";
+  const fixtureReasoning = typeof configuredReasoningEffort === "string"
+    ? configuredReasoningEffort
+    : CODEX_DEFAULT_REASONING_EFFORT;
+  const reportingModel = reportingAgent === "codex"
+    ? `${fixtureModel}[${fixtureReasoning}]`
+    : fixtureModel;
   return {
     agent,
-    model: "test-model",
+    model: configuredModel,
+    ...(configuredReasoningEffort === undefined
+      ? {}
+      : { reasoningEffort: configuredReasoningEffort }),
     cwd: root,
     sessionKey: "test-session",
     promptText: "perform the bounded test task",
@@ -157,7 +193,7 @@ function makeConfig(root, overrides = {}) {
     progressMs: 0,
     allowKinds: new Set(["read", "search", "think", "edit", "execute"]),
     lifecycle,
-    reporting: validReporting(lifecycle, { agent: reportingAgentFor(agent) }),
+    reporting: validReporting(lifecycle, { agent: reportingAgent, model: reportingModel }),
     maxResponseBytes: 1024 * 1024,
     runtimeModule: root,
     ...overrides
@@ -185,7 +221,9 @@ function makeRuntimeModule(options = {}) {
     closeStreamCalls: 0,
     streamClosed: false,
     closeAttempts: 0,
-    permissionOutcome: undefined
+    permissionOutcome: undefined,
+    configOptionInputs: [],
+    operationOrder: []
   };
   const result = options.result || Promise.resolve({ status: "completed", stopReason: "end_turn" });
   const events = options.events || [];
@@ -209,6 +247,7 @@ function makeRuntimeModule(options = {}) {
         },
         async ensureSession(input) {
           state.ensureInput = input;
+          state.operationOrder.push("ensureSession");
           if (options.permissionRequest) {
             state.permissionOutcome = await state.runtimeOptions.onPermissionRequest(
               options.permissionRequest,
@@ -222,8 +261,20 @@ function makeRuntimeModule(options = {}) {
             cwd: input.cwd
           };
         },
+        ...(options.omitSetConfigOption
+          ? {}
+          : {
+              async setConfigOption(input) {
+                state.configOptionInputs.push(input);
+                state.operationOrder.push(`setConfigOption:${input.key}`);
+                if (options.onSetConfigOption) {
+                  await options.onSetConfigOption(input, state);
+                }
+              }
+            }),
         startTurn(input) {
           state.turnInput = input;
+          state.operationOrder.push("startTurn");
           return {
             requestId: input.requestId,
             events: eventIterable,
@@ -2032,13 +2083,24 @@ test("claude omitted model keeps the runtime-default reporting contract", () => 
 });
 
 test("codex omitted model resolves to the explicit medium default on every surface", async () => {
-  // One authoritative constant, and it satisfies the fail-closed model
-  // grammar as a complete bracketed ACPX model ID.
-  assert.equal(CODEX_DEFAULT_MODEL, "gpt-5.6-sol[medium]");
+  // Runtime selections are separate; the composite constant is reporting
+  // metadata only and must never be sent back as the ACPX model value.
+  assert.equal(CODEX_DEFAULT_MODEL, "gpt-5.6-sol");
+  assert.equal(CODEX_DEFAULT_REASONING_EFFORT, "medium");
+  assert.equal(CODEX_DEFAULT_MODEL_IDENTITY, "gpt-5.6-sol[medium]");
   assert.equal(resolveConfiguredModel("codex", undefined), CODEX_DEFAULT_MODEL);
-  // Explicit models are preserved byte-for-byte for both agents, including
-  // bracketed ACPX IDs that differ from the default only in the suffix.
-  assert.equal(resolveConfiguredModel("codex", "gpt-5.6-sol[low]"), "gpt-5.6-sol[low]");
+  assert.equal(
+    resolveConfiguredReasoningEffort("codex", undefined),
+    CODEX_DEFAULT_REASONING_EFFORT
+  );
+  assert.equal(
+    modelReportingIdentity("codex", CODEX_DEFAULT_MODEL, CODEX_DEFAULT_REASONING_EFFORT),
+    CODEX_DEFAULT_MODEL_IDENTITY
+  );
+  assert.throws(
+    () => resolveConfiguredModel("codex", "gpt-5.6-sol[low]"),
+    { message: "codex_model_must_be_base_id", code: "codex_model_must_be_base_id" }
+  );
   assert.equal(resolveConfiguredModel("claude", "test-model"), "test-model");
 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-codex-default-model-"));
@@ -2067,10 +2129,11 @@ test("codex omitted model resolves to the explicit medium default on every surfa
   // before reporting validation, so the loaded config carries the default and
   // the reporting bundle must bind its identity lines to the same explicit ID.
   const loaded = loadSupervisorConfig(writeCase("codex-no-model", {
-    reporting: validReporting(lifecycle, { model: CODEX_DEFAULT_MODEL })
+    reporting: validReporting(lifecycle, { model: CODEX_DEFAULT_MODEL_IDENTITY })
   }));
   assert.equal(loaded.model, CODEX_DEFAULT_MODEL);
-  assert.ok(loaded.reporting.startMessage.includes("`" + CODEX_DEFAULT_MODEL + "`"));
+  assert.equal(loaded.reasoningEffort, CODEX_DEFAULT_REASONING_EFFORT);
+  assert.ok(loaded.reporting.startMessage.includes("`" + CODEX_DEFAULT_MODEL_IDENTITY + "`"));
 
   // A codex bundle claiming runtime-default for an omitted model cannot load:
   // reporting is validated against the normalized explicit default.
@@ -2104,7 +2167,7 @@ test("codex omitted model resolves to the explicit medium default on every surfa
   const exitCode = await runSupervisor(makeConfig(memRoot, {
     model: undefined,
     lifecycle: memLifecycle,
-    reporting: validReporting(memLifecycle, { model: CODEX_DEFAULT_MODEL })
+    reporting: validReporting(memLifecycle, { model: CODEX_DEFAULT_MODEL_IDENTITY })
   }), {
     runtimeModule: module,
     bindSignals: false,
@@ -2114,11 +2177,99 @@ test("codex omitted model resolves to the explicit medium default on every surfa
   });
   assert.equal(exitCode, EXIT_CODES.completed);
   const started = emitted.find((event) => event.type === "started");
-  assert.equal(started.model, CODEX_DEFAULT_MODEL);
-  assert.equal(state.ensureInput.sessionOptions.model, CODEX_DEFAULT_MODEL);
+  assert.equal(started.model, CODEX_DEFAULT_MODEL_IDENTITY);
+  assert.equal(started.reasoningEffort, CODEX_DEFAULT_REASONING_EFFORT);
+  assert.equal("model" in state.ensureInput.sessionOptions, false);
+  assert.deepEqual(
+    state.configOptionInputs.map(({ key, value }) => ({ key, value })),
+    [
+      { key: CODEX_MODEL_CONFIG_KEY, value: CODEX_DEFAULT_MODEL },
+      {
+        key: CODEX_REASONING_CONFIG_KEY,
+        value: CODEX_DEFAULT_REASONING_EFFORT
+      }
+    ]
+  );
+  assert.deepEqual(state.operationOrder, [
+    "ensureSession",
+    `setConfigOption:${CODEX_MODEL_CONFIG_KEY}`,
+    `setConfigOption:${CODEX_REASONING_CONFIG_KEY}`,
+    "startTurn"
+  ]);
 });
 
-test("model grammar accepts ACPX bracketed reasoning-selection IDs and fails closed on malformed brackets", () => {
+test("codex model and reasoning config fail closed before prompt start", async () => {
+  const runCase = async (name, runtimeOptions) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `acp-codex-config-${name}-`));
+    const lifecycle = parsedLifecycle();
+    const { module, state } = makeRuntimeModule(runtimeOptions);
+    const emitted = [];
+    const exitCode = await runSupervisor(makeConfig(root, {
+      model: "gpt-5.6-sol",
+      reasoningEffort: "medium",
+      lifecycle,
+      reporting: validReporting(lifecycle, { model: "gpt-5.6-sol[medium]" })
+    }), {
+      runtimeModule: module,
+      bindSignals: false,
+      writeEvent(event) {
+        emitted.push(event);
+      }
+    });
+    return { exitCode, emitted, state };
+  };
+
+  const missing = await runCase("missing-control", { omitSetConfigOption: true });
+  assert.equal(missing.exitCode, EXIT_CODES.supervisorError);
+  assert.equal(
+    missing.emitted.at(-1).code,
+    "acpx_runtime_instance_missing_setConfigOption"
+  );
+  assert.equal(missing.state.ensureInput, undefined);
+  assert.equal(missing.state.turnInput, undefined);
+
+  const modelRejected = await runCase("model-rejected", {
+    onSetConfigOption(input) {
+      if (input.key === CODEX_MODEL_CONFIG_KEY) {
+        throw new Error("private adapter model detail");
+      }
+    }
+  });
+  assert.equal(modelRejected.exitCode, EXIT_CODES.supervisorError);
+  assert.equal(modelRejected.emitted.at(-1).code, "codex_model_config_apply_failed");
+  assert.equal(modelRejected.state.configOptionInputs.length, 1);
+  assert.equal(modelRejected.state.turnInput, undefined);
+  assert.equal(modelRejected.state.closeAttempts, 1);
+
+  const reasoningRejected = await runCase("reasoning-rejected", {
+    onSetConfigOption(input) {
+      if (input.key === CODEX_REASONING_CONFIG_KEY) {
+        throw new Error("private adapter reasoning detail");
+      }
+    }
+  });
+  assert.equal(reasoningRejected.exitCode, EXIT_CODES.supervisorError);
+  assert.equal(
+    reasoningRejected.emitted.at(-1).code,
+    "codex_reasoning_config_apply_failed"
+  );
+  assert.deepEqual(
+    reasoningRejected.state.configOptionInputs.map((input) => input.key),
+    [CODEX_MODEL_CONFIG_KEY, CODEX_REASONING_CONFIG_KEY]
+  );
+  assert.equal(reasoningRejected.state.turnInput, undefined);
+  assert.equal(reasoningRejected.state.closeAttempts, 1);
+
+  assert.throws(
+    () => resolveConfiguredReasoningEffort("claude", "medium"),
+    {
+      message: "reasoning_effort_unsupported_agent",
+      code: "reasoning_effort_unsupported_agent"
+    }
+  );
+});
+
+test("codex accepts base model IDs and fails closed on composite or malformed IDs", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-model-grammar-"));
   const prompt = path.join(root, "prompt.txt");
   fs.writeFileSync(prompt, "bounded task", { mode: 0o600 });
@@ -2141,26 +2292,35 @@ test("model grammar accepts ACPX bracketed reasoning-selection IDs and fails clo
     return file;
   };
 
-  // Plain identifier-grammar model IDs stay accepted unchanged, and ACPX
-  // adapter-advertised bracketed IDs — reasoning selection inside the model
-  // ID itself — load with the complete string intact, including the
-  // 256-character boundary. The reporting bundle binds to the same complete
-  // string, so identity lines carry the bracketed ID verbatim.
+  // Codex accepts only base identifier-grammar model IDs. Reporting composes
+  // those base IDs with the separately defaulted reasoning effort.
   const valid = [
     ["plain", "test-model"],
     ["plain-dotted", "gpt-5.2"],
-    ["bracket-low", "gpt-5.6-sol[low]"],
-    ["bracket-high", "gpt-5.2[high]"],
-    ["bracket-duration", "claude-fable-5[1m]"],
-    ["bracket-max-length", "m".repeat(250) + "[high]"]
+    ["max-reporting-length", "m".repeat(248)]
   ];
   for (const [name, model] of valid) {
+    const reportingModel = `${model}[${CODEX_DEFAULT_REASONING_EFFORT}]`;
     const loaded = loadSupervisorConfig(writeCase(name, {
       model,
-      reporting: validReporting(lifecycle, { model })
+      reporting: validReporting(lifecycle, { model: reportingModel })
     }));
     assert.equal(loaded.model, model, name);
-    assert.ok(loaded.reporting.startMessage.includes("`" + model + "`"), name);
+    assert.ok(loaded.reporting.startMessage.includes("`" + reportingModel + "`"), name);
+  }
+
+  for (const model of ["gpt-5.6-sol[low]", "gpt-5.2[high]"]) {
+    assert.throws(
+      () => loadSupervisorConfig(writeCase("composite-" + model, {
+        model,
+        reporting: validReporting(lifecycle, { model })
+      })),
+      {
+        message: "codex_model_must_be_base_id",
+        code: "codex_model_must_be_base_id"
+      },
+      model
+    );
   }
 
   // Malformed bracket forms fail closed with the stable invalid_model code:
@@ -2182,7 +2342,7 @@ test("model grammar accepts ACPX bracketed reasoning-selection IDs and fails clo
     ["inner-hyphen", "gpt-5.2[extra-high]"],
     ["backtick", "gpt-5.2[`high`]"],
     ["control", "gpt-5.2[high]\n"],
-    ["over-length", "m".repeat(251) + "[high]"]
+    ["over-length", "m".repeat(257)]
   ];
   for (const [name, model] of invalid) {
     assert.throws(
@@ -2207,30 +2367,33 @@ test("model grammar accepts ACPX bracketed reasoning-selection IDs and fails clo
   );
 });
 
-test("bracketed model ID reaches the runtime session options unchanged", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-model-passthrough-"));
-  const model = "gpt-5.6-sol[low]";
+test("claude bracketed model ID reaches runtime session options unchanged", {
+  skip: process.platform === "win32"
+}, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-claude-model-passthrough-"));
+  const envFile = makeClaudeAuthFixture(root);
+  const model = "claude-fable-5[1m]";
   const lifecycle = parsedLifecycle();
   const { module, state } = makeRuntimeModule({
     events: [{ type: "text_delta", stream: "output", text: "bounded result" }]
   });
   const emitted = [];
-  const exitCode = await runSupervisor(makeConfig(root, {
+  const exitCode = await runSupervisor(makeClaudeConfig(root, envFile, {
     model,
     lifecycle,
-    reporting: validReporting(lifecycle, { model })
+    reporting: validReporting(lifecycle, { agent: "claude", model })
   }), {
     runtimeModule: module,
     bindSignals: false,
+    env: claudeEnv(envFile),
+    execArgv: ["--env-file=" + envFile],
     writeEvent(event) {
       emitted.push(event);
     }
   });
   assert.equal(exitCode, EXIT_CODES.completed);
-  // The complete bracketed string is what ACPX receives and what the
-  // normalized started event reports — no stripping, splitting, or rewriting
-  // into a separate thinking option anywhere in between.
   assert.equal(state.ensureInput.sessionOptions.model, model);
+  assert.deepEqual(state.configOptionInputs, []);
   const started = emitted.find((event) => event.type === "started");
   assert.equal(started.model, model);
   assert.equal(emitted.at(-1).type, "terminal");
@@ -2369,7 +2532,7 @@ test("claude openclaw provider-prefixed model fails closed before runtime access
   assert.equal(fs.existsSync(path.join(memRoot, "state")), false);
 });
 
-test("public docs describe the bracketed model-ID grammar", () => {
+test("public docs describe separate Codex model and reasoning config", () => {
   const skill = fs.readFileSync(new URL("../SKILL.md", import.meta.url), "utf8");
   const contract = fs.readFileSync(
     new URL("../references/runtime-contract.md", import.meta.url),
@@ -2377,18 +2540,25 @@ test("public docs describe the bracketed model-ID grammar", () => {
   );
 
   for (const doc of [skill, contract]) {
-    assert.match(doc, /gpt-5\.2\[high\]/);
-    assert.match(doc, /gpt-5\.6-sol\[low\]/);
-    assert.match(doc, /invalid_model/);
-    // The explicit Codex omission default is documented in both public docs.
+    assert.match(doc, /gpt-5\.6-sol/);
+    assert.match(doc, /reasoningEffort/);
+    assert.match(doc, /medium/);
+    assert.match(doc, /thought_level/);
+    assert.match(doc, /codex_model_config_apply_failed/);
+    assert.match(doc, /codex_reasoning_config_apply_failed/);
+    assert.match(doc, /codex_model_must_be_base_id/);
+    // The composed value remains public reporting metadata only.
     assert.match(doc, /gpt-5\.6-sol\[medium\]/);
     assert.match(doc, /runtime-default/);
     // Both docs distinguish the adapter-advertised ACP model ID from the
     // OpenClaw provider/catalog key and name the stable rejection code.
     assert.match(doc, /`claude-fable-5`/);
-    assert.match(doc, /anthropic\/claude-fable-5/);
+    assert.match(doc, /anthropic\//);
     assert.match(doc, /invalid_model_openclaw_provider_key/);
   }
+  assert.match(skill, /"model": "gpt-5\.6-sol"/);
+  assert.match(skill, /"reasoningEffort": "medium"/);
+  assert.match(skill, /anthropic\/claude-fable-5/);
   assert.match(contract, /claude-fable-5\[1m\]/);
   assert.match(contract, /sessionOptions\.model/);
 });
@@ -3563,7 +3733,10 @@ test("loader binds reporting to the canonical agent for both supported agents", 
   assert.equal(codex.agent, "codex");
   assert.equal(codex.reporting.schemaVersion, "acp-reporting-v2");
   assert.equal(codex.reporting.agent, "codex");
-  assert.match(codex.reporting.startMessage, /🤖 \*\*ACP\*\*: Codex · `test-model`/);
+  assert.match(
+    codex.reporting.startMessage,
+    /🤖 \*\*ACP\*\*: Codex · `test-model\[medium\]`/
+  );
   assert.equal(codex.reporting.startMessage.includes("Claude Code"), false);
 
   // claude keeps loading a v2 bundle, and — during the bounded migration —

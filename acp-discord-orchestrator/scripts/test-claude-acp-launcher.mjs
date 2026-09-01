@@ -106,7 +106,7 @@ function validReporting({
   messageId = START_MESSAGE_ID,
   deliveredAt,
   agent = "claude",
-  model = "test-model"
+  model = agent === "codex" ? "test-model[medium]" : "test-model"
 }) {
   return buildValidReporting({
     agent,
@@ -600,7 +600,9 @@ test("substituted public template loads through the real supervisor loader", () 
   const placeholders = [
     "AGENT_DISPLAY_NAME",
     "AGENT_NAME",
+    "MODEL_REPORTING_IDENTITY",
     "MODEL_ID",
+    "REASONING_EFFORT",
     "CONTROL_CONVERSATION_ID",
     "START_MESSAGE_ID",
     "START_MESSAGE_DELIVERED_AT_ISO_8601",
@@ -612,10 +614,13 @@ test("substituted public template loads through the real supervisor loader", () 
   }
   const deliveredAt = "2026-08-24T09:30:00.530000+00:00";
   const bind = (agent, displayName, suffix) => {
+    const reportingModel = agent === "codex" ? "test-model[medium]" : "test-model";
     const bound = templateText
       .replaceAll("AGENT_DISPLAY_NAME", displayName)
       .replaceAll("AGENT_NAME", agent)
+      .replaceAll("MODEL_REPORTING_IDENTITY", reportingModel)
       .replaceAll("MODEL_ID", "test-model")
+      .replaceAll("REASONING_EFFORT", "medium")
       .replaceAll("CONTROL_CONVERSATION_ID", CONTROL_CONVERSATION_ID)
       .replaceAll("START_MESSAGE_ID", START_MESSAGE_ID)
       .replaceAll("START_MESSAGE_DELIVERED_AT_ISO_8601", deliveredAt)
@@ -633,6 +638,9 @@ test("substituted public template loads through the real supervisor loader", () 
     // runtime-preflight assemble seam, exercised here with an attested-style
     // absolute path.
     const draft = JSON.parse(bound);
+    if (agent === "claude") {
+      delete draft.reasoningEffort;
+    }
     assert.equal(draft.runtimeModule, "RUNTIME_MODULE_FROM_PREFLIGHT");
     return JSON.stringify(assembleSupervisorConfig(draft, { runtimeModule: root }));
   };
@@ -645,7 +653,10 @@ test("substituted public template loads through the real supervisor loader", () 
   assert.equal(codex.auth, undefined);
   assert.equal(codex.reporting.schemaVersion, "acp-reporting-v2");
   assert.equal(codex.reporting.agent, "codex");
-  assert.match(codex.reporting.startMessage, /🤖 \*\*ACP\*\*: Codex · `test-model`/);
+  assert.match(
+    codex.reporting.startMessage,
+    /🤖 \*\*ACP\*\*: Codex · `test-model\[medium\]`/
+  );
 
   // For claude, the same neutral template composes with the provider-specific
   // auth profile template: substitute claude/Claude Code and merge the

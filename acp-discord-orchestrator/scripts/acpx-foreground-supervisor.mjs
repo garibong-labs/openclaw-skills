@@ -42,14 +42,18 @@ export const EXIT_CODES = Object.freeze({
 
 export const CLAUDE_AGENT = "claude";
 export const CODEX_AGENT = "codex";
-// Authoritative supervisor-side default for Codex runs that omit `model`. An
-// omitted Codex model must never inherit the adapter/backend preset
-// (gpt-5.6-sol[low]); it is normalized to this explicit complete ACPX model ID
-// before reporting validation and before the runtime receives
-// sessionOptions.model, so the loaded config, the reporting identity lines,
-// the normalized `started` event, and the ACPX session all name the same
-// model. Claude keeps genuine omission and the public `runtime-default` label.
-export const CODEX_DEFAULT_MODEL = "gpt-5.6-sol[medium]";
+// Codex ACP now advertises model and reasoning as separate config options.
+// Keep the requested values separate all the way to the runtime: passing the
+// historical composite `gpt-5.6-sol[medium]` through sessionOptions.model
+// makes ACPX compare it against the base model option and fail before prompt
+// start with ACP_MODEL_UNSUPPORTED. Public reporting still uses the composed
+// identity below, but that display value is never sent as the runtime model.
+export const CODEX_DEFAULT_MODEL = "gpt-5.6-sol";
+export const CODEX_DEFAULT_REASONING_EFFORT = "medium";
+export const CODEX_MODEL_CONFIG_KEY = "model";
+export const CODEX_REASONING_CONFIG_KEY = "thought_level";
+export const CODEX_DEFAULT_MODEL_IDENTITY =
+  `${CODEX_DEFAULT_MODEL}[${CODEX_DEFAULT_REASONING_EFFORT}]`;
 // The OpenClaw provider/catalog namespace prefix for Claude models. OpenClaw
 // keys like `anthropic/claude-fable-5` name a provider route in OpenClaw's own
 // catalog; they are not ACP model IDs. The Claude ACP adapter advertises and
@@ -60,19 +64,25 @@ export const CODEX_DEFAULT_MODEL = "gpt-5.6-sol[medium]";
 // slash-containing model IDs for every other agent untouched.
 export const CLAUDE_OPENCLAW_PROVIDER_PREFIX = "anthropic/";
 
-// Resolves the effective model for a config's agent. Only the canonical
-// "codex" agent has a supervisor-side omission default; an explicit model for
-// any agent is preserved byte-for-byte (including bracketed ACPX IDs), and
-// every other agent keeps undefined as genuine omission. For the canonical
-// "claude" agent an explicit model carrying the OpenClaw provider prefix
-// fails closed with the stable code invalid_model_openclaw_provider_key —
-// before dynamic runtime import, probing, or adapter startup on every path.
-// Shared by the config loader, the in-memory reporting preflight backstop,
-// and runSupervisor so no path can bind a different default or smuggle a
-// provider-prefixed Claude key past the guard.
+// Resolves the effective model for a config's agent. Canonical Codex has one
+// supervisor-side base-model default and rejects composite bracket syntax;
+// every other agent preserves explicit adapter IDs byte-for-byte (including
+// bounded bracket suffixes) and keeps undefined as genuine omission. For the
+// canonical Claude agent an explicit model carrying the OpenClaw provider
+// prefix fails closed with invalid_model_openclaw_provider_key before dynamic
+// runtime import, probing, or adapter startup on every path. Shared by the
+// loader, in-memory reporting backstop, and runSupervisor so no path can bind
+// a different default or smuggle a provider-prefixed Claude key past the guard.
 export function resolveConfiguredModel(agent, model) {
   if (model === undefined && agent === CODEX_AGENT) {
     return CODEX_DEFAULT_MODEL;
+  }
+  if (
+    agent === CODEX_AGENT &&
+    typeof model === "string" &&
+    (model.includes("[") || model.includes("]"))
+  ) {
+    fail("codex_model_must_be_base_id");
   }
   if (
     agent === CLAUDE_AGENT &&
@@ -83,6 +93,29 @@ export function resolveConfiguredModel(agent, model) {
     fail("invalid_model_openclaw_provider_key");
   }
   return model;
+}
+
+// Codex requires an explicit reasoning selection independent of its base
+// model. Other agents keep their adapter-owned model semantics and must not
+// receive a Codex-only reasoning config value.
+export function resolveConfiguredReasoningEffort(agent, reasoningEffort) {
+  if (agent === CODEX_AGENT) {
+    return reasoningEffort ?? CODEX_DEFAULT_REASONING_EFFORT;
+  }
+  if (reasoningEffort !== undefined) {
+    fail("reasoning_effort_unsupported_agent");
+  }
+  return undefined;
+}
+
+// One deterministic public identity derived from the separately validated
+// runtime selections. For Codex this is display/reporting metadata only; the
+// composite string must never be passed back to ACPX as a model value.
+export function modelReportingIdentity(agent, model, reasoningEffort) {
+  if (agent === CODEX_AGENT) {
+    return `${model}[${reasoningEffort}]`;
+  }
+  return model ?? ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL;
 }
 // The supervisor runs every turn as a oneshot ACP session; the constant keeps
 // the ensureSession request and the codex cleanup-fallback gate bound to the
@@ -331,15 +364,11 @@ function assertIdentifier(value, code, maxLength) {
   return checked;
 }
 
-// Model IDs are the identifier grammar plus at most one bounded bracket
-// suffix at the very end. ACPX 0.11.2+ adapters advertise Codex reasoning
-// selection inside the model ID itself — `gpt-5.2[high]`, `gpt-5.6-sol[low]`,
-// `claude-fable-5[1m]` — so the complete bracketed string is the model ID and
-// must reach sessionOptions.model unchanged; it is not a separate thinking
-// option. The suffix is one non-empty alphanumeric run in matched square
-// brackets; an empty suffix, unmatched or nested brackets, a second suffix,
-// or any character after the closing bracket fails closed. Agent names and
-// every other identifier keep the strict bracket-free grammar above.
+// Some non-Codex adapters still advertise bounded bracket suffixes as part of
+// their model IDs (for example `claude-fable-5[1m]`). Codex is narrowed later
+// by resolveConfiguredModel to a base ID because its model and reasoning are
+// separate config options. The generic parser keeps the legacy adapter form
+// available without relaxing any other identifier grammar.
 function assertModelId(value, code, maxLength) {
   const checked = assertString(value, code, maxLength);
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.:/@+-]*(\[[a-zA-Z0-9]+\])?$/.test(checked)) {
@@ -566,12 +595,23 @@ export function runReportingPreflight(config) {
   const receipt = lifecycle && isPlainObject(lifecycle.startReceipt)
     ? lifecycle.startReceipt
     : undefined;
+  if (
+    (config.model !== undefined && typeof config.model !== "string") ||
+    (config.reasoningEffort !== undefined &&
+      typeof config.reasoningEffort !== "string")
+  ) {
+    fail("invalid_reporting_context");
+  }
+  const model = resolveConfiguredModel(config.agent, config.model);
+  const reasoningEffort = resolveConfiguredReasoningEffort(
+    config.agent,
+    config.reasoningEffort
+  );
   assertReportingContract(config.reporting, {
     agent: config.agent,
-    // The same Codex omission default the loader applies: an in-memory config
-    // that omits the Codex model binds its reporting to the explicit default,
-    // so templates claiming `runtime-default` cannot pass the backstop either.
-    model: resolveConfiguredModel(config.agent, config.model),
+    // Reporting binds to the composed display identity only after the base
+    // model and reasoning selection have been resolved separately.
+    model: modelReportingIdentity(config.agent, model, reasoningEffort),
     controlConversationId: lifecycle ? lifecycle.controlConversationId : undefined,
     lifecycleStartReceipt: receipt
       ? {
@@ -946,17 +986,24 @@ export function loadSupervisorConfig(configPath) {
     allowKinds.add(value);
   }
 
-  // The Codex omission default is applied here, before the reporting bundle
-  // is validated, so reporting binds to the effective explicit model and a
-  // bundle claiming `runtime-default` for an omitted Codex model is rejected.
-  // The same call rejects an OpenClaw provider-prefixed Claude model
-  // (`anthropic/…`) as invalid config, long before any runtime surface.
+  // Codex defaults are applied as separate base-model and reasoning fields
+  // before reporting validation. A historical composite Codex model is
+  // rejected here instead of reaching ACPX and failing after session startup.
+  // The model resolver also rejects an OpenClaw provider-prefixed Claude
+  // model (`anthropic/…`) long before any runtime surface.
   const model = resolveConfiguredModel(
     agent,
     raw.model === undefined
       ? undefined
       : assertModelId(raw.model, "invalid_model", 256)
   );
+  const reasoningEffort = resolveConfiguredReasoningEffort(
+    agent,
+    raw.reasoningEffort === undefined
+      ? undefined
+      : assertIdentifier(raw.reasoningEffort, "invalid_reasoning_effort", 64)
+  );
+  const reportingModel = modelReportingIdentity(agent, model, reasoningEffort);
 
   // Mandatory reporting bundle, validated last so every structural field it
   // binds to (agent, model, lifecycle receipt) is already trusted, and before
@@ -969,7 +1016,7 @@ export function loadSupervisorConfig(configPath) {
   // caller-attested lifecycle receipt.
   const reporting = assertReportingContract(raw.reporting, {
     agent,
-    model,
+    model: reportingModel,
     controlConversationId: lifecycle.controlConversationId,
     lifecycleStartReceipt: {
       conversationId: lifecycle.startReceipt.conversationId,
@@ -982,6 +1029,7 @@ export function loadSupervisorConfig(configPath) {
     agent,
     auth,
     model,
+    reasoningEffort,
     cwd,
     sessionKey: assertString(raw.sessionKey, "invalid_session_key", 256),
     promptText,
@@ -2025,13 +2073,19 @@ export async function runSupervisor(config, dependencies = {}) {
     // every supported agent — no order-dependent asymmetry between the
     // Claude route guard and the reporting backstop.
     assertCanonicalSupportedAgent(config.agent);
-    // Effective model for every downstream surface: configs loaded from disk
-    // arrive already normalized, and a config assembled in memory gets the
-    // same Codex omission default and the same OpenClaw provider-prefix
-    // guard for Claude here — before any preflight, dynamic runtime import,
-    // probe, or adapter startup, and before the runtime receives
-    // sessionOptions.model.
+    // Effective selections for every downstream surface: Codex resolves a
+    // base model and reasoning effort independently; Claude keeps its
+    // adapter model semantics and no Codex-only reasoning field.
     const model = resolveConfiguredModel(config.agent, config.model);
+    const reasoningEffort = resolveConfiguredReasoningEffort(
+      config.agent,
+      config.reasoningEffort
+    );
+    const reportingModel = modelReportingIdentity(
+      config.agent,
+      model,
+      reasoningEffort
+    );
     runStartReceiptPreflight(config, now());
     // Agent-neutral process-integrity baseline, enforced for every supported
     // agent before any runtime module import — even when the caller-declared
@@ -2104,7 +2158,11 @@ export async function runSupervisor(config, dependencies = {}) {
       onPermissionRequest: permissionHandler
     });
 
-    for (const name of ["ensureSession", "startTurn", "close"]) {
+    const requiredRuntimeMethods = ["ensureSession", "startTurn", "close"];
+    if (config.agent === CODEX_AGENT) {
+      requiredRuntimeMethods.push("setConfigOption");
+    }
+    for (const name of requiredRuntimeMethods) {
       if (!runtime || typeof runtime[name] !== "function") {
         fail("acpx_runtime_instance_missing_" + name);
       }
@@ -2119,10 +2177,35 @@ export async function runSupervisor(config, dependencies = {}) {
       mode: ACP_SESSION_MODE,
       cwd: config.cwd,
       sessionOptions: {
-        ...(model ? { model } : {}),
+        // Codex model and reasoning are applied below as two acknowledged
+        // config-option writes. Omitting the Codex session model keeps one
+        // fail-closed control surface and avoids ACPX model-alias fallback.
+        // Other adapters keep their normal session model behavior.
+        ...(config.agent !== CODEX_AGENT && model ? { model } : {}),
         systemPrompt: { append: EXECUTION_CONTRACT.trim() }
       }
     });
+
+    if (config.agent === CODEX_AGENT) {
+      try {
+        await runtime.setConfigOption({
+          handle,
+          key: CODEX_MODEL_CONFIG_KEY,
+          value: model
+        });
+      } catch {
+        fail("codex_model_config_apply_failed");
+      }
+      try {
+        await runtime.setConfigOption({
+          handle,
+          key: CODEX_REASONING_CONFIG_KEY,
+          value: reasoningEffort
+        });
+      } catch {
+        fail("codex_reasoning_config_apply_failed");
+      }
+    }
 
     turn = runtime.startTurn({
       handle,
@@ -2149,7 +2232,8 @@ export async function runSupervisor(config, dependencies = {}) {
 
     emit("started", {
       agent: config.agent,
-      model: model || ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL,
+      model: reportingModel,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
       sessionRef: safeSessionReference(config.sessionKey),
       runtimeVersion: safeRuntimeVersion(loaded.version),
       allowedToolKinds: [...config.allowKinds].sort()
