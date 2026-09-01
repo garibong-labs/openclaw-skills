@@ -48,10 +48,13 @@ export const CODEX_AGENT = "codex";
 // makes ACPX compare it against the base model option and fail before prompt
 // start with ACP_MODEL_UNSUPPORTED. Public reporting still uses the composed
 // identity below, but that display value is never sent as the runtime model.
+// The reasoning option's advertised id is `reasoning_effort`; its category is
+// `thought_level`. ACP session/set_config_option takes the id and one advertised
+// option value (for example `medium`), never the category label.
 export const CODEX_DEFAULT_MODEL = "gpt-5.6-sol";
 export const CODEX_DEFAULT_REASONING_EFFORT = "medium";
 export const CODEX_MODEL_CONFIG_KEY = "model";
-export const CODEX_REASONING_CONFIG_KEY = "thought_level";
+export const CODEX_REASONING_CONFIG_KEY = "reasoning_effort";
 export const CODEX_DEFAULT_MODEL_IDENTITY =
   `${CODEX_DEFAULT_MODEL}[${CODEX_DEFAULT_REASONING_EFFORT}]`;
 // The OpenClaw provider/catalog namespace prefix for Claude models. OpenClaw
@@ -113,7 +116,19 @@ export function resolveConfiguredReasoningEffort(agent, reasoningEffort) {
 // composite string must never be passed back to ACPX as a model value.
 export function modelReportingIdentity(agent, model, reasoningEffort) {
   if (agent === CODEX_AGENT) {
-    return `${model}[${reasoningEffort}]`;
+    // Config-file loading resolves Codex defaults before this helper runs.
+    // Re-assert the bounded base selections here because host transport tests
+    // and integrations may inject a loader directly; never persist a public
+    // identity such as "model[undefined]" from that bypass path.
+    const baseModel = resolveConfiguredModel(
+      agent,
+      assertModelId(model, "invalid_model", 256)
+    );
+    const selectedReasoningEffort = resolveConfiguredReasoningEffort(
+      agent,
+      assertIdentifier(reasoningEffort, "invalid_reasoning_effort", 64)
+    );
+    return `${baseModel}[${selectedReasoningEffort}]`;
   }
   return model ?? ACP_REPORT_RUNTIME_DEFAULT_MODEL_LABEL;
 }
@@ -281,7 +296,7 @@ const MIN_MAX_START_RECEIPT_AGE_MS = 1000;
 const MAX_MAX_START_RECEIPT_AGE_MS = 3600000;
 // Delivery timestamps come from a remote chat clock, so a bounded forward
 // skew keeps an honest receipt usable without widening the freshness window.
-const START_RECEIPT_FUTURE_SKEW_MS = 1000;
+export const REMOTE_PROVIDER_CLOCK_SKEW_MS = 1000;
 
 const EXECUTION_CONTRACT = [
   "",
@@ -471,11 +486,35 @@ function assertDiscordId(value, code) {
   return value;
 }
 
-function parseDeliveredAt(value, code) {
+// The one bounded parser for caller-attested chat-provider receipt instants.
+// Keep remote wire spellings separate from private Date#toISOString record
+// timestamps, and return only a safe Date.parse result to callers.
+function validDeliveredAtCalendar(value) {
+  const year = Number.parseInt(value.slice(0, 4), 10);
+  const month = Number.parseInt(value.slice(5, 7), 10);
+  const day = Number.parseInt(value.slice(8, 10), 10);
+  const hour = Number.parseInt(value.slice(11, 13), 10);
+  const minute = Number.parseInt(value.slice(14, 16), 10);
+  const second = Number.parseInt(value.slice(17, 19), 10);
+  if (
+    month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59
+  ) {
+    return false;
+  }
+  const daysInMonth = [
+    31,
+    (year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)) ? 29 : 28,
+    31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+  ];
+  return day <= daysInMonth[month - 1];
+}
+
+export function parseDeliveredAt(value, code) {
   if (
     typeof value !== "string" ||
     value.length > MAX_DELIVERED_AT_LENGTH ||
-    !ISO_INSTANT.test(value)
+    !ISO_INSTANT.test(value) ||
+    !validDeliveredAtCalendar(value)
   ) {
     fail(code);
   }
@@ -562,7 +601,7 @@ export function runStartReceiptPreflight(config, nowMs) {
   }
 
   const ageMs = nowMs - receipt.deliveredAtMs;
-  if (ageMs < -START_RECEIPT_FUTURE_SKEW_MS) {
+  if (ageMs < -REMOTE_PROVIDER_CLOCK_SKEW_MS) {
     fail("start_receipt_future");
   }
   if (ageMs > lifecycle.maxStartReceiptAgeMs) {

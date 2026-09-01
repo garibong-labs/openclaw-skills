@@ -43,6 +43,7 @@ import {
   loadSupervisorConfig,
   main,
   normalizeRuntimeEvent,
+  parseDeliveredAt,
   parseHostActivationLine,
   reconcileLifecycleLedger,
   resolveConfiguredModel,
@@ -1779,6 +1780,35 @@ test("start-receipt config shape fails closed with exact codes", () => {
   );
 });
 
+test("shared deliveredAt parser preserves the bounded remote receipt wire contract", () => {
+  const code = "invalid_delivered_at";
+  for (const value of [
+    "2026-08-22T07:47:48Z",
+    "2026-08-22T07:47:48.530000+00:00",
+    "2026-08-22T16:47:48.530000+09:00"
+  ]) {
+    assert.equal(parseDeliveredAt(value, code), Date.parse(value), value);
+  }
+  for (const value of [
+    "2026-08-22T07:47:48",
+    "2026-08-22T07:47:48.5300001+00:00",
+    "2026-08-22T07:47:48+99:99",
+    "2026-02-29T07:47:48Z",
+    "2026-02-31T07:47:48Z",
+    "2026-08-22T07:47:48.530000+00:00x".padEnd(41, "x")
+  ]) {
+    assert.throws(
+      () => parseDeliveredAt(value, code),
+      { message: code, code },
+      value
+    );
+  }
+  assert.equal(
+    parseDeliveredAt("2024-02-29T07:47:48Z", code),
+    Date.parse("2024-02-29T07:47:48Z")
+  );
+});
+
 test("delivered-at accepts Discord's native instant within a bounded fraction", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-receipt-instant-"));
   const prompt = path.join(root, "prompt.txt");
@@ -2180,6 +2210,10 @@ test("codex omitted model resolves to the explicit medium default on every surfa
   assert.equal(started.model, CODEX_DEFAULT_MODEL_IDENTITY);
   assert.equal(started.reasoningEffort, CODEX_DEFAULT_REASONING_EFFORT);
   assert.equal("model" in state.ensureInput.sessionOptions, false);
+  // codex-acp advertises id `reasoning_effort`, category `thought_level`,
+  // and select values such as `medium`. Using the category as the id was the
+  // production mismatch this literal regression guard must catch.
+  assert.equal(CODEX_REASONING_CONFIG_KEY, "reasoning_effort");
   assert.deepEqual(
     state.configOptionInputs.map(({ key, value }) => ({ key, value })),
     [
@@ -2538,11 +2572,16 @@ test("public docs describe separate Codex model and reasoning config", () => {
     new URL("../references/runtime-contract.md", import.meta.url),
     "utf8"
   );
+  const ackTemplate = JSON.parse(fs.readFileSync(
+    new URL("../templates/host-transport-ack-report.json", import.meta.url),
+    "utf8"
+  ));
 
   for (const doc of [skill, contract]) {
     assert.match(doc, /gpt-5\.6-sol/);
     assert.match(doc, /reasoningEffort/);
     assert.match(doc, /medium/);
+    assert.match(doc, /reasoning_effort/);
     assert.match(doc, /thought_level/);
     assert.match(doc, /codex_model_config_apply_failed/);
     assert.match(doc, /codex_reasoning_config_apply_failed/);
@@ -2561,6 +2600,13 @@ test("public docs describe separate Codex model and reasoning config", () => {
   assert.match(skill, /anthropic\/claude-fable-5/);
   assert.match(contract, /claude-fable-5\[1m\]/);
   assert.match(contract, /sessionOptions\.model/);
+  assert.match(contract, /serviceCursorAck\.servicedAt/);
+  assert.match(contract, /owner-clock attestation/);
+  assert.match(contract, /canonical millisecond UTC/);
+  assert.equal(
+    ackTemplate.receipt.deliveredAt,
+    "2026-08-31T10:00:05.000000+00:00"
+  );
 });
 
 test("metadata containing forbidden-pattern words loads while free-text slots stay screened", () => {

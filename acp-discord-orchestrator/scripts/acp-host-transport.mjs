@@ -16,7 +16,10 @@ import {
   CLAUDE_INJECTION_ENV,
   CLAUDE_OAUTH_TOKEN_ENV,
   SCHEMA_VERSION as ACP_FOREGROUND_SCHEMA_VERSION,
-  loadSupervisorConfig
+  loadSupervisorConfig,
+  modelReportingIdentity,
+  parseDeliveredAt,
+  REMOTE_PROVIDER_CLOCK_SKEW_MS
 } from "./acpx-foreground-supervisor.mjs";
 import {
   ACP_SUPPORTED_AGENTS,
@@ -616,7 +619,15 @@ export function prepareHostTransport(input, dependencies = {}) {
     createdAt: new Date(nowValue(dependencies)).toISOString(),
     reportingContext: {
       agent: config.agent,
-      model: config.model ?? "runtime-default",
+      // Bind acknowledgements to the same deterministic public identity that
+      // config/reporting validation and the supervisor's started event use.
+      // The base Codex model remains separate in the supervisor config and is
+      // never replaced by this display-only composite value.
+      model: modelReportingIdentity(
+        config.agent,
+        config.model,
+        config.reasoningEffort
+      ),
       roundIndex: config.reporting.roundIndex,
       repository: config.reporting.repository,
       branch: config.reporting.branch,
@@ -990,17 +1001,22 @@ export function acknowledgeHostTransportReport(input, dependencies = {}) {
     !REPORT_DELIVERY_SUCCESS_STATUSES.includes(receipt.deliveryStatus) ||
     receipt.conversationId !== loaded.record.reportingContext.controlConversationId ||
     typeof receipt.messageId !== "string" || !DECIMAL_ID.test(receipt.messageId) ||
-    receipt.messageDigest !== canonicalDigest ||
-    !validInstant(receipt.deliveredAt)) {
+    receipt.messageDigest !== canonicalDigest) {
     transportFail("host_transport_report_receipt_invalid");
   }
   const nowMs = nowValue(dependencies);
-  const deliveredAt = Date.parse(receipt.deliveredAt);
+  // Reuse the supervisor's bounded wire parser. Report delivery comes from a
+  // remote provider clock, unlike canonical owner-clock transport timestamps.
+  const deliveredAt = parseDeliveredAt(
+    receipt.deliveredAt,
+    "host_transport_report_receipt_invalid"
+  );
   if (publication.acknowledgedMessageIds.includes(receipt.messageId)) {
     transportFail("host_transport_report_receipt_duplicate");
   }
   if (
-    deliveredAt < Date.parse(publication.requiredAt) || deliveredAt > nowMs ||
+    deliveredAt < Date.parse(publication.requiredAt) - REMOTE_PROVIDER_CLOCK_SKEW_MS ||
+    deliveredAt > nowMs + REMOTE_PROVIDER_CLOCK_SKEW_MS ||
     nowMs - deliveredAt > MAX_REPORT_RECEIPT_AGE_MS
   ) {
     transportFail("host_transport_report_receipt_stale");
