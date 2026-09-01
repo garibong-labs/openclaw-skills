@@ -58,7 +58,7 @@ function publicationFixture(overrides = {}) {
 function reportingContextFixture() {
   return {
     agent: "codex",
-    model: "test-model",
+    model: "test-model[medium]",
     roundIndex: 1,
     repository: "openclaw-skills",
     branch: "fix/acp-report-publication-state-machine",
@@ -186,6 +186,7 @@ export function createAcpRuntime() {
   return {
     async probeAvailability() {},
     async ensureSession() { return { sessionId: "mock" }; },
+    async setConfigOption() {},
     startTurn(input) {
       return {
         requestId: input.requestId,
@@ -207,6 +208,7 @@ export function createAcpRuntime() {
   fs.writeFileSync(configFile, JSON.stringify({
     agent: "codex",
     model: "test-model",
+    reasoningEffort: "medium",
     cwd: root,
     sessionKey: "host-transport-test",
     promptFile,
@@ -228,7 +230,7 @@ export function createAcpRuntime() {
       controlConversationId: CONTROL_CONVERSATION_ID,
       messageId: START_MESSAGE_ID,
       deliveredAt,
-      model: "test-model"
+      model: "test-model[medium]"
     }),
     allowKinds: ["read"],
     runtimeModule: runtimeFile

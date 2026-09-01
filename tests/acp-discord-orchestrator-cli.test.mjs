@@ -17,7 +17,7 @@ const START_MESSAGE_ID = "100000000000000002";
 // Deterministic codex acp-reporting-v2 bundle from the shared integration
 // fixture, bound to this test's lifecycle receipt so the config passes the
 // mandatory reporting gate and reaches turn execution.
-function validReporting(deliveredAt, model = "test-model") {
+function validReporting(deliveredAt, model = "test-model[medium]") {
   return buildValidReporting({
     agent: "codex",
     controlConversationId: CONTROL_CONVERSATION_ID,
@@ -47,6 +47,7 @@ export function createAcpRuntime() {
   setInterval(() => {}, 1000);
   return {
     async ensureSession() { return { sessionId: "mock" }; },
+    async setConfigOption() {},
     startTurn(input) {
       return {
         requestId: input.requestId,
@@ -65,6 +66,7 @@ export function createAcpRuntime() {
   fs.writeFileSync(configFile, JSON.stringify({
     agent: "codex",
     model: "test-model",
+    reasoningEffort: "medium",
     cwd: root,
     sessionKey: "cli-exit-test",
     promptFile,
