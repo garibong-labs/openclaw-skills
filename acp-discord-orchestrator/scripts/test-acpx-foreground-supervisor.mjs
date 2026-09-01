@@ -43,6 +43,7 @@ import {
   loadSupervisorConfig,
   main,
   normalizeRuntimeEvent,
+  parseDeliveredAt,
   parseHostActivationLine,
   reconcileLifecycleLedger,
   resolveConfiguredModel,
@@ -1779,6 +1780,35 @@ test("start-receipt config shape fails closed with exact codes", () => {
   );
 });
 
+test("shared deliveredAt parser preserves the bounded remote receipt wire contract", () => {
+  const code = "invalid_delivered_at";
+  for (const value of [
+    "2026-08-22T07:47:48Z",
+    "2026-08-22T07:47:48.530000+00:00",
+    "2026-08-22T16:47:48.530000+09:00"
+  ]) {
+    assert.equal(parseDeliveredAt(value, code), Date.parse(value), value);
+  }
+  for (const value of [
+    "2026-08-22T07:47:48",
+    "2026-08-22T07:47:48.5300001+00:00",
+    "2026-08-22T07:47:48+99:99",
+    "2026-02-29T07:47:48Z",
+    "2026-02-31T07:47:48Z",
+    "2026-08-22T07:47:48.530000+00:00x".padEnd(41, "x")
+  ]) {
+    assert.throws(
+      () => parseDeliveredAt(value, code),
+      { message: code, code },
+      value
+    );
+  }
+  assert.equal(
+    parseDeliveredAt("2024-02-29T07:47:48Z", code),
+    Date.parse("2024-02-29T07:47:48Z")
+  );
+});
+
 test("delivered-at accepts Discord's native instant within a bounded fraction", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-receipt-instant-"));
   const prompt = path.join(root, "prompt.txt");
@@ -2570,6 +2600,9 @@ test("public docs describe separate Codex model and reasoning config", () => {
   assert.match(skill, /anthropic\/claude-fable-5/);
   assert.match(contract, /claude-fable-5\[1m\]/);
   assert.match(contract, /sessionOptions\.model/);
+  assert.match(contract, /serviceCursorAck\.servicedAt/);
+  assert.match(contract, /owner-clock attestation/);
+  assert.match(contract, /canonical millisecond UTC/);
   assert.equal(
     ackTemplate.receipt.deliveredAt,
     "2026-08-31T10:00:05.000000+00:00"

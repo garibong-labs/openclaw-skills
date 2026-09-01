@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+  MAX_REPORT_RECEIPT_AGE_MS,
   REPORT_CADENCE_MS,
   acknowledgeHostTransportReport,
   activateHostTransport,
@@ -18,6 +19,7 @@ import {
   reconcileHostTransport,
   statusHostTransport
 } from "./acp-host-transport.mjs";
+import { REMOTE_PROVIDER_CLOCK_SKEW_MS } from "./acpx-foreground-supervisor.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 import {
   buildAcpIntermediateReport,
@@ -326,6 +328,39 @@ test("prepare binds Codex report acknowledgements to the composed public model i
   );
 });
 
+test("prepare fails closed when an injected Codex config omits or invalidly supplies reporting identity selections", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-transport-injected-config-"));
+  const configFile = path.join(root, "run.json");
+  fs.writeFileSync(configFile, "{}\n", { mode: 0o600 });
+  const shared = {
+    agent: "codex",
+    stateDir: root,
+    reporting: {
+      roundIndex: 1,
+      repository: "openclaw-skills",
+      branch: "fix/acp-codex-reasoning-smoke"
+    },
+    lifecycle: { controlConversationId: CONTROL_CONVERSATION_ID }
+  };
+  const cases = [
+    ["missing model", { model: undefined, reasoningEffort: "medium" }, "invalid_model"],
+    ["invalid model", { model: "not a model", reasoningEffort: "medium" }, "invalid_model"],
+    ["missing reasoning", { model: "test-model", reasoningEffort: undefined }, "invalid_reasoning_effort"],
+    ["invalid reasoning", { model: "test-model", reasoningEffort: "not an effort" }, "invalid_reasoning_effort"]
+  ];
+  for (const [name, selections, expected] of cases) {
+    assert.throws(() => prepareHostTransport({ configFile }, {
+      loadConfig() {
+        return { ...shared, ...selections };
+      },
+      runTmux(args) {
+        assert.deepEqual(args, ["-V"]);
+        return { status: 0, stdout: "tmux 3.5a\n", stderr: "" };
+      }
+    }), { message: expected, code: expected }, name);
+  }
+});
+
 test("host transport CLI accepts only the closed private input shape", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-host-transport-cli-"));
   const inputFile = path.join(root, "input.json");
@@ -507,7 +542,7 @@ test("report receipt validation stays blocked until exact destination delivery i
   assert.throws(() => acknowledgeHostTransportReport({ ...base, receipt: { ...validReceipt, conversationId: "999888777666555444" } }, { nowMs: dueAt }), /host_transport_report_receipt_invalid/);
   assert.throws(() => acknowledgeHostTransportReport({ ...base, receipt: { ...validReceipt, deliveredAt: "1970-01-01T00:10:00.0000001+00:00" } }, { nowMs: dueAt }), /host_transport_report_receipt_invalid/);
   assert.throws(() => acknowledgeHostTransportReport({ ...base, receipt: { ...validReceipt, deliveredAt: "1970-01-01T00:10:00.000000" } }, { nowMs: dueAt }), /host_transport_report_receipt_invalid/);
-  assert.throws(() => acknowledgeHostTransportReport({ ...base, receipt: { ...validReceipt, deliveredAt: new Date(dueAt - 1).toISOString() } }, { nowMs: dueAt }), /host_transport_report_receipt_stale/);
+  assert.throws(() => acknowledgeHostTransportReport({ ...base, receipt: { ...validReceipt, deliveredAt: new Date(dueAt - REMOTE_PROVIDER_CLOCK_SKEW_MS - 1).toISOString() } }, { nowMs: dueAt }), /host_transport_report_receipt_stale/);
   const acked = acknowledgeHostTransportReport({ ...base, receipt: validReceipt }, { nowMs: dueAt });
   assert.deepEqual(acked, {
     schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
@@ -549,6 +584,66 @@ test("report receipt validation stays blocked until exact destination delivery i
     report,
     receipt: { ...validReceipt, deliveredAt: new Date(nextDue).toISOString() }
   }, { nowMs: nextDue }), /host_transport_report_receipt_duplicate/);
+});
+
+test("report receipt freshness permits only bounded symmetric remote provider clock skew", () => {
+  const dueAt = REPORT_CADENCE_MS;
+  const receiptFor = (label, deliveredAt, nowMs = dueAt) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `acp-receipt-skew-${label}-`));
+    const fixture = writeStaticTransport({
+      root,
+      handle: `acp-receipt-skew-${label}`,
+      events: [event(1, "started", 0)],
+      publication: publicationFixture({ nextDueAt: new Date(dueAt).toISOString() })
+    });
+    const status = statusHostTransport(fixture, {
+      ...ACTIVE_TMUX,
+      nowMs: dueAt,
+      randomUUID: () => `receipt-${label}`
+    });
+    const report = canonicalReport("intermediate");
+    return {
+      input: {
+        ...fixture,
+        reportId: status.reportPublication.reportId,
+        reportKind: "intermediate",
+        cadence: 1,
+        report,
+        receipt: reportReceipt("intermediate", report, "100000000000000011", deliveredAt)
+      },
+      nowMs
+    };
+  };
+
+  assert.equal(REMOTE_PROVIDER_CLOCK_SKEW_MS, 1000);
+  for (const [label, offset] of [
+    ["behind-bound", -REMOTE_PROVIDER_CLOCK_SKEW_MS],
+    ["ahead-bound", REMOTE_PROVIDER_CLOCK_SKEW_MS]
+  ]) {
+    const { input, nowMs } = receiptFor(label, dueAt + offset);
+    assert.equal(
+      acknowledgeHostTransportReport(input, { nowMs }).type,
+      "host_transport_report_acknowledged",
+      label
+    );
+  }
+  for (const [label, offset] of [
+    ["behind-outside", -REMOTE_PROVIDER_CLOCK_SKEW_MS - 1],
+    ["ahead-outside", REMOTE_PROVIDER_CLOCK_SKEW_MS + 1]
+  ]) {
+    const { input, nowMs } = receiptFor(label, dueAt + offset);
+    assert.throws(
+      () => acknowledgeHostTransportReport(input, { nowMs }),
+      /host_transport_report_receipt_stale/,
+      label
+    );
+  }
+
+  const stale = receiptFor("five-minute-age", dueAt, dueAt + MAX_REPORT_RECEIPT_AGE_MS + 1);
+  assert.throws(
+    () => acknowledgeHostTransportReport(stale.input, { nowMs: stale.nowMs }),
+    /host_transport_report_receipt_stale/
+  );
 });
 
 test("private transport timestamps retain canonical millisecond UTC spelling", () => {
@@ -852,6 +947,13 @@ test("control service cursor prevents starvation and accepts only fresh exact-co
   assert.throws(() => statusHostTransport({
     ...fixture,
     serviceCursorAck: { ...serviceAck(first, 1001), conversationId: "999888777666555444" }
+  }, { ...ACTIVE_TMUX, nowMs: 1001 }), /host_transport_service_cursor_invalid/);
+  assert.throws(() => statusHostTransport({
+    ...fixture,
+    serviceCursorAck: {
+      ...serviceAck(first, 1001),
+      servicedAt: "1970-01-01T00:00:01.001000+00:00"
+    }
   }, { ...ACTIVE_TMUX, nowMs: 1001 }), /host_transport_service_cursor_invalid/);
   const second = statusHostTransport({
     ...fixture,
