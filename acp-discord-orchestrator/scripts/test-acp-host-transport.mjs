@@ -32,6 +32,10 @@ import {
   buildAcpTerminalReport
 } from "./acp-reporting-contract.mjs";
 import {
+  AcpReportControllerPreparationError,
+  runReportControllerPreparation
+} from "./acp-report-controller-preparation.mjs";
+import {
   activateLifecycleLedger,
   createLifecycleLedger,
   loadLifecycleLedger,
@@ -303,6 +307,125 @@ test("an uncertain activation write remains fenced against preactivation abort",
     /host_transport_preactivation_abort_denied/u);
 });
 
+test("an exact supervisor rejection after the activation write permits running preactivation cleanup", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-controller-rejected-running-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-controller-rejected-running",
+    events: [activationRequiredEvent()],
+    controllerLease: { phase: "prepared" },
+  });
+  const calls = [];
+  const dependencies = { runTmux(args) {
+    calls.push(args);
+    if (args[0] === "paste-buffer") {
+      fs.appendFileSync(fixture.record.eventsFile,
+        JSON.stringify(supervisorErrorEvent()) + "\n");
+    }
+    return { status: 0, stdout: "", stderr: "" };
+  } };
+
+  await assert.rejects(activateHostTransport(fixture, dependencies),
+    /host_transport_activation_rejected/u);
+  assert.equal(readRecord(fixture).controllerLease.phase, "activation_in_progress");
+  assert.equal(abortHostTransportPreactivation(fixture, dependencies).type,
+    "host_transport_preactivation_aborted");
+  assert.equal(abortHostTransportPreactivation(fixture, dependencies).type,
+    "host_transport_preactivation_aborted");
+  assert.equal(readRecord(fixture).controllerLease.phase, "preactivation_aborted");
+  assert.equal(calls.filter((args) => args[0] === "kill-session" &&
+    args[2] === `=${fixture.processHandle}`).length, 1);
+});
+
+test("unknown, malformed, and mixed activation evidence keeps an in-progress abort denied", () => {
+  const cases = [
+    ["unknown", [activationRequiredEvent(), event(2, "unknown_control")]],
+    ["activation-confirmed", [activationRequiredEvent(), event(2, "activation_confirmed"),
+      supervisorErrorEvent(3)]],
+    ["after-error", [activationRequiredEvent(), supervisorErrorEvent(), event(3, "started")]],
+    ["error-extra-field", [activationRequiredEvent(), supervisorErrorEvent(2, { detail: "private" })]],
+    ["out-of-order-time", [activationRequiredEvent(2000), supervisorErrorEvent(2, {}, 1000)]],
+  ];
+  for (const [name, events] of cases) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `acp-controller-mixed-${name}-`));
+    const fixture = writeStaticTransport({
+      root,
+      handle: `acp-controller-mixed-${name}`,
+      events,
+      controllerLease: { phase: "activation_in_progress" },
+    });
+    assert.throws(() => abortHostTransportPreactivation(fixture, ACTIVE_TMUX),
+      /host_transport_preactivation_abort_denied/u, name);
+    assert.equal(readRecord(fixture).controllerLease.phase, "activation_in_progress");
+  }
+});
+
+test("an exact supervisor rejection with its mapped preactivation exit can be aborted", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-controller-rejected-exit-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-controller-rejected-exit",
+    events: [activationRequiredEvent(), supervisorErrorEvent()],
+    exitCode: 22,
+    controllerLease: { phase: "activation_in_progress" },
+  });
+  assert.equal(abortHostTransportPreactivation(fixture, DEAD_TMUX).type,
+    "host_transport_preactivation_aborted");
+  assert.equal(readRecord(fixture).controllerLease.phase, "preactivation_aborted");
+
+  const wrongRoot = fs.mkdtempSync(path.join(os.tmpdir(), "acp-controller-rejected-wrong-exit-"));
+  const wrongExit = writeStaticTransport({
+    root: wrongRoot,
+    handle: "acp-controller-rejected-wrong-exit",
+    events: [activationRequiredEvent(), supervisorErrorEvent()],
+    exitCode: 64,
+    controllerLease: { phase: "activation_in_progress" },
+  });
+  assert.throws(() => abortHostTransportPreactivation(wrongExit, DEAD_TMUX),
+    /host_transport_preactivation_abort_denied/u);
+  assert.equal(readRecord(wrongExit).controllerLease.phase, "activation_in_progress");
+});
+
+test("coordinator rollback releases a registered lease after exact supervisor preactivation rejection", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-controller-coordinator-rollback-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-controller-coordinator-rollback",
+    events: [activationRequiredEvent(), supervisorErrorEvent()],
+    exitCode: 22,
+    controllerLease: { phase: "activation_in_progress" },
+  });
+  const calls = [];
+  await assert.rejects(runReportControllerPreparation({
+    roundIndex: 1,
+    destination: { channel: "discord", accountId: "account-example",
+      conversationId: CONTROL_CONVERSATION_ID },
+    reportPumpEntry: path.join(root, "acp-report-pump.mjs"),
+    hostTransportEntry: path.join(root, "acp-host-transport.mjs"),
+  }, {
+    randomBytes: () => Buffer.alloc(32, 0xab),
+    async createAutomation() { calls.push("create"); return { id: "coordinator-job" }; },
+    async bindReporting() { calls.push("bind"); return {}; },
+    async sendStartReceipt() { calls.push("start"); return {}; },
+    async assemble() { calls.push("assemble"); return {}; },
+    async prepare() { calls.push("prepare"); return fixture; },
+    async registerController() { calls.push("register"); return { status: "prepared" }; },
+    async activate() { calls.push("activate"); throw new Error("preactivation rejection"); },
+    async removeAutomation() { calls.push("remove"); return { removed: true }; },
+    async abortController() {
+      calls.push("abort");
+      const result = abortHostTransportPreactivation(fixture, DEAD_TMUX);
+      return { status: result.type === "host_transport_preactivation_aborted" ? "aborted" : "invalid" };
+    },
+    async commitController() { assert.fail("commit must not run"); },
+    async retainRecovery() { assert.fail("recovery must not run"); },
+  }), (error) => error instanceof AcpReportControllerPreparationError &&
+    error.code === "report_controller_preparation_failed");
+  assert.deepEqual(calls, ["create", "bind", "start", "assemble", "prepare", "register",
+    "activate", "remove", "abort"]);
+  assert.equal(readRecord(fixture).controllerLease.phase, "preactivation_aborted");
+});
+
 test("preactivation mapped launcher exit can be durably aborted without PID inference", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-controller-mapped-exit-"));
   const fixture = writeStaticTransport({
@@ -328,6 +451,19 @@ function event(sequence, type = "activity", timestampMs = sequence * 1000, extra
     elapsedMs: timestampMs,
     ...extra
   };
+}
+
+function activationRequiredEvent(timestampMs = 1000) {
+  return event(1, "activation_required", timestampMs, {
+    activationSchemaVersion: "acp-host-activation.v1",
+  });
+}
+
+function supervisorErrorEvent(sequence = 2, extra = {}, timestampMs = sequence * 1000) {
+  return event(sequence, "supervisor_error", timestampMs, {
+    code: "host_activation_rejected",
+    ...extra,
+  });
 }
 
 const ACTIVE_TMUX = { runTmux() { return { status: 0, stdout: "", stderr: "" }; } };

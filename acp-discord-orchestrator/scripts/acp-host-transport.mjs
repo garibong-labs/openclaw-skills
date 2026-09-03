@@ -999,6 +999,51 @@ function hasUnsafePreactivationEvidence(events) {
   return events.some((event) => !["activation_required", "launcher_error"].includes(event.type));
 }
 
+const NORMALIZED_EVENT_BASE_KEYS = Object.freeze([
+  "schemaVersion",
+  "runId",
+  "requestId",
+  "sequence",
+  "timestamp",
+  "elapsedMs",
+  "type"
+]);
+
+function isExactNormalizedEvent(event, type, payloadKeys) {
+  return exactKeys(event, [...NORMALIZED_EVENT_BASE_KEYS, ...payloadKeys]) &&
+    event.schemaVersion === ACP_FOREGROUND_SCHEMA_VERSION &&
+    event.type === type &&
+    typeof event.runId === "string" && SAFE_HANDLE.test(event.runId) &&
+    typeof event.requestId === "string" && SAFE_HANDLE.test(event.requestId) &&
+    Number.isSafeInteger(event.sequence) && event.sequence >= 1 &&
+    validInstant(event.timestamp) &&
+    Number.isSafeInteger(event.elapsedMs) && event.elapsedMs >= 0;
+}
+
+// `activation_in_progress` normally means that the activation line may have
+// reached the PTY and therefore cannot be rolled back. The sole safe
+// exception is the supervisor's closed, canonical rejection sequence: its
+// first event requests activation and its second (and final) event rejects it
+// before activation confirmation or any ACP mutation/activity evidence.
+// Exact keys keep arbitrary event payloads and message-text classifications
+// out of this proof boundary.
+function hasExactPreactivationSupervisorRejection(events) {
+  if (events.length !== 2) return false;
+  const [required, rejected] = events;
+  if (!isExactNormalizedEvent(required, "activation_required", ["activationSchemaVersion"]) ||
+      required.activationSchemaVersion !== ACP_HOST_ACTIVATION_SCHEMA_VERSION ||
+      required.sequence !== 1 ||
+      !isExactNormalizedEvent(rejected, "supervisor_error", ["code"]) ||
+      typeof rejected.code !== "string" || !SAFE_EVENT_TYPE.test(rejected.code) ||
+      rejected.sequence !== 2) {
+    return false;
+  }
+  return rejected.runId === required.runId &&
+    rejected.requestId === required.requestId &&
+    Date.parse(rejected.timestamp) >= Date.parse(required.timestamp) &&
+    rejected.elapsedMs >= required.elapsedMs;
+}
+
 // Plugin-facing preactivation rollback. The record lease serializes this
 // decision with activate-begin. No process id is accepted or inferred: only
 // the exact tmux session handle created by prepare may be stopped.
@@ -1011,11 +1056,15 @@ export function abortHostTransportPreactivation(input, dependencies = {}) {
     if (loaded.record.controllerLease.phase === "preactivation_aborted") {
       return controllerLeaseResult("host_transport_preactivation_aborted", handle);
     }
-    if (loaded.record.controllerLease.phase !== "prepared") {
+    const phase = loaded.record.controllerLease.phase;
+    if (!["prepared", "activation_in_progress"].includes(phase)) {
       transportFail("host_transport_preactivation_abort_denied");
     }
     const events = parseEvents(loaded.record.eventsFile);
-    if (hasUnsafePreactivationEvidence(events)) {
+    const rejectedBeforeActivation = phase === "activation_in_progress" &&
+      hasExactPreactivationSupervisorRejection(events);
+    if ((phase === "activation_in_progress" && !rejectedBeforeActivation) ||
+        (phase === "prepared" && hasUnsafePreactivationEvidence(events))) {
       transportFail("host_transport_preactivation_abort_denied");
     }
     const runTmux = dependencies.runTmux ?? runTmuxDefault;
@@ -1027,7 +1076,8 @@ export function abortHostTransportPreactivation(input, dependencies = {}) {
       }
     } else {
       const exitCode = exitCodeFromFile(loaded.record.exitFile);
-      if (![22, 64].includes(exitCode) || events.length === 0) {
+      const mappedExit = rejectedBeforeActivation ? exitCode === 22 : [22, 64].includes(exitCode);
+      if (!mappedExit || events.length === 0) {
         transportFail("host_transport_preactivation_abort_denied");
       }
     }
