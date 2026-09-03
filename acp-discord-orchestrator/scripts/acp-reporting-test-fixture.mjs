@@ -178,8 +178,9 @@ export function buildValidReporting({
   }
   if (schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V3) {
     // The v3 bundle attests the ENABLED report-pump automation instead of the
-    // disabled static-snapshot watchdog and carries no report payload at all:
-    // report content is machine-derived per claim at the host transport.
+    // disabled static-snapshot watchdog and carries only the non-secret
+    // deterministic script-template attestation: report content is
+    // machine-derived per claim at the host transport.
     return {
       schemaVersion,
       agent,
@@ -202,11 +203,15 @@ export function buildValidReporting({
         enabled: true,
         sessionTarget: "isolated",
         schedule: { kind: "every", everyMs: 600000 },
-        delivery: {
-          mode: "announce",
-          channel: "discord",
-          to: `channel:${controlConversationId}`
+        payload: {
+          kind: "script",
+          scriptVersion: "acp-report-controller-script.v1",
+          scriptSha256: "8e48a6cbe8bdb1e6142331257a5763edfc41687e9081745aea074a27146187e7",
+          timeoutSeconds: 60,
+          toolBudget: 5,
+          toolsAllow: ["acp_report_controller", "message", "automations"]
         },
+        delivery: { mode: "none" },
         deleteAfterRun: false
       }
     };

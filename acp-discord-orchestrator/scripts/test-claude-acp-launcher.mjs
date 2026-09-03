@@ -693,17 +693,21 @@ test("substituted public template loads through the real supervisor loader", () 
   assert.equal(loaded.reporting.terminalDestination, CONTROL_CONVERSATION_ID);
   assert.equal(loaded.reporting.startReceipt.messageId, START_MESSAGE_ID);
   assert.equal(loaded.reporting.startReceipt.deliveredAt, deliveredAt);
-  // The v3 bundle attests the ENABLED report-pump automation and carries no
-  // static report payload: report content is machine-derived per claim.
+  // The v3 bundle attests the enabled deterministic script structure without
+  // carrying the substituted script, lease token, or a static report.
   assert.equal(loaded.reporting.reportPump.enabled, true);
   assert.equal(loaded.reporting.reportPump.sessionTarget, "isolated");
   assert.deepEqual(loaded.reporting.reportPump.schedule, { kind: "every", everyMs: 600000 });
-  assert.equal("payload" in loaded.reporting.reportPump, false);
+  assert.deepEqual(loaded.reporting.reportPump.payload, {
+    kind: "script",
+    scriptVersion: "acp-report-controller-script.v1",
+    scriptSha256: "8e48a6cbe8bdb1e6142331257a5763edfc41687e9081745aea074a27146187e7",
+    timeoutSeconds: 60,
+    toolBudget: 5,
+    toolsAllow: ["acp_report_controller", "message", "automations"]
+  });
   assert.equal("watchdog" in loaded.reporting, false);
-  assert.equal(
-    loaded.reporting.reportPump.delivery.to,
-    "channel:" + CONTROL_CONVERSATION_ID
-  );
+  assert.deepEqual(loaded.reporting.reportPump.delivery, { mode: "none" });
 });
 
 test("launcher rejects a non-canonical claude spelling as invalid config", POSIX_ONLY, async () => {

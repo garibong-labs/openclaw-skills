@@ -45,10 +45,20 @@
         "kind": "every",
         "everyMs": 600000
       },
+      "payload": {
+        "kind": "script",
+        "scriptVersion": "acp-report-controller-script.v1",
+        "scriptSha256": "8e48a6cbe8bdb1e6142331257a5763edfc41687e9081745aea074a27146187e7",
+        "timeoutSeconds": 60,
+        "toolBudget": 5,
+        "toolsAllow": [
+          "acp_report_controller",
+          "message",
+          "automations"
+        ]
+      },
       "delivery": {
-        "mode": "announce",
-        "channel": "discord",
-        "to": "channel:CONTROL_CONVERSATION_ID"
+        "mode": "none"
       },
       "deleteAfterRun": false
     }

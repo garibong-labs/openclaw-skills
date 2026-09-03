@@ -1,6 +1,6 @@
 /**
- * ACP reporting contract (acp-reporting-v2, with a bounded acp-reporting-v1
- * compatibility path for the canonical Claude agent).
+ * ACP reporting contract (current acp-reporting-v3, with bounded v2 and v1
+ * compatibility paths).
  *
  * Pure, deterministic, dependency-free validation of the reporting bundle an
  * ACP turn must register before doing any work: the public round-start
@@ -39,6 +39,20 @@ const MAX_MODEL_LENGTH = 256;
 const MAX_DELIVERED_AT_LENGTH = 40;
 const WATCHDOG_EVERY_MS = 600000;
 const MAX_WATCHDOG_TIMEOUT_SECONDS = 60;
+
+// Non-secret structural identity of the deterministic OpenClaw 2026.8.1
+// controller job. The digest is over the exact public script template with
+// its literal LEASE_TOKEN placeholder, never over a token-substituted job.
+// The actual lease token exists only in the privately created scheduler job.
+export const ACP_REPORT_CONTROLLER_SCRIPT_VERSION = 'acp-report-controller-script.v1';
+export const ACP_REPORT_CONTROLLER_SCRIPT_SHA256 = '8e48a6cbe8bdb1e6142331257a5763edfc41687e9081745aea074a27146187e7';
+export const ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS = 60;
+export const ACP_REPORT_CONTROLLER_TOOL_BUDGET = 5;
+export const ACP_REPORT_CONTROLLER_TOOLS_ALLOW = Object.freeze([
+  'acp_report_controller',
+  'message',
+  'automations',
+]);
 
 export const ACP_REPORTING_SCHEMA_VERSION_V1 = 'acp-reporting-v1';
 export const ACP_REPORTING_SCHEMA_VERSION_V2 = 'acp-reporting-v2';
@@ -129,6 +143,7 @@ export const ACP_REPORTING_ERROR_CODES = Object.freeze([
   'invalid_reporting_report_pump_round',
   'invalid_reporting_report_pump_schedule',
   'invalid_reporting_report_pump_delivery',
+  'invalid_reporting_report_pump_payload',
   'invalid_reporting_report',
   'invalid_reporting_forbidden_content',
 ]);
@@ -1027,10 +1042,10 @@ function validateWatchdog(watchdog, expected) {
 // validated variable part ({ id }) captured at validation time. The pump
 // supersedes the v1/v2 disabled-snapshot watchdog: it is one ENABLED
 // 600-second automation bound to the round and the control conversation, and
-// it deliberately attests no payload message — the public report content is
-// machine-derived per claim from current normalized evidence at the host
-// transport's closed claim-report action, so no static public report snapshot
-// exists in the config to be replayed as the reporting source. The attested
+// it attests only the non-secret structural identity of the deterministic
+// script payload — never its token-substituted script or a static report. The
+// public report content is machine-derived per claim from current normalized
+// evidence at the host transport's closed claim-report action. The attested
 // `id` is the exact scheduler job identity the pump must present to
 // claim-report; the transport binds it at prepare time and rejects any other
 // job.
@@ -1040,7 +1055,7 @@ function validateReportPump(reportPump, expected) {
   }
   assertExactKeys(
     reportPump,
-    ['id', 'roundIndex', 'enabled', 'sessionTarget', 'schedule', 'delivery', 'deleteAfterRun'],
+    ['id', 'roundIndex', 'enabled', 'sessionTarget', 'schedule', 'payload', 'delivery', 'deleteAfterRun'],
     'invalid_reporting_report_pump',
     'reportPump'
   );
@@ -1077,13 +1092,32 @@ function validateReportPump(reportPump, expected) {
   if (!isPlainObject(delivery)) {
     fail('invalid_reporting_report_pump_delivery', 'reportPump.delivery must be a plain object');
   }
-  assertExactKeys(delivery, ['mode', 'channel', 'to'], 'invalid_reporting_report_pump_delivery', 'reportPump.delivery');
+  assertExactKeys(delivery, ['mode'], 'invalid_reporting_report_pump_delivery', 'reportPump.delivery');
+  if (delivery.mode !== 'none') {
+    fail('invalid_reporting_report_pump_delivery', 'reportPump.delivery.mode must be exactly "none"');
+  }
+  const { payload } = reportPump;
+  if (!isPlainObject(payload)) {
+    fail('invalid_reporting_report_pump_payload', 'reportPump.payload must be a plain object');
+  }
+  assertExactKeys(
+    payload,
+    ['kind', 'scriptVersion', 'scriptSha256', 'timeoutSeconds', 'toolBudget', 'toolsAllow'],
+    'invalid_reporting_report_pump_payload',
+    'reportPump.payload'
+  );
+  const { kind, scriptVersion, scriptSha256, timeoutSeconds, toolBudget, toolsAllow } = payload;
   if (
-    delivery.mode !== 'announce' ||
-    delivery.channel !== 'discord' ||
-    delivery.to !== `channel:${expected.controlConversationId}`
+    kind !== 'script' ||
+    scriptVersion !== ACP_REPORT_CONTROLLER_SCRIPT_VERSION ||
+    scriptSha256 !== ACP_REPORT_CONTROLLER_SCRIPT_SHA256 ||
+    timeoutSeconds !== ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS ||
+    toolBudget !== ACP_REPORT_CONTROLLER_TOOL_BUDGET ||
+    !Array.isArray(toolsAllow) ||
+    toolsAllow.length !== ACP_REPORT_CONTROLLER_TOOLS_ALLOW.length ||
+    toolsAllow.some((tool, index) => tool !== ACP_REPORT_CONTROLLER_TOOLS_ALLOW[index])
   ) {
-    fail('invalid_reporting_report_pump_delivery', 'reportPump.delivery must announce on Discord to the control conversation channel');
+    fail('invalid_reporting_report_pump_payload', 'reportPump.payload must match the deterministic controller script attestation');
   }
   return { id };
 }
@@ -1119,7 +1153,8 @@ const TOP_LEVEL_KEYS_V2 = Object.freeze(['agent', ...TOP_LEVEL_KEYS_V1]);
 // acp-reporting-v3 supersedes the disabled-snapshot watchdog with the enabled
 // report-pump attestation: `watchdog` and `watchdogDestination` are replaced
 // by `reportPump` and `pumpDestination`. Everything else is the v2 shape,
-// agent attestation included. v3 carries no static report payload at all.
+// agent attestation included. v3 carries only a non-secret script-template
+// attestation and no lease token, executable script, or static report.
 const TOP_LEVEL_KEYS_V3 = Object.freeze([
   'agent',
   'schemaVersion',
@@ -1139,8 +1174,8 @@ const TOP_LEVEL_KEYS_V3 = Object.freeze([
  *
  * The current schema is acp-reporting-v3, whose enabled `reportPump`
  * attestation supersedes the v1/v2 disabled-snapshot `watchdog`: the pump
- * carries no static report payload, because report content is machine-derived
- * per claim at the host transport. acp-reporting-v2 remains accepted for
+ * carries no static report payload or lease token, because report content is
+ * machine-derived per claim at the host transport. acp-reporting-v2 remains accepted for
  * already-prepared configs, and the legacy acp-reporting-v1 shape is accepted
  * only when the bound canonical agent is `claude`, as a bounded migration
  * path; every v2/v3 bundle's top-level `agent` must equal the canonical
@@ -1260,7 +1295,15 @@ export function validateAcpReportingContract(reporting, context) {
         enabled: true,
         sessionTarget: 'isolated',
         schedule: { kind: 'every', everyMs: WATCHDOG_EVERY_MS },
-        delivery: { mode: 'announce', channel: 'discord', to: `channel:${ctx.controlConversationId}` },
+        payload: {
+          kind: 'script',
+          scriptVersion: ACP_REPORT_CONTROLLER_SCRIPT_VERSION,
+          scriptSha256: ACP_REPORT_CONTROLLER_SCRIPT_SHA256,
+          timeoutSeconds: ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS,
+          toolBudget: ACP_REPORT_CONTROLLER_TOOL_BUDGET,
+          toolsAllow: [...ACP_REPORT_CONTROLLER_TOOLS_ALLOW],
+        },
+        delivery: { mode: 'none' },
         deleteAfterRun: false,
       },
     });

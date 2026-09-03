@@ -1,0 +1,15 @@
+{
+  "action": "register",
+  "leaseToken": "PRIVATE_OPAQUE_LEASE_TOKEN",
+  "transportFile": "/absolute/private/path/to/transport.json",
+  "processHandle": "EXACT_PREPARED_PROCESS_HANDLE",
+  "jobId": "EXACT_CREATED_AUTOMATION_JOB_ID",
+  "destination": {
+    "channel": "discord",
+    "accountId": "EXACT_DISCORD_ACCOUNT_ID",
+    "conversationId": "EXACT_DECIMAL_DISCORD_DESTINATION"
+  },
+  "reportPumpEntry": "/absolute/path/to/acp-discord-orchestrator/scripts/acp-report-pump.mjs",
+  "hostTransportEntry": "/absolute/path/to/acp-discord-orchestrator/scripts/acp-host-transport.mjs",
+  "snapshotFile": "/optional/absolute/private/path/to/report-pump-snapshot.json"
+}

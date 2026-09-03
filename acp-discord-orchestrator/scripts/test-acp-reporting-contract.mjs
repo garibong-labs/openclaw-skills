@@ -1537,11 +1537,15 @@ function buildReportingV3({
       enabled: true,
       sessionTarget: 'isolated',
       schedule: { kind: 'every', everyMs: 600000 },
-      delivery: {
-        mode: 'announce',
-        channel: 'discord',
-        to: `channel:${CONTEXT.controlConversationId}`,
+      payload: {
+        kind: 'script',
+        scriptVersion: 'acp-report-controller-script.v1',
+        scriptSha256: '8e48a6cbe8bdb1e6142331257a5763edfc41687e9081745aea074a27146187e7',
+        timeoutSeconds: 60,
+        toolBudget: 5,
+        toolsAllow: ['acp_report_controller', 'message', 'automations'],
       },
+      delivery: { mode: 'none' },
       deleteAfterRun: false,
       ...pump,
     },
@@ -1575,7 +1579,7 @@ test('acp-reporting-v3 requires the agent attestation to equal the canonical con
   expectRejected(missing, 'invalid_reporting_agent');
 });
 
-test('acp-reporting-v3 rejects a disabled, mis-scheduled, mis-routed, or mis-bound pump', () => {
+test('acp-reporting-v3 rejects a disabled, mis-scheduled, fallback-delivered, or mis-bound pump', () => {
   expectRejected(buildReportingV3({ pump: { enabled: false } }), 'invalid_reporting_report_pump');
   expectRejected(buildReportingV3({ pump: { sessionTarget: 'main' } }), 'invalid_reporting_report_pump');
   expectRejected(buildReportingV3({ pump: { deleteAfterRun: true } }), 'invalid_reporting_report_pump');
@@ -1594,13 +1598,31 @@ test('acp-reporting-v3 rejects a disabled, mis-scheduled, mis-routed, or mis-bou
   );
 });
 
-test('acp-reporting-v3 carries no static report payload and no watchdog keys', () => {
-  // A payload smuggled into the pump attestation is an unknown key: report
-  // content is machine-derived per claim, never replayed from the config.
-  expectRejected(
-    buildReportingV3({ pump: { payload: { kind: 'agentTurn', toolsAllow: [], timeoutSeconds: 45, message: 'static' } } }),
-    'invalid_reporting_report_pump'
-  );
+test('acp-reporting-v3 binds the exact script structure and carries no executable script, token, or static report', () => {
+  const valid = buildReportingV3();
+  const serialized = JSON.stringify(valid);
+  assert.equal(serialized.includes('LEASE_TOKEN'), false);
+  assert.equal(serialized.includes('leaseToken'), false);
+  assert.equal(serialized.includes('"script":'), false);
+  assert.equal(serialized.includes('static'), false);
+  assert.deepEqual(valid.reportPump.delivery, { mode: 'none' });
+
+  for (const payload of [
+    { ...valid.reportPump.payload, kind: 'agentTurn' },
+    { ...valid.reportPump.payload, scriptVersion: 'acp-report-controller-script.v0' },
+    { ...valid.reportPump.payload, scriptSha256: '0'.repeat(64) },
+    { ...valid.reportPump.payload, timeoutSeconds: 59 },
+    { ...valid.reportPump.payload, toolBudget: 4 },
+    { ...valid.reportPump.payload, toolsAllow: ['message', 'acp_report_controller', 'automations'] },
+    { ...valid.reportPump.payload, toolsAllow: [...valid.reportPump.payload.toolsAllow, 'exec'] },
+    { ...valid.reportPump.payload, message: 'static report' },
+    { ...valid.reportPump.payload, script: 'const leaseToken = "secret";' },
+  ]) {
+    expectRejected(
+      buildReportingV3({ pump: { payload } }),
+      'invalid_reporting_report_pump_payload'
+    );
+  }
   const withWatchdog = buildReportingV3();
   withWatchdog.watchdog = buildReporting().watchdog;
   expectRejected(withWatchdog, 'invalid_reporting_unknown_key');
@@ -1611,5 +1633,9 @@ test('acp-reporting-v3 carries no static report payload and no watchdog keys', (
   assert.equal(
     validateAcpReportingContract(buildReporting(), CONTEXT).schemaVersion,
     'acp-reporting-v2'
+  );
+  assert.equal(
+    validateAcpReportingContract(buildReporting({ schemaVersion: 'acp-reporting-v1' }), CONTEXT).schemaVersion,
+    'acp-reporting-v1'
   );
 });

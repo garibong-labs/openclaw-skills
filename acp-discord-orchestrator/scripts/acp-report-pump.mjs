@@ -1,14 +1,13 @@
-// Skill-side automation report pump. One enabled every-600000-ms OpenClaw
-// automation per exact ACP handle runs this entry point; each run claims a
+// Skill-side report pump imported in-process by the durable controller plugin.
+// One enabled every-600000-ms OpenClaw script automation per exact ACP handle
+// invokes the controller; each controller tick calls this entry point to claim a
 // fresh report obligation from the host transport's closed `claim-report`
 // action, derives the canonical public message from that live claim (never
 // from a static public report snapshot), marks the fenced attempt
 // `delivery_pending`, and hands the bounded result to the delivery layer.
-// The pump has no chat credentials and performs no delivery itself: the
-// automation turn sends the returned message to the exact control
-// conversation and then closes the attempt with the transport's `ack-report`
-// action, presenting the same attempt/fencing identity plus the digest-bound
-// Discord receipt.
+// The pump has no chat credentials and performs no delivery itself. The
+// controller script sends the returned message, and the plugin's message_sent
+// hook closes the attempt with the digest-bound Discord receipt.
 //
 // Terminal acknowledgement is the deterministic self-cleanup boundary: a
 // claim returning `terminal_acked` means publication is complete and the
