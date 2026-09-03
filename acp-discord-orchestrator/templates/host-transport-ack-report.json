@@ -1,11 +1,13 @@
 {
-  "schemaVersion": "acp-host-transport.v1",
+  "schemaVersion": "acp-host-transport.v2",
   "action": "ack-report",
   "transportFile": "/absolute/private/transport.json",
   "processHandle": "EXACT_HOST_HANDLE",
   "reportId": "EXACT_REPORT_ID",
   "reportKind": "terminal",
   "cadence": 0,
+  "attemptId": "EXACT_ATTEMPT_ID",
+  "fence": 1,
   "report": {
     "agent": "codex",
     "model": "MODEL_ID",

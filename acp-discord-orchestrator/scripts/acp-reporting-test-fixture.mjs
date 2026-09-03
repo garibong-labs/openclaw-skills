@@ -12,6 +12,7 @@
 import {
   ACP_AGENT_PRESENTATIONS,
   ACP_REPORTING_SCHEMA_VERSION_V2,
+  ACP_REPORTING_SCHEMA_VERSION_V3,
   ACP_REPORT_BEGIN_DELIMITER,
   ACP_REPORT_END_DELIMITER,
   ACP_REPORT_INSTRUCTION,
@@ -99,7 +100,8 @@ export function buildValidReporting({
   branch = FIXTURE_BRANCH,
   scopeBullet = "- 통합 픽스처 검증",
   sectionBullets = DEFAULT_SECTION_BULLETS,
-  issueBullet = null
+  issueBullet = null,
+  pumpId = `acp-report-pump-round-${roundIndex}`
 }) {
   // The valid path derives the start message through the production builder,
   // so integration fixtures exercise the same canonical preparation path as
@@ -173,6 +175,41 @@ export function buildValidReporting({
     });
   } else {
     report = reportLines.join("\n");
+  }
+  if (schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V3) {
+    // The v3 bundle attests the ENABLED report-pump automation instead of the
+    // disabled static-snapshot watchdog and carries no report payload at all:
+    // report content is machine-derived per claim at the host transport.
+    return {
+      schemaVersion,
+      agent,
+      roundIndex,
+      repository,
+      branch,
+      startMessage,
+      startDestination: controlConversationId,
+      pumpDestination: controlConversationId,
+      terminalDestination: controlConversationId,
+      startReceipt: {
+        conversationId: receiptConversationId,
+        messageId,
+        deliveredAt,
+        message: startMessage
+      },
+      reportPump: {
+        id: pumpId,
+        roundIndex,
+        enabled: true,
+        sessionTarget: "isolated",
+        schedule: { kind: "every", everyMs: 600000 },
+        delivery: {
+          mode: "announce",
+          channel: "discord",
+          to: `channel:${controlConversationId}`
+        },
+        deleteAfterRun: false
+      }
+    };
   }
   return {
     schemaVersion,

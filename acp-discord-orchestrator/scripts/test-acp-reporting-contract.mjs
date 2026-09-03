@@ -313,7 +313,7 @@ test('start receipt content and lifecycle mismatches are rejected', () => {
 });
 
 test('schemaVersion, roundIndex, repository, and branch are validated', () => {
-  for (const badVersion of ['acp-reporting-v3', 'acp-reporting', 'v2', 1, undefined]) {
+  for (const badVersion of ['acp-reporting-v4', 'acp-reporting', 'v2', 1, undefined]) {
     const reporting = buildReporting();
     reporting.schemaVersion = badVersion;
     expectRejected(reporting, 'invalid_reporting_schema_version');
@@ -1503,4 +1503,113 @@ test('report input reader distinguishes empty, oversized, unreadable, and invali
       },
     },
   }), /invalid_input_file_unreadable/);
+});
+
+// ---------------------------------------------------------------------------
+// acp-reporting-v3: the enabled report-pump attestation supersedes the
+// disabled-snapshot watchdog. v3 carries no static report payload at all.
+// ---------------------------------------------------------------------------
+
+function buildReportingV3({
+  roundIndex = 1,
+  agent = 'claude',
+  label = AGENT_LABELS[agent] ?? String(agent),
+  model = CONTEXT.model,
+  repository = REPO,
+  branch = BRANCH,
+  pump = {},
+} = {}) {
+  const startMessage = buildStartMessage({ roundIndex, label, model, repository, branch });
+  return {
+    schemaVersion: 'acp-reporting-v3',
+    agent,
+    roundIndex,
+    repository,
+    branch,
+    startMessage,
+    startDestination: CONTEXT.controlConversationId,
+    pumpDestination: CONTEXT.controlConversationId,
+    terminalDestination: CONTEXT.controlConversationId,
+    startReceipt: { ...CONTEXT.lifecycleStartReceipt, message: startMessage },
+    reportPump: {
+      id: `acp-report-pump-round-${roundIndex}`,
+      roundIndex,
+      enabled: true,
+      sessionTarget: 'isolated',
+      schedule: { kind: 'every', everyMs: 600000 },
+      delivery: {
+        mode: 'announce',
+        channel: 'discord',
+        to: `channel:${CONTEXT.controlConversationId}`,
+      },
+      deleteAfterRun: false,
+      ...pump,
+    },
+  };
+}
+
+test('valid acp-reporting-v3 bundle passes for claude and codex and normalizes the pump', () => {
+  const claude = buildReportingV3();
+  const normalized = validateAcpReportingContract(claude, CONTEXT);
+  assert.notEqual(normalized, claude);
+  assert.deepEqual(normalized, claude);
+  assert.ok(Object.isFrozen(normalized));
+  assert.ok(Object.isFrozen(normalized.reportPump));
+  assert.equal(normalized.reportPump.enabled, true);
+  assert.equal(normalized.pumpDestination, CONTEXT.controlConversationId);
+  assert.equal('watchdog' in normalized, false);
+  assert.equal('watchdogDestination' in normalized, false);
+
+  const codex = buildReportingV3({ agent: 'codex', model: CODEX_CONTEXT.model });
+  const codexNormalized = validateAcpReportingContract(codex, CODEX_CONTEXT);
+  assert.equal(codexNormalized.agent, 'codex');
+  assert.equal(codexNormalized.reportPump.schedule.everyMs, 600000);
+});
+
+test('acp-reporting-v3 requires the agent attestation to equal the canonical config agent', () => {
+  const spoofed = buildReportingV3();
+  spoofed.agent = 'codex';
+  expectRejected(spoofed, 'invalid_reporting_agent');
+  const missing = buildReportingV3();
+  delete missing.agent;
+  expectRejected(missing, 'invalid_reporting_agent');
+});
+
+test('acp-reporting-v3 rejects a disabled, mis-scheduled, mis-routed, or mis-bound pump', () => {
+  expectRejected(buildReportingV3({ pump: { enabled: false } }), 'invalid_reporting_report_pump');
+  expectRejected(buildReportingV3({ pump: { sessionTarget: 'main' } }), 'invalid_reporting_report_pump');
+  expectRejected(buildReportingV3({ pump: { deleteAfterRun: true } }), 'invalid_reporting_report_pump');
+  expectRejected(buildReportingV3({ pump: { id: 'has whitespace' } }), 'invalid_reporting_report_pump');
+  expectRejected(
+    buildReportingV3({ pump: { roundIndex: 2 } }),
+    'invalid_reporting_report_pump_round'
+  );
+  expectRejected(
+    buildReportingV3({ pump: { schedule: { kind: 'every', everyMs: 300000 } } }),
+    'invalid_reporting_report_pump_schedule'
+  );
+  expectRejected(
+    buildReportingV3({ pump: { delivery: { mode: 'announce', channel: 'discord', to: `channel:${OTHER_CHANNEL}` } } }),
+    'invalid_reporting_report_pump_delivery'
+  );
+});
+
+test('acp-reporting-v3 carries no static report payload and no watchdog keys', () => {
+  // A payload smuggled into the pump attestation is an unknown key: report
+  // content is machine-derived per claim, never replayed from the config.
+  expectRejected(
+    buildReportingV3({ pump: { payload: { kind: 'agentTurn', toolsAllow: [], timeoutSeconds: 45, message: 'static' } } }),
+    'invalid_reporting_report_pump'
+  );
+  const withWatchdog = buildReportingV3();
+  withWatchdog.watchdog = buildReporting().watchdog;
+  expectRejected(withWatchdog, 'invalid_reporting_unknown_key');
+  const withWatchdogDestination = buildReportingV3();
+  withWatchdogDestination.watchdogDestination = CONTEXT.controlConversationId;
+  expectRejected(withWatchdogDestination, 'invalid_reporting_unknown_key');
+  // The v2/v1 watchdog shapes remain accepted as the bounded migration path.
+  assert.equal(
+    validateAcpReportingContract(buildReporting(), CONTEXT).schemaVersion,
+    'acp-reporting-v2'
+  );
 });

@@ -529,10 +529,12 @@ test("public docs and template describe the canonical claude route", () => {
   assert.match(claudeProfile.auth.envFile, /^\/absolute\//);
 
   // Both public docs must describe the mandatory fail-closed reporting gate —
-  // the current v2 schema, its bounded v1 Claude migration path, and the
-  // closed agent presentation mapping — and the runtime contract must
-  // document every stable reporting error code the validator can produce.
+  // the current v3 report-pump schema, the accepted v2 shape, its bounded v1
+  // Claude migration path, and the closed agent presentation mapping — and
+  // the runtime contract must document every stable reporting error code the
+  // validator can produce.
   for (const doc of [skill, contract]) {
+    assert.match(doc, /acp-reporting-v3/);
     assert.match(doc, /acp-reporting-v2/);
     assert.match(doc, /acp-reporting-v1/);
     assert.match(doc, /invalid_reporting_/);
@@ -572,15 +574,16 @@ test("template substitution counts match the documented guidance", () => {
   // substring, so the two counts are independent of each other.
   assert.equal("AGENT_DISPLAY_NAME".includes("AGENT_NAME"), false);
   // AGENT_NAME: the config `agent` and the reporting bundle's `agent`
-  // attestation. AGENT_DISPLAY_NAME: the start message, its byte-identical
-  // receipt copy, and the watchdog report identity line.
+  // attestation. AGENT_DISPLAY_NAME: the start message and its byte-identical
+  // receipt copy — the v3 report-pump attestation carries no static report
+  // payload, so no third occurrence exists.
   assert.equal(templateText.split("AGENT_NAME").length - 1, 2);
-  assert.equal(templateText.split("AGENT_DISPLAY_NAME").length - 1, 3);
+  assert.equal(templateText.split("AGENT_DISPLAY_NAME").length - 1, 2);
 
   // The operator instructions state the exact occurrence counts, so a
   // template change that adds or removes a placeholder must update both.
   assert.match(skill, /`AGENT_NAME` appears exactly twice/);
-  assert.match(skill, /`AGENT_DISPLAY_NAME` appears exactly three times/);
+  assert.match(skill, /`AGENT_DISPLAY_NAME` appears exactly twice/);
 });
 
 test("substituted public template loads through the real supervisor loader", () => {
@@ -651,7 +654,7 @@ test("substituted public template loads through the real supervisor loader", () 
   const codex = loadSupervisorConfig(codexFile);
   assert.equal(codex.agent, "codex");
   assert.equal(codex.auth, undefined);
-  assert.equal(codex.reporting.schemaVersion, "acp-reporting-v2");
+  assert.equal(codex.reporting.schemaVersion, "acp-reporting-v3");
   assert.equal(codex.reporting.agent, "codex");
   assert.match(
     codex.reporting.startMessage,
@@ -678,7 +681,7 @@ test("substituted public template loads through the real supervisor loader", () 
   assert.equal(loaded.lifecycle.controlConversationId, CONTROL_CONVERSATION_ID);
   assert.equal(loaded.lifecycle.startReceipt.deliveredAt, deliveredAt);
   assert.equal(Object.isFrozen(loaded.reporting), true);
-  assert.equal(loaded.reporting.schemaVersion, "acp-reporting-v2");
+  assert.equal(loaded.reporting.schemaVersion, "acp-reporting-v3");
   assert.equal(loaded.reporting.agent, "claude");
   assert.equal(loaded.reporting.roundIndex, 1);
   assert.equal(loaded.reporting.repository, "openclaw-skills");
@@ -686,16 +689,19 @@ test("substituted public template loads through the real supervisor loader", () 
   assert.equal(loaded.reporting.startMessage.split("\n").length, 13);
   assert.match(loaded.reporting.startMessage, /🤖 \*\*ACP\*\*: Claude Code · `test-model`/);
   assert.equal(loaded.reporting.startDestination, CONTROL_CONVERSATION_ID);
-  assert.equal(loaded.reporting.watchdogDestination, CONTROL_CONVERSATION_ID);
+  assert.equal(loaded.reporting.pumpDestination, CONTROL_CONVERSATION_ID);
   assert.equal(loaded.reporting.terminalDestination, CONTROL_CONVERSATION_ID);
   assert.equal(loaded.reporting.startReceipt.messageId, START_MESSAGE_ID);
   assert.equal(loaded.reporting.startReceipt.deliveredAt, deliveredAt);
-  assert.equal(loaded.reporting.watchdog.enabled, false);
-  assert.equal(loaded.reporting.watchdog.sessionTarget, "isolated");
-  assert.deepEqual(loaded.reporting.watchdog.schedule, { kind: "every", everyMs: 600000 });
-  assert.deepEqual(loaded.reporting.watchdog.payload.toolsAllow, []);
+  // The v3 bundle attests the ENABLED report-pump automation and carries no
+  // static report payload: report content is machine-derived per claim.
+  assert.equal(loaded.reporting.reportPump.enabled, true);
+  assert.equal(loaded.reporting.reportPump.sessionTarget, "isolated");
+  assert.deepEqual(loaded.reporting.reportPump.schedule, { kind: "every", everyMs: 600000 });
+  assert.equal("payload" in loaded.reporting.reportPump, false);
+  assert.equal("watchdog" in loaded.reporting, false);
   assert.equal(
-    loaded.reporting.watchdog.delivery.to,
+    loaded.reporting.reportPump.delivery.to,
     "channel:" + CONTROL_CONVERSATION_ID
   );
 });

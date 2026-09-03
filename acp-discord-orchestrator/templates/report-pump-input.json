@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "acp-report-pump.v1",
+  "transportFile": "/absolute/private/transport.json",
+  "processHandle": "EXACT_HOST_HANDLE",
+  "jobId": "EXACT_REPORT_PUMP_JOB_ID",
+  "destination": "CONTROL_CONVERSATION_ID",
+  "snapshotFile": "/absolute/private/report-pump-snapshot.json"
+}

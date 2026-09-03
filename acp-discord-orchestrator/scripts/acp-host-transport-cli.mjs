@@ -6,7 +6,9 @@ import {
   ACP_HOST_TRANSPORT_SCHEMA_VERSION,
   acknowledgeHostTransportReport,
   activateHostTransport,
+  beginHostTransportReportDelivery,
   cancelHostTransport,
+  claimHostTransportReport,
   prepareHostTransport,
   probeHostTransport,
   reconcileHostTransport,
@@ -38,6 +40,8 @@ function exitCodeFor(code) {
     code === "host_transport_handle_invalid" ||
     code === "host_transport_handle_mismatch" ||
     code === "host_transport_cursor_invalid" ||
+    code === "host_transport_report_fencing_stale" ||
+    code.startsWith("host_transport_pump_") ||
     code.startsWith("host_transport_service_cursor_") ||
     code.startsWith("host_transport_report_ack_") ||
     code.startsWith("host_transport_report_receipt_")
@@ -116,6 +120,27 @@ async function dispatch(input) {
     ]);
     return statusHostTransport(input);
   }
+  if (input.action === "claim-report") {
+    assertExactKeys(input, [
+      ...base,
+      "transportFile",
+      "processHandle",
+      "jobId",
+      "runToken",
+      "destination"
+    ]);
+    return claimHostTransportReport(input);
+  }
+  if (input.action === "begin-delivery") {
+    assertExactKeys(input, [
+      ...base,
+      "transportFile",
+      "processHandle",
+      "attemptId",
+      "fence"
+    ]);
+    return beginHostTransportReportDelivery(input);
+  }
   if (input.action === "ack-report") {
     assertExactKeys(input, [
       ...base,
@@ -124,6 +149,8 @@ async function dispatch(input) {
       "reportId",
       "reportKind",
       "cadence",
+      "attemptId",
+      "fence",
       "report",
       "receipt"
     ]);
