@@ -206,7 +206,7 @@ export function buildValidReporting({
         payload: {
           kind: "script",
           scriptVersion: "acp-report-controller-script.v1",
-          scriptSha256: "8e48a6cbe8bdb1e6142331257a5763edfc41687e9081745aea074a27146187e7",
+          scriptSha256: "dad87e9f3b11f74d7a541c3b0c5ac0cdaca2ffd4fd49161ec2b4b333c4b6c65c",
           timeoutSeconds: 60,
           toolBudget: 5,
           toolsAllow: ["acp_report_controller", "message", "automations"]

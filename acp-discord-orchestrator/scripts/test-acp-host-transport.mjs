@@ -13,6 +13,7 @@ import {
   MAX_REPORT_RECEIPT_AGE_MS,
   REPORT_ATTEMPT_TTL_MS,
   REPORT_CADENCE_MS,
+  acquireTransportLock,
   acknowledgeHostTransportReport,
   activateHostTransport,
   abortHostTransportPreactivation,
@@ -198,8 +199,24 @@ function readRecord(fixture) {
   return JSON.parse(fs.readFileSync(fixture.transportFile, "utf8"));
 }
 
+test("v2 records require controllerLease and fail with the bounded record code", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-controller-lease-required-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-controller-lease-required",
+    events: [event(1, "started", 0)],
+  });
+  const record = readRecord(fixture);
+  delete record.controllerLease;
+  fs.writeFileSync(fixture.transportFile, JSON.stringify(record), { mode: 0o600 });
+  assert.throws(
+    () => confirmHostTransportActivation(fixture),
+    (error) => error?.code === "host_transport_record_invalid",
+  );
+});
+
 function writeStaticTransport({ root, handle, events, publication = publicationFixture(), exitCode = null,
-  controllerLease }) {
+  controllerLease = { phase: "activation_confirmed" } }) {
   if (process.platform !== "win32") fs.chmodSync(root, 0o700);
   const prefix = path.join(root, `host-transport-${handle}`);
   const transportFile = `${prefix}.json`;
@@ -216,7 +233,7 @@ function writeStaticTransport({ root, handle, events, publication = publicationF
     createdAt: new Date(0).toISOString(),
     reportingContext: reportingContextFixture(),
     publication,
-    ...(controllerLease === undefined ? {} : { controllerLease })
+    controllerLease
   };
   fs.writeFileSync(transportFile, JSON.stringify(record), { mode: 0o600 });
   fs.writeFileSync(record.eventsFile, events.map((event) => JSON.stringify(event)).join("\n") + "\n", { mode: 0o600 });
@@ -404,7 +421,8 @@ test("coordinator rollback releases a registered lease after exact supervisor pr
     hostTransportEntry: path.join(root, "acp-host-transport.mjs"),
   }, {
     randomBytes: () => Buffer.alloc(32, 0xab),
-    async createAutomation() { calls.push("create"); return { id: "coordinator-job" }; },
+    randomUUID: () => "coordinator-job",
+    async createAutomation(call) { calls.push("create"); return { id: call.job.id }; },
     async bindReporting() { calls.push("bind"); return {}; },
     async sendStartReceipt() { calls.push("start"); return {}; },
     async assemble() { calls.push("assemble"); return {}; },
@@ -649,6 +667,19 @@ test("prepare binds the acp-reporting-v3 pump job identity into the transport re
   assert.equal(record.publication.pumpJobId, PUMP_JOB_ID);
 });
 
+test("prepare applies the shared report-pump id rule before writing transport state", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-transport-pump-id-invalid-"));
+  if (process.platform !== "win32") fs.chmodSync(root, 0o700);
+  const configFile = path.join(root, "run.json");
+  fs.writeFileSync(configFile, "{}\n", { mode: 0o600 });
+  assert.throws(() => prepareHostTransport({ configFile }, {
+    statFile: () => ({ isSymbolicLink: () => false, isFile: () => true, mode: 0o755 }),
+    runTmux: () => ({ status: 0, stdout: "tmux 3.6a\n", stderr: "" }),
+    loadConfig: () => ({ reporting: { reportPump: { id: "invalid job id" } } }),
+  }), /host_transport_pump_job_invalid/u);
+  assert.deepEqual(fs.readdirSync(root), ["run.json"]);
+});
+
 test("prepare fails closed when an injected Codex config omits or invalidly supplies reporting identity selections", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-transport-injected-config-"));
   const configFile = path.join(root, "run.json");
@@ -720,7 +751,8 @@ test("status ignores an incomplete NDJSON tail until a later poll", () => {
     environmentFile: `${prefix}.env.json`,
     createdAt: new Date().toISOString(),
     reportingContext: reportingContextFixture(),
-    publication: publicationFixture()
+    publication: publicationFixture(),
+    controllerLease: { phase: "activation_confirmed" }
   };
   fs.writeFileSync(transportFile, JSON.stringify(record), { mode: 0o600 });
   fs.writeFileSync(record.eventsFile, '{"type":"activation_required"', { mode: 0o600 });
@@ -758,7 +790,8 @@ test("truncated status advances its cursor only through returned events", () => 
     environmentFile: `${prefix}.env.json`,
     createdAt: new Date().toISOString(),
     reportingContext: reportingContextFixture(),
-    publication: publicationFixture()
+    publication: publicationFixture(),
+    controllerLease: { phase: "activation_confirmed" }
   };
   fs.writeFileSync(transportFile, JSON.stringify(record), { mode: 0o600 });
   fs.writeFileSync(record.eventsFile, Array.from({ length: 66 }, (_, index) => JSON.stringify({
@@ -1185,7 +1218,7 @@ test("terminal supersedes an overdue intermediate and requires exact terminal ac
   assert.equal(terminal.cadence, 0);
   assert.equal(terminal.terminalStatus, "completed");
   assert.equal(terminal.fence, 2);
-  assert.equal(readRecord(fixture).publication.lastAttemptOutcome, "uncertain");
+  assert.equal(readRecord(fixture).publication.lastAttemptOutcome, null);
 
   const terminalStatus = statusHostTransport({
     ...fixture,
@@ -1360,6 +1393,35 @@ test("record mutations serialize on the exclusive lease and never steal a live l
   assert.equal(status.type, "host_transport_status");
   // The lease is released deterministically when the action returns.
   assert.equal(fs.existsSync(lockFile), false);
+});
+
+test("failed stale-lock unlink still observes bounded sleep and timeout", () => {
+  const exists = () => {
+    const error = new Error("exists");
+    error.code = "EEXIST";
+    throw error;
+  };
+  let sleeps = 0;
+  const startedAt = Date.now();
+  assert.throws(() => acquireTransportLock("/private/fake-record.json", "status", {
+    fileSystem: {
+      writeFileSync: exists,
+      lstatSync: () => ({ mtimeMs: 0 }),
+      unlinkSync() {
+        const error = new Error("denied");
+        error.code = "EPERM";
+        throw error;
+      },
+    },
+    lockWaitMs: 35,
+    lockStaleMs: 1,
+    sleepMs(ms) {
+      sleeps += 1;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    },
+  }), /host_transport_lock_timeout/u);
+  assert.ok(sleeps >= 1);
+  assert.ok(Date.now() - startedAt < 500);
 });
 
 test("two concurrent claimers yield exactly one live claim", {
@@ -1673,6 +1735,23 @@ test("a dead session without exit or terminal evidence halts publication as trac
   assert.equal(status.publicationHalted, "tracking_lost");
 });
 
+test("a dead session with mapped exit but no terminal evidence also halts as tracking_lost", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-tracking-lost-mapped-exit-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-tracking-lost-mapped-exit",
+    events: [event(1, "started", 0)],
+    exitCode: 22,
+    publication: publicationFixture({ nextDueAt: new Date(REPORT_CADENCE_MS).toISOString() }),
+  });
+  const result = claimHostTransportReport(claimInput(fixture), {
+    ...DEAD_TMUX,
+    nowMs: REPORT_CADENCE_MS,
+  });
+  assert.equal(result.status, "tracking_lost");
+  assert.equal(readRecord(fixture).publication.halted, "tracking_lost");
+});
+
 test("control service cursor prevents starvation and accepts only fresh exact-conversation attestation", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-service-cursor-"));
   const fixture = writeStaticTransport({
@@ -1954,7 +2033,8 @@ test("launcher failures reconcile from exact transport terminal and exit evidenc
     environmentFile: `${prefix}.env.json`,
     createdAt: new Date().toISOString(),
     reportingContext: reportingContextFixture(),
-    publication: publicationFixture()
+    publication: publicationFixture(),
+    controllerLease: { phase: "activation_confirmed" }
   };
   fs.writeFileSync(transportFile, JSON.stringify(record), { mode: 0o600 });
   fs.writeFileSync(record.eventsFile, JSON.stringify({
@@ -2035,4 +2115,41 @@ test("tmux host transport returns a handle before activation and reconciles exac
     type: "host_transport_reconciled",
     status: "exit_reconciled"
   });
+});
+
+test("normative contract documents every report-pump correction error code", () => {
+  const skillRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const contract = fs.readFileSync(path.join(skillRoot, "references/runtime-contract.md"), "utf8");
+  const sources = [
+    "scripts/acp-host-transport.mjs",
+    "scripts/acp-report-pump.mjs",
+    "scripts/acp-report-controller-preparation.mjs",
+  ].map((relative) => fs.readFileSync(path.join(skillRoot, relative), "utf8")).join("\n");
+  const stableCodes = [
+    "host_transport_report_claim_held",
+    "host_transport_report_attempts_exhausted",
+    "host_transport_report_fencing_stale",
+    "host_transport_lock_timeout",
+    "host_transport_pump_destination_mismatch",
+    "host_transport_pump_job_mismatch",
+    "host_transport_report_attempt_expired",
+    "host_transport_report_delivery_already_pending",
+    "host_transport_publication_halted",
+    "host_transport_pump_job_invalid",
+    "host_transport_pump_run_token_invalid",
+    "host_transport_lock_failed",
+    "host_transport_activation_state_invalid",
+    "host_transport_activation_not_confirmed",
+    "report_pump_input_invalid",
+    "report_pump_input_schema",
+    "report_controller_lease_token_invalid",
+    "report_controller_round_invalid",
+    "report_controller_job_create_invalid",
+    "report_controller_registration_invalid",
+    "report_controller_commit_recovery_invalid",
+  ];
+  for (const code of stableCodes) {
+    assert.equal(sources.includes(`"${code}"`), true, `${code} must remain implemented`);
+    assert.equal(contract.includes(`\`${code}\``), true, `${code} must remain documented`);
+  }
 });

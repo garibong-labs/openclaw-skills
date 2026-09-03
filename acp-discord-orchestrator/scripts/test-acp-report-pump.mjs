@@ -89,7 +89,8 @@ function writeStaticTransport({ root, handle, events, publication = publicationF
       branch: "fix/acp-automated-report-pump",
       controlConversationId: CONTROL_CONVERSATION_ID
     },
-    publication
+    publication,
+    controllerLease: { phase: "activation_confirmed" }
   };
   fs.writeFileSync(transportFile, JSON.stringify(record), { mode: 0o600 });
   fs.writeFileSync(record.eventsFile, events.map((item) => JSON.stringify(item)).join("\n") + "\n", { mode: 0o600 });
@@ -109,8 +110,8 @@ function pumpInput(fixture, overrides = {}) {
   };
 }
 
-function writeSnapshot(root, snapshot) {
-  const snapshotFile = path.join(root, "snapshot.json");
+function writeSnapshot(root, snapshot, name = "snapshot.json") {
+  const snapshotFile = path.join(root, name);
   fs.writeFileSync(snapshotFile, JSON.stringify(snapshot), { mode: 0o600 });
   return snapshotFile;
 }
@@ -193,7 +194,10 @@ test("pump claims a due intermediate and derives the canonical fresh report", ()
 
 test("pump output closes cleanly through ack-report with the digest-bound receipt", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-pump-ack-"));
-  const dueAt = REPORT_CADENCE_MS;
+  // Render just before a KST minute boundary and acknowledge just after it.
+  // The receipt must reuse the exact structured report returned by the pump.
+  const dueAt = 598000;
+  const deliveredAt = dueAt + 5000;
   const fixture = writeStaticTransport({
     root,
     handle: "acp-pump-ack",
@@ -202,6 +206,7 @@ test("pump output closes cleanly through ack-report with the digest-bound receip
   });
   const result = runReportPump(pumpInput(fixture), { ...ACTIVE_TMUX, nowMs: dueAt });
   assert.equal(result.status, "delivery_pending");
+  assert.equal(result.report.timeKst, "09:09");
   // Without an owner snapshot the pump renders canonical bounded defaults —
   // fixed neutral slot values, machine-derived times — and no ACP activity
   // event keeps the fail-closed maximum age instead of a fabricated instant.
@@ -215,31 +220,15 @@ test("pump output closes cleanly through ack-report with the digest-bound receip
     cadence: result.cadence,
     attemptId: result.attemptId,
     fence: result.fence,
-    report: {
-      agent: "codex",
-      model: "test-model[medium]",
-      roundIndex: 1,
-      repository: "openclaw-skills",
-      branch: "fix/acp-automated-report-pump",
-      timeKst: "09:10",
-      phaseIndex: 2,
-      totalMinutes: 10,
-      phaseMinutes: 10,
-      lastAcpActivityMinutesAgo: 10,
-      newResultDelta: 0,
-      executionState: "ACP 실행 계속 중",
-      inProgress: "ACP 작업 진행 중",
-      verification: "자체 검증 대기",
-      next: "작업 계속"
-    },
+    report: result.report,
     receipt: {
       conversationId: CONTROL_CONVERSATION_ID,
       messageId: "100000000000000050",
-      deliveredAt: new Date(dueAt).toISOString(),
+      deliveredAt: new Date(deliveredAt).toISOString(),
       deliveryStatus: "delivered",
       messageDigest: result.messageDigest
     }
-  }, { nowMs: dueAt });
+  }, { nowMs: deliveredAt });
   assert.equal(acked.type, "host_transport_report_acknowledged");
   assert.equal(record.publication.pumpJobId, PUMP_JOB_ID);
 });
@@ -369,6 +358,79 @@ test("pump fails closed on job identity mismatch and malformed snapshots", () =>
   // A rejected snapshot fails before any claim is minted.
   const record = JSON.parse(fs.readFileSync(fixture.transportFile, "utf8"));
   assert.equal(record.publication.kind, null);
+});
+
+test("snapshot builder bounds are rejected before consuming an attempt", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-pump-snapshot-bounds-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-pump-snapshot-bounds",
+    events: [event(1, "started", 0)],
+    publication: publicationFixture({ nextDueAt: new Date(REPORT_CADENCE_MS).toISOString() }),
+  });
+  const invalidSnapshots = [
+    { phaseIndex: 0 },
+    { phaseIndex: 5 },
+    { newResultDelta: 10000 },
+    { newResultDelta: 1 },
+    { executionState: "" },
+    { terminal: { summary: "x".repeat(2000) } },
+  ];
+  for (const [index, fields] of invalidSnapshots.entries()) {
+    const snapshotFile = writeSnapshot(root, {
+      schemaVersion: ACP_REPORT_PUMP_SNAPSHOT_SCHEMA_VERSION,
+      ...fields,
+    }, `bad-${index}.json`);
+    assert.throws(() => runReportPump(pumpInput(fixture, { snapshotFile }), {
+      ...ACTIVE_TMUX,
+      nowMs: REPORT_CADENCE_MS,
+    }), /report_pump_snapshot_invalid/u, `snapshot ${index} must fail before claim`);
+    const publication = JSON.parse(fs.readFileSync(fixture.transportFile, "utf8")).publication;
+    assert.equal(publication.attemptCount, 0);
+    assert.equal(publication.attempt, null);
+  }
+});
+
+test("snapshot private-file failures preserve their distinct bounded codes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-pump-snapshot-errors-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-pump-snapshot-errors",
+    events: [event(1, "started", 0)],
+  });
+  assert.throws(() => runReportPump(pumpInput(fixture, {
+    snapshotFile: path.join(root, "missing.json"),
+  }), ACTIVE_TMUX), /invalid_input_file_missing/u);
+  const oversized = path.join(root, "oversized.json");
+  fs.writeFileSync(oversized, "x".repeat(8193), { mode: 0o600 });
+  assert.throws(() => runReportPump(pumpInput(fixture, { snapshotFile: oversized }), ACTIVE_TMUX),
+    /invalid_input_file_too_large/u);
+  if (process.platform !== "win32") {
+    const exposed = writeSnapshot(root, { schemaVersion: ACP_REPORT_PUMP_SNAPSHOT_SCHEMA_VERSION },
+      "exposed.json");
+    fs.chmodSync(exposed, 0o644);
+    assert.throws(() => runReportPump(pumpInput(fixture, { snapshotFile: exposed }), ACTIVE_TMUX),
+      /invalid_input_file_permissions/u);
+  }
+});
+
+test("pump boundary rejects malformed required fields before transport access", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-pump-input-fields-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-pump-input-fields",
+    events: [event(1, "started", 0)],
+  });
+  for (const overrides of [
+    { transportFile: "relative.json" },
+    { processHandle: {} },
+    { jobId: 42 },
+    { destination: { conversationId: CONTROL_CONVERSATION_ID } },
+  ]) {
+    assert.throws(() => runReportPump(pumpInput(fixture, overrides), ACTIVE_TMUX),
+      /report_pump_input_invalid/u);
+  }
+  assert.equal(JSON.parse(fs.readFileSync(fixture.transportFile, "utf8")).publication.attemptCount, 0);
 });
 
 test("pump CLI emits one bounded result event and one bounded error event", async () => {

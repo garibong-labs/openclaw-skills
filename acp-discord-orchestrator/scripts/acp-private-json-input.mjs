@@ -1,5 +1,40 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+export function isPlainObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+export function assertExactKeys(value, required, optional, fail, code) {
+  if (!hasExactKeys(value, required, optional)) fail(code);
+}
+
+export function hasExactKeys(value, required, optional = []) {
+  if (!isPlainObject(value)) return false;
+  const allowed = new Set([...required, ...optional]);
+  const keys = Object.keys(value);
+  return required.every((key) => keys.includes(key)) &&
+    !keys.some((key) => !allowed.has(key));
+}
+
+export function safeCode(value, fallback) {
+  return typeof value === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value)
+    ? value
+    : fallback;
+}
+
+export function isCliEntry(argvPath, moduleUrl, fileSystem = fs) {
+  if (typeof argvPath !== "string" || argvPath.length === 0) return false;
+  try {
+    return fileSystem.realpathSync(path.resolve(argvPath)) ===
+      fileSystem.realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
 
 export function parsePrivateJsonInputCli(argv, fail) {
   if (argv.length !== 2 || argv[0] !== "--input") {

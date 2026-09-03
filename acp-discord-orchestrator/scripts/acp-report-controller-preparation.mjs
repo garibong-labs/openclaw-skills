@@ -1,9 +1,9 @@
 // Private preparation helpers for one durable ACP report-controller lease.
 //
-// The public template contains a literal LEASE_TOKEN placeholder. Only
-// buildReportControllerAutomationAddCall substitutes a generated private token,
-// and the resulting job object must go directly to the authenticated
-// `automations` add call. Neither the token nor the substituted script is
+// The public template contains literal LEASE_TOKEN and JOB_ID placeholders.
+// Only buildReportControllerAutomationAddCall substitutes a generated private
+// token and reserved scheduler id. The resulting job object must go directly
+// to the authenticated `automations` add call. Neither the token nor the substituted script is
 // returned by runControllerPreparation or placed in the public supervisor
 // reporting bundle.
 
@@ -19,12 +19,15 @@ import {
   ACP_REPORT_CONTROLLER_TOOL_BUDGET,
   ACP_REPORT_CONTROLLER_TOOLS_ALLOW,
 } from "./acp-reporting-contract.mjs";
+import { abortHostTransportPreactivation } from "./acp-host-transport.mjs";
+import { hasExactKeys, isPlainObject } from "./acp-private-json-input.mjs";
 
 export const REPORT_CONTROLLER_AUTOMATION_TEMPLATE = fileURLToPath(
   new URL("../templates/report-controller-automation.json", import.meta.url),
 );
 
 const LEASE_TOKEN_PLACEHOLDER = "LEASE_TOKEN";
+const JOB_ID_PLACEHOLDER = "JOB_ID";
 const SAFE_LEASE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{15,127}$/u;
 const SAFE_JOB_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
 const SAFE_HANDLE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
@@ -43,24 +46,20 @@ function fail(code) {
   throw new AcpReportControllerPreparationError(code);
 }
 
-function plainObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function exactKeys(value, keys) {
-  return plainObject(value) &&
-    Object.keys(value).length === keys.length &&
-    Object.keys(value).every((key) => keys.includes(key));
-}
-
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
 export function generateReportControllerLeaseToken(randomBytes = crypto.randomBytes) {
-  const token = randomBytes(32).toString("base64url");
+  const token = `acplease${randomBytes(32).toString("base64url")}`;
   if (!SAFE_LEASE_TOKEN.test(token)) fail("report_controller_lease_token_invalid");
   return token;
+}
+
+export function generateReportControllerJobId(randomUUID = crypto.randomUUID) {
+  const jobId = `acp-report-${randomUUID()}`;
+  if (!SAFE_JOB_ID.test(jobId)) fail("report_controller_job_create_invalid");
+  return jobId;
 }
 
 export function loadReportControllerAutomationTemplate(fileSystem = fs) {
@@ -70,13 +69,13 @@ export function loadReportControllerAutomationTemplate(fileSystem = fs) {
   } catch {
     fail("report_controller_automation_template_invalid");
   }
-  if (!exactKeys(template, ["name", "sessionTarget", "schedule", "payload", "delivery", "enabled", "deleteAfterRun"]) ||
+  if (!hasExactKeys(template, ["name", "sessionTarget", "schedule", "payload", "delivery", "enabled", "deleteAfterRun"]) ||
       template.name !== "ACP report controller" || template.sessionTarget !== "isolated" ||
       template.enabled !== true || template.deleteAfterRun !== false ||
-      !exactKeys(template.schedule, ["kind", "everyMs"]) ||
+      !hasExactKeys(template.schedule, ["kind", "everyMs"]) ||
       template.schedule.kind !== "every" || template.schedule.everyMs !== 600000 ||
-      !exactKeys(template.delivery, ["mode"]) || template.delivery.mode !== "none" ||
-      !exactKeys(template.payload, ["kind", "script", "timeoutSeconds", "toolBudget", "toolsAllow"]) ||
+      !hasExactKeys(template.delivery, ["mode"]) || template.delivery.mode !== "none" ||
+      !hasExactKeys(template.payload, ["kind", "script", "timeoutSeconds", "toolBudget", "toolsAllow"]) ||
       template.payload.kind !== "script" ||
       template.payload.timeoutSeconds !== ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS ||
       template.payload.toolBudget !== ACP_REPORT_CONTROLLER_TOOL_BUDGET ||
@@ -85,6 +84,7 @@ export function loadReportControllerAutomationTemplate(fileSystem = fs) {
       template.payload.toolsAllow.some((tool, index) => tool !== ACP_REPORT_CONTROLLER_TOOLS_ALLOW[index]) ||
       typeof template.payload.script !== "string" ||
       template.payload.script.split(LEASE_TOKEN_PLACEHOLDER).length !== 2 ||
+      template.payload.script.split(JOB_ID_PLACEHOLDER).length !== 2 ||
       crypto.createHash("sha256").update(template.payload.script, "utf8").digest("hex") !==
         ACP_REPORT_CONTROLLER_SCRIPT_SHA256) {
     fail("report_controller_automation_template_invalid");
@@ -92,16 +92,20 @@ export function loadReportControllerAutomationTemplate(fileSystem = fs) {
   return clone(template);
 }
 
-export function buildReportControllerAutomationAddCall(leaseToken, options = {}) {
+export function buildReportControllerAutomationAddCall(leaseToken, jobId, options = {}) {
   if (!SAFE_LEASE_TOKEN.test(leaseToken)) fail("report_controller_lease_token_invalid");
+  if (!SAFE_JOB_ID.test(jobId)) fail("report_controller_job_id_invalid");
   const template = loadReportControllerAutomationTemplate(options.fileSystem);
-  template.payload.script = template.payload.script.replace(
-    `"${LEASE_TOKEN_PLACEHOLDER}"`,
-    JSON.stringify(leaseToken),
-  );
-  if (template.payload.script.includes(LEASE_TOKEN_PLACEHOLDER)) {
+  template.payload.script = template.payload.script
+    .replace(`"${LEASE_TOKEN_PLACEHOLDER}"`, JSON.stringify(leaseToken))
+    .replace(`"${JOB_ID_PLACEHOLDER}"`, JSON.stringify(jobId));
+  if (template.payload.script.includes(LEASE_TOKEN_PLACEHOLDER) ||
+      template.payload.script.includes(JOB_ID_PLACEHOLDER)) {
     fail("report_controller_automation_template_invalid");
   }
+  // The scheduler's internal create path accepts a pre-reserved durable id;
+  // this lets the enabled script carry its exact own identity atomically.
+  template.id = jobId;
   return { action: "add", job: template };
 }
 
@@ -129,14 +133,16 @@ export function buildReportPumpStructuralAttestation(jobId, roundIndex) {
   };
 }
 
-function extractJobId(result) {
-  const candidate = plainObject(result?.details) ? result.details.id : result?.id;
-  if (!SAFE_JOB_ID.test(candidate)) fail("report_controller_job_create_invalid");
+function extractJobId(result, expectedJobId) {
+  const candidate = isPlainObject(result?.details) ? result.details.id : result?.id;
+  if (!SAFE_JOB_ID.test(candidate) || candidate !== expectedJobId) {
+    fail("report_controller_job_create_invalid");
+  }
   return candidate;
 }
 
 function assertPrepared(prepared) {
-  if (!plainObject(prepared) || typeof prepared.transportFile !== "string" ||
+  if (!isPlainObject(prepared) || typeof prepared.transportFile !== "string" ||
       prepared.transportFile.length === 0 || typeof prepared.processHandle !== "string" ||
       prepared.processHandle.length === 0) {
     fail("report_controller_transport_prepare_invalid");
@@ -144,7 +150,7 @@ function assertPrepared(prepared) {
 }
 
 function resultStatus(result) {
-  return plainObject(result?.details) ? result.details.status : result?.status;
+  return isPlainObject(result?.details) ? result.details.status : result?.status;
 }
 
 export function buildReportControllerRegistration(input, leaseToken, jobId, prepared) {
@@ -165,7 +171,7 @@ export function buildReportControllerRegistration(input, leaseToken, jobId, prep
   if (!SAFE_LEASE_TOKEN.test(leaseToken) || !SAFE_JOB_ID.test(jobId) ||
       !SAFE_HANDLE.test(registration.processHandle) ||
       paths.some((candidate) => typeof candidate !== "string" || !path.isAbsolute(candidate)) ||
-      !plainObject(registration.destination) || registration.destination.channel !== "discord" ||
+      !isPlainObject(registration.destination) || registration.destination.channel !== "discord" ||
       !SAFE_ACCOUNT.test(registration.destination.accountId) ||
       !DECIMAL_ID.test(registration.destination.conversationId)) {
     fail("report_controller_registration_invalid");
@@ -173,8 +179,8 @@ export function buildReportControllerRegistration(input, leaseToken, jobId, prep
   return registration;
 }
 
-async function rollbackBeforeActivation(jobId, leaseToken, registered, dependencies) {
-  if (jobId !== undefined) {
+async function rollbackBeforeActivation(jobId, automationCreated, leaseToken, prepared, registrationSubmitted, dependencies) {
+  if (automationCreated) {
     try {
       const removed = await dependencies.removeAutomation({ action: "remove", jobId });
       if (removed?.removed !== true && resultStatus(removed) !== "removed") {
@@ -184,10 +190,17 @@ async function rollbackBeforeActivation(jobId, leaseToken, registered, dependenc
       fail("report_controller_pre_activation_cleanup_failed");
     }
   }
-  if (registered) {
+  if (prepared !== undefined) {
     try {
-      const aborted = await dependencies.abortController({ action: "abort_preactivation", leaseToken });
-      if (resultStatus(aborted) !== "aborted") {
+      const aborted = registrationSubmitted
+        ? await dependencies.abortController({ action: "abort_preactivation", leaseToken })
+        : await (dependencies.abortTransport ?? abortHostTransportPreactivation)({
+            transportFile: prepared.transportFile,
+            processHandle: prepared.processHandle,
+          });
+      const abortedStatus = registrationSubmitted ? resultStatus(aborted) :
+        aborted?.type === "host_transport_preactivation_aborted" ? "aborted" : undefined;
+      if (abortedStatus !== "aborted") {
         fail("report_controller_pre_activation_cleanup_failed");
       }
     } catch {
@@ -215,12 +228,12 @@ async function retainCommitRecovery(dependencies, recovery) {
 }
 
 export async function retryReportControllerActivationCommit(recovery, dependencies) {
-  if (!exactKeys(recovery, ["schemaVersion", "type", "leaseToken", "jobId", "transportFile", "processHandle"]) ||
+  if (!hasExactKeys(recovery, ["schemaVersion", "type", "leaseToken", "jobId", "transportFile", "processHandle"]) ||
       recovery.schemaVersion !== "acp-report-controller-recovery.v1" ||
       recovery.type !== "commit_activation_pending" ||
       !SAFE_LEASE_TOKEN.test(recovery.leaseToken) || !SAFE_JOB_ID.test(recovery.jobId) ||
       !path.isAbsolute(recovery.transportFile) || !SAFE_HANDLE.test(recovery.processHandle) ||
-      !plainObject(dependencies) || typeof dependencies.commitController !== "function") {
+      !isPlainObject(dependencies) || typeof dependencies.commitController !== "function") {
     fail("report_controller_commit_recovery_invalid");
   }
   let committed;
@@ -247,31 +260,34 @@ export async function runReportControllerPreparation(input, dependencies) {
     "prepare", "registerController", "activate", "removeAutomation",
     "commitController", "abortController", "retainRecovery",
   ];
-  if (!plainObject(input) || !plainObject(dependencies) ||
+  if (!isPlainObject(input) || !isPlainObject(dependencies) ||
       required.some((name) => typeof dependencies[name] !== "function")) {
     fail("report_controller_preparation_input_invalid");
   }
   const leaseToken = generateReportControllerLeaseToken(dependencies.randomBytes);
-  let jobId;
-  let registered = false;
+  const jobId = generateReportControllerJobId(dependencies.randomUUID);
+  let automationCreated = false;
+  let prepared;
+  let registrationSubmitted = false;
   let activationConfirmed = false;
   try {
     const created = await dependencies.createAutomation(
-      buildReportControllerAutomationAddCall(leaseToken),
+      buildReportControllerAutomationAddCall(leaseToken, jobId),
     );
-    jobId = extractJobId(created);
+    automationCreated = true;
+    extractJobId(created, jobId);
     const reportPump = buildReportPumpStructuralAttestation(jobId, input.roundIndex);
     const bound = await dependencies.bindReporting({ jobId, reportPump });
     const startReceipt = await dependencies.sendStartReceipt({ jobId, reportPump, bound });
     const assembled = await dependencies.assemble({ jobId, reportPump, bound, startReceipt });
-    const prepared = await dependencies.prepare({ jobId, reportPump, assembled });
+    prepared = await dependencies.prepare({ jobId, reportPump, assembled });
     assertPrepared(prepared);
     const registration = buildReportControllerRegistration(input, leaseToken, jobId, prepared);
+    registrationSubmitted = true;
     const registrationResult = await dependencies.registerController(registration);
     if (resultStatus(registrationResult) !== "prepared") {
       fail("report_controller_registration_failed");
     }
-    registered = true;
     const activation = await dependencies.activate({
       transportFile: prepared.transportFile,
       processHandle: prepared.processHandle,
@@ -301,7 +317,16 @@ export async function runReportControllerPreparation(input, dependencies) {
     }
     return { jobId, reportPump, startReceipt, prepared, activation, controllerStatus: "active" };
   } catch (error) {
-    if (!activationConfirmed) await rollbackBeforeActivation(jobId, leaseToken, registered, dependencies);
+    if (!activationConfirmed) {
+      await rollbackBeforeActivation(
+        jobId,
+        automationCreated,
+        leaseToken,
+        prepared,
+        registrationSubmitted,
+        dependencies,
+      );
+    }
     if (error instanceof AcpReportControllerPreparationError) throw error;
     fail("report_controller_preparation_failed");
   }

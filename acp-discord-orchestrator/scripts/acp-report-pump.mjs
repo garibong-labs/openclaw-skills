@@ -6,8 +6,9 @@
 // from a static public report snapshot), marks the fenced attempt
 // `delivery_pending`, and hands the bounded result to the delivery layer.
 // The pump has no chat credentials and performs no delivery itself. The
-// controller script sends the returned message, and the plugin's message_sent
-// hook closes the attempt with the digest-bound Discord receipt.
+// controller script sends only an opaque publication token; trusted plugin
+// policy injects the retained message, and message_sent closes the attempt
+// with the exact returned structured report and digest-bound Discord receipt.
 //
 // Terminal acknowledgement is the deterministic self-cleanup boundary: a
 // claim returning `terminal_acked` means publication is complete and the
@@ -16,9 +17,7 @@
 // relaunch ACP.
 
 import crypto from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import {
   beginHostTransportReportDelivery,
@@ -27,11 +26,18 @@ import {
 } from "./acp-host-transport.mjs";
 import {
   buildAcpIntermediateReport,
-  buildAcpTerminalReport
+  buildAcpTerminalReport,
+  ACP_REPORT_PHASES,
+  isReportPumpId,
+  MAX_REPORT_RESULT_DELTA
 } from "./acp-reporting-contract.mjs";
 import {
+  assertExactKeys,
+  isCliEntry,
+  isPlainObject,
   parsePrivateJsonInputCli,
-  readPrivateJsonInput
+  readPrivateJsonInput,
+  safeCode
 } from "./acp-private-json-input.mjs";
 
 export const ACP_REPORT_PUMP_SCHEMA_VERSION = "acp-report-pump.v1";
@@ -42,6 +48,7 @@ export const MAX_REPORT_PUMP_SNAPSHOT_BYTES = 8192;
 const INVALID_INPUT_EXIT = 64;
 const PUMP_ERROR_EXIT = 22;
 const SAFE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const DECIMAL_ID = /^[0-9]{1,32}$/;
 const KST_OFFSET_MS = 9 * 3600000;
 const CADENCE_MINUTES = REPORT_CADENCE_MS / 60000;
 
@@ -69,28 +76,7 @@ function pumpFail(code) {
   throw error;
 }
 
-function isPlainObject(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-function assertExactKeys(value, required, optional, code) {
-  const allowed = new Set([...required, ...optional]);
-  const keys = Object.keys(value);
-  if (!required.every((key) => keys.includes(key)) || keys.some((key) => !allowed.has(key))) {
-    pumpFail(code);
-  }
-}
-
-export function readReportPumpInput(inputPath, dependencies = {}) {
-  const parsed = readPrivateJsonInput(inputPath, {
-    maxBytes: MAX_REPORT_PUMP_INPUT_BYTES,
-    fail: pumpFail,
-    fileSystem: dependencies.fileSystem
-  });
+function validateReportPumpInput(parsed) {
   if (!isPlainObject(parsed)) {
     pumpFail("report_pump_input_invalid");
   }
@@ -98,13 +84,18 @@ export function readReportPumpInput(inputPath, dependencies = {}) {
     parsed,
     ["schemaVersion", "transportFile", "processHandle", "jobId", "destination"],
     ["snapshotFile", "runToken"],
+    pumpFail,
     "report_pump_input_invalid"
   );
   if (parsed.schemaVersion !== ACP_REPORT_PUMP_SCHEMA_VERSION) {
     pumpFail("report_pump_input_schema");
   }
-  if (parsed.snapshotFile !== undefined &&
-    (typeof parsed.snapshotFile !== "string" || !path.isAbsolute(parsed.snapshotFile))) {
+  if (typeof parsed.transportFile !== "string" || !path.isAbsolute(parsed.transportFile) ||
+      typeof parsed.processHandle !== "string" || !SAFE_TOKEN.test(parsed.processHandle) ||
+      !isReportPumpId(parsed.jobId) || typeof parsed.destination !== "string" ||
+      !DECIMAL_ID.test(parsed.destination) ||
+      (parsed.snapshotFile !== undefined &&
+        (typeof parsed.snapshotFile !== "string" || !path.isAbsolute(parsed.snapshotFile)))) {
     pumpFail("report_pump_input_invalid");
   }
   if (parsed.runToken !== undefined &&
@@ -114,13 +105,21 @@ export function readReportPumpInput(inputPath, dependencies = {}) {
   return parsed;
 }
 
+export function readReportPumpInput(inputPath, dependencies = {}) {
+  return validateReportPumpInput(readPrivateJsonInput(inputPath, {
+    maxBytes: MAX_REPORT_PUMP_INPUT_BYTES,
+    fail: pumpFail,
+    fileSystem: dependencies.fileSystem
+  }));
+}
+
 function readSnapshot(snapshotFile, dependencies) {
   if (snapshotFile === undefined) {
     return {};
   }
   const parsed = readPrivateJsonInput(snapshotFile, {
     maxBytes: MAX_REPORT_PUMP_SNAPSHOT_BYTES,
-    fail: () => pumpFail("report_pump_snapshot_invalid"),
+    fail: pumpFail,
     fileSystem: dependencies.fileSystem
   });
   if (!isPlainObject(parsed) || parsed.schemaVersion !== ACP_REPORT_PUMP_SNAPSHOT_SCHEMA_VERSION) {
@@ -133,6 +132,7 @@ function readSnapshot(snapshotFile, dependencies) {
       "phaseIndex", "phaseStartedCadence", "executionState", "inProgress",
       "verification", "next", "newResultDelta", "newResult", "issue", "terminal"
     ],
+    pumpFail,
     "report_pump_snapshot_invalid"
   );
   for (const key of ["executionState", "inProgress", "verification", "next", "newResult", "issue"]) {
@@ -145,6 +145,15 @@ function readSnapshot(snapshotFile, dependencies) {
       pumpFail("report_pump_snapshot_invalid");
     }
   }
+  if (parsed.phaseIndex !== undefined && !Object.hasOwn(ACP_REPORT_PHASES, parsed.phaseIndex)) {
+    pumpFail("report_pump_snapshot_invalid");
+  }
+  if (parsed.newResultDelta !== undefined && parsed.newResultDelta > MAX_REPORT_RESULT_DELTA) {
+    pumpFail("report_pump_snapshot_invalid");
+  }
+  if ((parsed.newResultDelta ?? 0) > 0 && parsed.newResult === undefined) {
+    pumpFail("report_pump_snapshot_invalid");
+  }
   if (parsed.terminal !== undefined) {
     if (!isPlainObject(parsed.terminal)) {
       pumpFail("report_pump_snapshot_invalid");
@@ -153,6 +162,7 @@ function readSnapshot(snapshotFile, dependencies) {
       parsed.terminal,
       [],
       ["summary", "verification", "result", "next", "externalAction"],
+      pumpFail,
       "report_pump_snapshot_invalid"
     );
     for (const value of Object.values(parsed.terminal)) {
@@ -160,6 +170,46 @@ function readSnapshot(snapshotFile, dependencies) {
         pumpFail("report_pump_snapshot_invalid");
       }
     }
+  }
+  // Exercise the canonical builders with fixed valid machine fields so every
+  // owner-controlled slot is proven acceptable before claim-report can mint
+  // an attempt. Live identity/time/cadence values are still supplied only
+  // after the claim and are never taken from this validation fixture.
+  try {
+    const newResultDelta = parsed.newResultDelta ?? 0;
+    buildAcpIntermediateReport({
+      agent: "claude",
+      model: "runtime-default",
+      roundIndex: 1,
+      repository: "snapshot-validation",
+      branch: "snapshot-validation",
+      timeKst: "00:00",
+      phaseIndex: parsed.phaseIndex ?? 2,
+      totalMinutes: 0,
+      phaseMinutes: 0,
+      lastAcpActivityMinutesAgo: 0,
+      newResultDelta,
+      ...(newResultDelta > 0 ? { newResult: parsed.newResult } : {}),
+      executionState: parsed.executionState ?? DEFAULT_INTERMEDIATE_SLOTS.executionState,
+      inProgress: parsed.inProgress ?? DEFAULT_INTERMEDIATE_SLOTS.inProgress,
+      verification: parsed.verification ?? DEFAULT_INTERMEDIATE_SLOTS.verification,
+      next: parsed.next ?? DEFAULT_INTERMEDIATE_SLOTS.next,
+      ...(parsed.issue !== undefined ? { issue: parsed.issue } : {})
+    });
+    const terminal = { ...DEFAULT_TERMINAL_SLOTS, ...(parsed.terminal ?? {}) };
+    buildAcpTerminalReport({
+      agent: "claude",
+      model: "runtime-default",
+      roundIndex: 1,
+      repository: "snapshot-validation",
+      branch: "snapshot-validation",
+      timeKst: "00:00",
+      elapsed: "측정 불가",
+      status: "failed",
+      ...terminal
+    });
+  } catch {
+    pumpFail("report_pump_snapshot_invalid");
   }
   return parsed;
 }
@@ -176,11 +226,11 @@ function clampMinutes(value, maximum) {
 // bounded owner snapshot. Cadence-derived minutes, the activity age, and the
 // terminal status always come from the claim — a stale snapshot can never
 // move a machine-derived value.
-function buildClaimedMessage(claim, snapshot, nowMs) {
+function buildClaimedReport(claim, snapshot, nowMs) {
   const identity = { ...claim.identity, timeKst: timeKstFrom(nowMs) };
   if (claim.reportKind === "terminal") {
     const slots = { ...DEFAULT_TERMINAL_SLOTS, ...(snapshot.terminal ?? {}) };
-    return buildAcpTerminalReport({
+    return {
       ...identity,
       status: claim.terminalStatus,
       elapsed: claim.elapsedMs === null
@@ -191,7 +241,7 @@ function buildClaimedMessage(claim, snapshot, nowMs) {
       result: slots.result,
       next: slots.next,
       externalAction: slots.externalAction
-    });
+    };
   }
   const totalMinutes = claim.cadence * CADENCE_MINUTES;
   const activityMs = claim.lastAcpActivityAt === null
@@ -199,7 +249,7 @@ function buildClaimedMessage(claim, snapshot, nowMs) {
     : Date.parse(claim.lastAcpActivityAt);
   const phaseStartedCadence = snapshot.phaseStartedCadence ?? 0;
   const newResultDelta = snapshot.newResultDelta ?? 0;
-  return buildAcpIntermediateReport({
+  return {
     ...identity,
     phaseIndex: snapshot.phaseIndex ?? 2,
     totalMinutes,
@@ -219,10 +269,11 @@ function buildClaimedMessage(claim, snapshot, nowMs) {
     verification: snapshot.verification ?? DEFAULT_INTERMEDIATE_SLOTS.verification,
     next: snapshot.next ?? DEFAULT_INTERMEDIATE_SLOTS.next,
     ...(snapshot.issue !== undefined ? { issue: snapshot.issue } : {})
-  });
+  };
 }
 
 export function runReportPump(input, dependencies = {}) {
+  validateReportPumpInput(input);
   const snapshot = readSnapshot(input.snapshotFile, dependencies);
   const randomUUID = dependencies.randomUUID ?? crypto.randomUUID;
   // One opaque run identity per pump invocation, bound into the fenced
@@ -245,7 +296,10 @@ export function runReportPump(input, dependencies = {}) {
   const nowMs = typeof dependencies.nowMs === "function"
     ? dependencies.nowMs()
     : dependencies.nowMs ?? Date.now();
-  const message = buildClaimedMessage(claim, snapshot, nowMs);
+  const report = buildClaimedReport(claim, snapshot, nowMs);
+  const message = claim.reportKind === "intermediate"
+    ? buildAcpIntermediateReport(report)
+    : buildAcpTerminalReport(report);
   beginHostTransportReportDelivery({
     transportFile: input.transportFile,
     processHandle: input.processHandle,
@@ -263,14 +317,9 @@ export function runReportPump(input, dependencies = {}) {
     fence: claim.fence,
     runToken,
     messageDigest: crypto.createHash("sha256").update(message, "utf8").digest("hex"),
-    message
+    message,
+    report
   };
-}
-
-function safeCode(value) {
-  return typeof value === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value)
-    ? value
-    : "report_pump_failed";
 }
 
 function exitCodeFor(code) {
@@ -294,24 +343,13 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     writeResult(runReportPump(input, dependencies));
     return 0;
   } catch (error) {
-    const code = safeCode(error && error.code);
+    const code = safeCode(error && error.code, "report_pump_failed");
     writeEvent({
       schemaVersion: ACP_REPORT_PUMP_SCHEMA_VERSION,
       type: "report_pump_error",
       code
     });
     return exitCodeFor(code);
-  }
-}
-
-function isCliEntry(argvPath, moduleUrl) {
-  if (typeof argvPath !== "string" || argvPath.length === 0) {
-    return false;
-  }
-  try {
-    return fs.realpathSync(path.resolve(argvPath)) === fs.realpathSync(fileURLToPath(moduleUrl));
-  } catch {
-    return false;
   }
 }
 

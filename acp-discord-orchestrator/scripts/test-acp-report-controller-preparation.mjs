@@ -9,6 +9,7 @@ import {
   buildReportControllerAutomationAddCall,
   buildReportControllerRegistration,
   buildReportPumpStructuralAttestation,
+  generateReportControllerJobId,
   generateReportControllerLeaseToken,
   loadReportControllerAutomationTemplate,
   retryReportControllerActivationCommit,
@@ -17,24 +18,30 @@ import {
 import { validateAcpReportingContract } from "./acp-reporting-contract.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 
-const PINNED_PLUGIN_COMMIT = "7cdaf6463aac5c34868162f89476295a2a2f90ca";
+const PINNED_PLUGIN_COMMIT = "0acb0dc271212afebbd68dee03b2ef3389058af1";
 const PINNED_SCRIPT = `const leaseToken = "LEASE_TOKEN";
+const jobId = "JOB_ID";
 const cleanup = async (result) => {
   if (result.status !== "terminal_acked" && result.status !== "tracking_lost") return;
-  await automations({ action: "remove", jobId: result.jobId });
+  await automations({ action: "remove", jobId });
   await acp_report_controller({ action: "release", leaseToken });
 };
 const first = await acp_report_controller({ action: "tick", leaseToken });
 if (first.status === "delivery_pending") {
-  await message({ action: "send", channel: first.destination.channel, target: first.destination.conversationId, accountId: first.destination.accountId, message: first.message, final: false });
+  await message({ action: "send", message: first.publicationToken, final: false });
   const afterSend = await acp_report_controller({ action: "tick", leaseToken });
   await cleanup(afterSend);
   return;
 }
+if (first.status === "error" && first.code === "acp_lifecycle_guard.controller.lease_prepared") {
+  await automations({ action: "remove", jobId });
+  await acp_report_controller({ action: "abort_preactivation", leaseToken });
+  return;
+}
 await cleanup(first);`;
-const SCRIPT_SHA256 = "8e48a6cbe8bdb1e6142331257a5763edfc41687e9081745aea074a27146187e7";
+const SCRIPT_SHA256 = "dad87e9f3b11f74d7a541c3b0c5ac0cdaca2ffd4fd49161ec2b4b333c4b6c65c";
 const JOB_ID = "acp-report-controller-round-2";
-const TOKEN = Buffer.alloc(32, 0xab).toString("base64url");
+const TOKEN = `acplease${Buffer.alloc(32, 0xab).toString("base64url")}`;
 
 test(`automation template is byte-for-byte script-compatible with plugin ${PINNED_PLUGIN_COMMIT}`, () => {
   const template = loadReportControllerAutomationTemplate();
@@ -48,13 +55,20 @@ test(`automation template is byte-for-byte script-compatible with plugin ${PINNE
   assert.deepEqual(template.delivery, { mode: "none" });
 });
 
-test("private job construction substitutes only the lease token and leaves no public placeholder", () => {
+test("private job construction reserves its exact id and substitutes both private placeholders", () => {
   assert.equal(generateReportControllerLeaseToken(() => Buffer.alloc(32, 0xab)), TOKEN);
-  const call = buildReportControllerAutomationAddCall(TOKEN);
+  assert.equal(generateReportControllerLeaseToken(() => Buffer.from([0xf8, ...Buffer.alloc(31)]))
+    .startsWith("acplease-"), true);
+  assert.equal(generateReportControllerJobId(() => "controller-round-2"), JOB_ID);
+  const call = buildReportControllerAutomationAddCall(TOKEN, JOB_ID);
   assert.deepEqual(Object.keys(call), ["action", "job"]);
   assert.equal(call.action, "add");
-  assert.equal(call.job.payload.script, PINNED_SCRIPT.replace('"LEASE_TOKEN"', JSON.stringify(TOKEN)));
+  assert.equal(call.job.id, JOB_ID);
+  assert.equal(call.job.payload.script, PINNED_SCRIPT
+    .replace('"LEASE_TOKEN"', JSON.stringify(TOKEN))
+    .replace('"JOB_ID"', JSON.stringify(JOB_ID)));
   assert.equal(call.job.payload.script.includes("LEASE_TOKEN"), false);
+  assert.equal(call.job.payload.script.includes("JOB_ID"), false);
   assert.equal(JSON.stringify(buildReportPumpStructuralAttestation(JOB_ID, 2)).includes(TOKEN), false);
 });
 
@@ -115,6 +129,7 @@ function makeInput() {
 function makeDependencies(events, overrides = {}) {
   return {
     randomBytes: () => Buffer.alloc(32, 0xab),
+    randomUUID: () => "controller-round-2",
     async createAutomation(call) { events.push(["create", call]); return { details: { id: JOB_ID } }; },
     async bindReporting(value) { events.push(["bind", value]); return { config: "bound" }; },
     async sendStartReceipt(value) { events.push(["start", value]); return { messageId: "receipt" }; },
@@ -125,6 +140,7 @@ function makeDependencies(events, overrides = {}) {
     async commitController(value) { events.push(["commit", value]); return { details: { status: "active" } }; },
     async removeAutomation(value) { events.push(["remove", value]); return { removed: true }; },
     async abortController(value) { events.push(["abort", value]); return { details: { status: "aborted" } }; },
+    async abortTransport(value) { events.push(["abort-transport", value]); return { type: "host_transport_preactivation_aborted" }; },
     async retainRecovery(value) { events.push(["retain", value]); return { status: "retained" }; },
     ...overrides,
   };
@@ -156,6 +172,38 @@ test("failure before registration removes only the newly created job and never a
     (error) => error instanceof AcpReportControllerPreparationError && error.code === "report_controller_preparation_failed",
   );
   assert.deepEqual(events.map(([name]) => name), ["create", "bind", "start", "assemble", "prepare", "remove"]);
+});
+
+test("malformed registration after transport preparation removes the job then aborts the exact transport", async () => {
+  const events = [];
+  const input = makeInput();
+  input.destination = { channel: "discord", accountId: "account-example", conversationId: {} };
+  await assert.rejects(
+    runReportControllerPreparation(input, makeDependencies(events)),
+    (error) => error instanceof AcpReportControllerPreparationError &&
+      error.code === "report_controller_registration_invalid",
+  );
+  assert.deepEqual(events.map(([name]) => name), [
+    "create", "bind", "start", "assemble", "prepare", "remove", "abort-transport",
+  ]);
+  assert.deepEqual(events.at(-1)[1], {
+    transportFile: "/private/transport.json",
+    processHandle: "handle-1",
+  });
+});
+
+test("non-prepared registration removes the job before controller-proven abort", async () => {
+  const events = [];
+  await assert.rejects(
+    runReportControllerPreparation(makeInput(), makeDependencies(events, {
+      async registerController(value) { events.push(["register", value]); return { status: "rejected" }; },
+    })),
+    (error) => error instanceof AcpReportControllerPreparationError &&
+      error.code === "report_controller_registration_failed",
+  );
+  assert.deepEqual(events.map(([name]) => name), [
+    "create", "bind", "start", "assemble", "prepare", "register", "remove", "abort",
+  ]);
 });
 
 test("failure before activation confirmation removes the current job before aborting preactivation", async () => {

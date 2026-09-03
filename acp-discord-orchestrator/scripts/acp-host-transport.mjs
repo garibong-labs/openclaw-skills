@@ -24,7 +24,8 @@ import {
 import {
   ACP_SUPPORTED_AGENTS,
   buildAcpIntermediateReport,
-  buildAcpTerminalReport
+  buildAcpTerminalReport,
+  isReportPumpId
 } from "./acp-reporting-contract.mjs";
 
 // v2 is an incompatible bump over acp-host-transport.v1: the private record
@@ -218,16 +219,20 @@ function sleepSyncMs(ms) {
 // A live lock is never silently stolen: takeover happens only after the
 // bounded stale age, which only a crashed or wedged holder can reach because
 // every action releases the lock before returning.
-function acquireTransportLock(recordFile, action, dependencies = {}) {
+export function acquireTransportLock(recordFile, action, dependencies = {}) {
   const lockFile = `${recordFile}.lock`;
   const waitMs = dependencies.lockWaitMs ?? TRANSPORT_LOCK_WAIT_MS;
   const staleMs = dependencies.lockStaleMs ?? TRANSPORT_LOCK_STALE_MS;
   const sleep = dependencies.sleepMs ?? sleepSyncMs;
+  const fileSystem = dependencies.fileSystem ?? fs;
   const ownerToken = crypto.randomUUID();
   const deadlineMs = Date.now() + waitMs;
   for (;;) {
+    if (Date.now() >= deadlineMs) {
+      transportFail("host_transport_lock_timeout");
+    }
     try {
-      fs.writeFileSync(lockFile, JSON.stringify({
+      fileSystem.writeFileSync(lockFile, JSON.stringify({
         schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
         type: "host_transport_lease",
         action,
@@ -242,9 +247,10 @@ function acquireTransportLock(recordFile, action, dependencies = {}) {
     }
     let stat = null;
     try {
-      stat = fs.lstatSync(lockFile);
+      stat = fileSystem.lstatSync(lockFile);
     } catch (error) {
       if (error && error.code === "ENOENT") {
+        sleep(25);
         continue;
       }
       transportFail("host_transport_lock_failed");
@@ -253,22 +259,20 @@ function acquireTransportLock(recordFile, action, dependencies = {}) {
       // Expired lease of a crashed holder — not a live lease. Remove it and
       // race for a fresh acquisition; losing that race just loops again.
       try {
-        fs.unlinkSync(lockFile);
+        fileSystem.unlinkSync(lockFile);
       } catch {
         // Another taker may have removed it first.
       }
+      sleep(25);
       continue;
-    }
-    if (Date.now() >= deadlineMs) {
-      transportFail("host_transport_lock_timeout");
     }
     sleep(25);
   }
   return function releaseTransportLock() {
     try {
-      const holder = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+      const holder = JSON.parse(fileSystem.readFileSync(lockFile, "utf8"));
       if (holder && holder.ownerToken === ownerToken) {
-        fs.unlinkSync(lockFile);
+        fileSystem.unlinkSync(lockFile);
       }
     } catch {
       // Release is best-effort: an unreadable or foreign lock is left alone
@@ -360,14 +364,6 @@ function validateControllerLease(value) {
   return value;
 }
 
-function isPumpJobId(value) {
-  // Mirrors the reporting contract's reportPump.id rule: 1..200 characters
-  // with no whitespace or control characters.
-  return typeof value === "string" &&
-    value.length >= 1 && value.length <= 200 &&
-    !/[\s\u0000-\u001F\u007F-\u009F\u2028\u2029]/u.test(value);
-}
-
 // The public 마지막 ACP 활동 age is bound to normalized ACP activity events
 // only — envelope `type: "activity"`, the model/tool/status activity of the
 // exact execution handle. Host lifecycle/control marks (`activation_confirmed`,
@@ -439,7 +435,7 @@ function validatePublication(value) {
     value.attemptCount < 0 || value.attemptCount > MAX_REPORT_PUBLICATION_ATTEMPTS ||
     ![null, "acknowledged", "uncertain", "missing"].includes(value.lastAttemptOutcome) ||
     ![null, "tracking_lost"].includes(value.halted) ||
-    (value.pumpJobId !== null && !isPumpJobId(value.pumpJobId))) {
+    (value.pumpJobId !== null && !isReportPumpId(value.pumpJobId))) {
     transportFail("host_transport_record_invalid");
   }
   const attempt = value.attempt;
@@ -450,7 +446,7 @@ function validatePublication(value) {
     typeof attempt.attemptId === "string" && SAFE_HANDLE.test(attempt.attemptId) &&
     attempt.fence === value.fence && value.fence >= 1 &&
     ["claim_acquired", "delivery_pending"].includes(attempt.state) &&
-    isPumpJobId(attempt.jobId) && attempt.jobId === value.pumpJobId &&
+    isReportPumpId(attempt.jobId) && attempt.jobId === value.pumpJobId &&
     typeof attempt.runToken === "string" && SAFE_HANDLE.test(attempt.runToken) &&
     validInstant(attempt.claimedAt) && validInstant(attempt.expiresAt) &&
     Date.parse(attempt.expiresAt) > Date.parse(attempt.claimedAt)
@@ -580,11 +576,12 @@ function parseTransportRecord(value) {
     "environmentFile",
     "createdAt",
     "reportingContext",
-    "publication"
+    "publication",
+    "controllerLease"
   ];
   if (
     !isPlainObject(value) ||
-    !Object.keys(value).every((key) => required.includes(key) || key === "controllerLease") ||
+    !Object.keys(value).every((key) => required.includes(key)) ||
     !required.every((key) => Object.hasOwn(value, key)) ||
     value.schemaVersion !== ACP_HOST_TRANSPORT_SCHEMA_VERSION ||
     typeof value.transportId !== "string" ||
@@ -607,7 +604,7 @@ function parseTransportRecord(value) {
   }
   validateReportingContext(value.reportingContext);
   validatePublication(value.publication);
-  if (value.controllerLease !== undefined) validateControllerLease(value.controllerLease);
+  validateControllerLease(value.controllerLease);
   return value;
 }
 
@@ -763,6 +760,10 @@ export function prepareHostTransport(input, dependencies = {}) {
   probeHostTransport(dependencies);
   const configFile = assertPrivateRegularFile(input.configFile, "host_transport_config_file");
   const config = (dependencies.loadConfig ?? loadSupervisorConfig)(configFile);
+  const configuredPumpJobId = config.reporting?.reportPump?.id;
+  if (configuredPumpJobId !== undefined && !isReportPumpId(configuredPumpJobId)) {
+    transportFail("host_transport_pump_job_invalid");
+  }
   const stateDir = preparePrivateDirectory(config.stateDir);
   const randomUUID = dependencies.randomUUID ?? crypto.randomUUID;
   const handle = createHandle(randomUUID);
@@ -806,8 +807,8 @@ export function prepareHostTransport(input, dependencies = {}) {
       // id; bind it now so only that exact scheduler job can claim reports.
       // v1/v2 watchdog configs stay accepted (bounded migration): their
       // records bind the pump job on its first successful claim instead.
-      pumpJobId: typeof config.reporting?.reportPump?.id === "string"
-        ? config.reporting.reportPump.id
+      pumpJobId: configuredPumpJobId !== undefined
+        ? configuredPumpJobId
         : null
     },
     controllerLease: initialControllerLeaseState()
@@ -1143,6 +1144,7 @@ export function requireReport(loaded, kind, cadence, requiredAtMs, evidenceThrou
   publication.requiredAt = new Date(requiredAtMs).toISOString();
   publication.evidenceThroughSequence = evidenceThroughSequence;
   publication.receiptMessageId = null;
+  publication.lastAttemptOutcome = null;
   if (terminal) {
     publication.terminalSequence = terminal.sequence;
     publication.terminalStatus = terminalStatus(terminal);
@@ -1295,7 +1297,7 @@ function claimResult(status, extra = {}) {
 // live record and event log at claim time.
 export function claimHostTransportReport(input, dependencies = {}) {
   const handle = assertHandle(input.processHandle);
-  if (!isPumpJobId(input.jobId)) {
+  if (!isReportPumpId(input.jobId)) {
     transportFail("host_transport_pump_job_invalid");
   }
   if (typeof input.runToken !== "string" || !SAFE_HANDLE.test(input.runToken)) {
@@ -1331,10 +1333,11 @@ export function claimHostTransportReport(input, dependencies = {}) {
     if (bindingJob) {
       publication.pumpJobId = input.jobId;
     }
-    if (!terminal && exitCode === null && !active) {
-      // The exact tracked session is gone without terminal or exit evidence:
+    if (!terminal && !active) {
+      // The exact tracked session is gone without terminal evidence:
       // control-plane tracking loss. Stop publication permanently — a report
-      // that claims ACP is still running would be false — and never relaunch.
+      // that claims ACP is still running would be false — even when a mapped
+      // exit file survived — and never relaunch.
       publication.halted = "tracking_lost";
       persistTransportRecord(loaded);
       return claimResult("tracking_lost");
@@ -1654,19 +1657,12 @@ function reconcileLockedTransport(loaded, handle) {
       status: "terminal_publication_pending"
     };
   }
-  const reconciled = ledger.state === "exit_reconciled"
-    ? reconcileLifecycleLedger({
-        ledgerFile,
-        processHandle: ledger.processHandle,
-        outcome: "exited",
-        exitCode
-      })
-    : reconcileLifecycleLedger({
-        ledgerFile,
-        processHandle: ledger.processHandle,
-        outcome: "exited",
-        exitCode
-      });
+  const reconciled = reconcileLifecycleLedger({
+    ledgerFile,
+    processHandle: ledger.processHandle,
+    outcome: "exited",
+    exitCode
+  });
   return {
     schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
     type: "host_transport_reconciled",

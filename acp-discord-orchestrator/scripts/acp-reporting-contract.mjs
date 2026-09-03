@@ -42,10 +42,10 @@ const MAX_WATCHDOG_TIMEOUT_SECONDS = 60;
 
 // Non-secret structural identity of the deterministic OpenClaw 2026.8.1
 // controller job. The digest is over the exact public script template with
-// its literal LEASE_TOKEN placeholder, never over a token-substituted job.
-// The actual lease token exists only in the privately created scheduler job.
+// its literal LEASE_TOKEN and JOB_ID placeholders, never over a substituted
+// job. The actual lease token and reserved id exist only in scheduler state.
 export const ACP_REPORT_CONTROLLER_SCRIPT_VERSION = 'acp-report-controller-script.v1';
-export const ACP_REPORT_CONTROLLER_SCRIPT_SHA256 = '8e48a6cbe8bdb1e6142331257a5763edfc41687e9081745aea074a27146187e7';
+export const ACP_REPORT_CONTROLLER_SCRIPT_SHA256 = 'dad87e9f3b11f74d7a541c3b0c5ac0cdaca2ffd4fd49161ec2b4b333c4b6c65c';
 export const ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS = 60;
 export const ACP_REPORT_CONTROLLER_TOOL_BUDGET = 5;
 export const ACP_REPORT_CONTROLLER_TOOLS_ALLOW = Object.freeze([
@@ -112,6 +112,12 @@ export const ACP_TERMINAL_REPORT_STATUSES = Object.freeze([
 // result renders `Δ0 · 새로 확인된 ACP 결과 없음` next to an activity age of
 // `0분 전`.
 export const ACP_REPORT_NO_NEW_RESULT = '새로 확인된 ACP 결과 없음';
+
+export function isReportPumpId(value) {
+  return typeof value === 'string' &&
+    value.length >= 1 && value.length <= MAX_WATCHDOG_ID_LENGTH &&
+    !NO_WHITESPACE_OR_CONTROL_RE.test(value);
+}
 
 // The only valid phaseIndex → phaseName mappings for the 라운드 metadata line.
 export const ACP_REPORT_PHASES = Object.freeze({
@@ -684,7 +690,7 @@ const TERMINAL_REPORT_INPUT_KEYS = Object.freeze([
   'externalAction',
 ]);
 const MAX_REPORT_MINUTES = 99999;
-const MAX_REPORT_RESULT_DELTA = 9999;
+export const MAX_REPORT_RESULT_DELTA = 9999;
 
 function validateReportMinutes(value, label) {
   if (!Number.isInteger(value) || value < 0 || value > MAX_REPORT_MINUTES) {
@@ -974,12 +980,7 @@ function validateWatchdog(watchdog, expected) {
     'watchdog'
   );
   const { id } = watchdog;
-  if (
-    typeof id !== 'string' ||
-    id.length === 0 ||
-    id.length > MAX_WATCHDOG_ID_LENGTH ||
-    NO_WHITESPACE_OR_CONTROL_RE.test(id)
-  ) {
+  if (!isReportPumpId(id)) {
     fail('invalid_reporting_watchdog', 'watchdog.id must be 1..200 characters with no whitespace or control characters');
   }
   if (watchdog.roundIndex !== expected.roundIndex) {
@@ -1060,12 +1061,7 @@ function validateReportPump(reportPump, expected) {
     'reportPump'
   );
   const { id } = reportPump;
-  if (
-    typeof id !== 'string' ||
-    id.length === 0 ||
-    id.length > MAX_WATCHDOG_ID_LENGTH ||
-    NO_WHITESPACE_OR_CONTROL_RE.test(id)
-  ) {
+  if (!isReportPumpId(id)) {
     fail('invalid_reporting_report_pump', 'reportPump.id must be 1..200 characters with no whitespace or control characters');
   }
   if (reportPump.roundIndex !== expected.roundIndex) {
