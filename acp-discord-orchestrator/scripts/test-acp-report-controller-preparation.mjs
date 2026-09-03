@@ -198,6 +198,14 @@ function createdJob(overrides = {}) {
   };
 }
 
+// The order installed OpenClaw 2026.8.1 actually persists. `capCronJobToolsAllow`
+// rewrites the finite requested allowlist as
+// `creatorToolsAllow.filter(matches).map((tool) => tool.name)`, and the creator
+// tool surface builds core `automations` before core `message` and appends
+// plugin tools last — so the arm request's canonical order never survives, and
+// the stored job comes back permuted. Fixtures model that real answer.
+const PERSISTED_TOOLS_ALLOW = ["automations", "message", "acp_report_controller"];
+
 // The exact persisted job installed OpenClaw 2026.8.1 returns from the
 // model-callable automations update (Gateway cron.update -> cronJobReadView),
 // including the scheduler-owned `anchorMs` phase anchor and inert bookkeeping.
@@ -216,7 +224,7 @@ function armedJob(overrides = {}) {
         script: ARMED_SCRIPT,
         timeoutSeconds: 60,
         toolBudget: 5,
-        toolsAllow: ["acp_report_controller", "message", "automations"],
+        toolsAllow: [...PERSISTED_TOOLS_ALLOW],
       },
       delivery: { mode: "none" },
       createdAtMs: 1756890000000,
@@ -291,7 +299,9 @@ test("preparation creates disabled, arms the exact returned id, then binds, regi
       script: ARMED_SCRIPT,
       timeoutSeconds: 60,
       toolBudget: 5,
-      toolsAllow: ["acp_report_controller", "message", "automations"],
+      // Proven accepted in the order the scheduler really stores, not the order
+      // the arm request asked for.
+      toolsAllow: ["automations", "message", "acp_report_controller"],
     },
     delivery: { mode: "none" },
     createdAtMs: 1756890000000,
@@ -377,6 +387,44 @@ test("a returned job that is not disabled is removed instead of armed", async ()
   assert.deepEqual(events.at(-1)[1], { action: "remove", jobId: JOB_ID });
 });
 
+function permute(values) {
+  if (values.length === 0) return [[]];
+  return values.flatMap((entry, index) => permute(
+    [...values.slice(0, index), ...values.slice(index + 1)],
+  ).map((rest) => [entry, ...rest]));
+}
+
+// Installed OpenClaw 2026.8.1 normalizes the requested allowlist order away, so
+// the stored array's order is a projection of the creator tool surface and
+// carries no authority. Authority is the SET of names, and every ordering of
+// exactly the intended set is the same safe authority. Three distinct names
+// have exactly six orderings, so iterating them is exhaustive over order.
+test("every persisted ordering of the exact allowlist set arms and reaches bind and start", async () => {
+  const canonical = ["acp_report_controller", "message", "automations"];
+  const orderings = permute(canonical);
+  assert.equal(orderings.length, 6);
+  // The order the scheduler really stores is one of them, and is deliberately
+  // not the order the arm request asks for.
+  assert.equal(orderings.some((order) => order.join() === PERSISTED_TOOLS_ALLOW.join()), true);
+  assert.notDeepEqual(PERSISTED_TOOLS_ALLOW, canonical);
+  for (const toolsAllow of orderings) {
+    const events = [];
+    const result = await runReportControllerPreparation(makeInput(), makeDependencies(events, {
+      async armAutomation(call) {
+        events.push(["arm", call]);
+        // Whatever the scheduler stores, the outgoing request is unchanged.
+        assert.deepEqual(call.job.payload.toolsAllow, canonical, toolsAllow.join());
+        return armedJobVariant({ payload: { toolsAllow } });
+      },
+    }));
+    assert.deepEqual(events.map(([name]) => name), [
+      "create", "arm", "bind", "start", "assemble", "prepare", "register", "activate", "commit",
+    ], toolsAllow.join());
+    assert.equal(result.controllerStatus, "active", toolsAllow.join());
+    assert.equal(events.some(([name]) => name === "remove"), false, toolsAllow.join());
+  }
+});
+
 test("an unproven arm removes the exact created job and never binds or starts", async () => {
   const cases = [
     ["throws", "report_controller_preparation_failed", () => { throw new Error("secret arm detail"); }],
@@ -453,8 +501,12 @@ test("an unproven arm removes the exact created job and never binds or starts", 
       () => armedJobVariant({ dropPayloadKeys: ["toolBudget"] })],
     ["wrong tool allowlist", "report_controller_job_arm_invalid",
       () => armedJobVariant({ payload: { toolsAllow: ["acp_report_controller", "message", "exec"] } })],
-    ["misordered tool allowlist", "report_controller_job_arm_invalid",
-      () => armedJobVariant({ payload: { toolsAllow: ["automations", "message", "acp_report_controller"] } })],
+    ["duplicated tool allowlist entry", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ payload: { toolsAllow: ["message", "message", "automations"] } })],
+    ["non-string tool allowlist entry", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ payload: { toolsAllow: ["automations", "message", { name: "acp_report_controller" }] } })],
+    ["plugin group tool allowlist entry", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ payload: { toolsAllow: ["automations", "message", "group:acp"] } })],
     ["extra tool allowlist entry", "report_controller_job_arm_invalid",
       () => armedJobVariant({
         payload: { toolsAllow: ["acp_report_controller", "message", "automations", "exec"] },
@@ -553,6 +605,108 @@ test("automation removal failure never aborts the prepared lease", async () => {
       !error.message.includes("secret"),
   );
   assert.equal(events.some(([name]) => name === "abort"), false);
+});
+
+// The model-callable automations remove wraps the Gateway cron.remove payload
+// with jsonResult(...), so a real successful removal arrives as
+// `{ content, details: { removed: true } }` with no top-level `removed`.
+// Reading only the top level would misread that success as a failure and skip
+// the transport/controller abort, orphaning a prepared lease.
+const PROVEN_REMOVALS = [
+  ["model-tool jsonResult envelope",
+    { content: [{ type: "text", text: '{\n  "removed": true\n}' }], details: { removed: true } }],
+  ["nested details.removed", { details: { removed: true } }],
+  ["unwrapped top-level removed", { removed: true }],
+  ["top-level removed status", { status: "removed" }],
+  ["nested details status", { details: { status: "removed" } }],
+];
+
+test("a proven removal in any real envelope aborts the exact unregistered prepared transport", async () => {
+  for (const [label, removal] of PROVEN_REMOVALS) {
+    const events = [];
+    const input = makeInput();
+    // Registration construction fails after prepare, so the transport exists
+    // but was never registered and must be aborted directly.
+    input.destination = { channel: "discord", accountId: "account-example", conversationId: {} };
+    await assert.rejects(
+      runReportControllerPreparation(input, makeDependencies(events, {
+        async removeAutomation(value) { events.push(["remove", value]); return removal; },
+      })),
+      (error) => error instanceof AcpReportControllerPreparationError &&
+        error.code === "report_controller_registration_invalid",
+      label,
+    );
+    assert.deepEqual(events.map(([name]) => name), [
+      "create", "arm", "bind", "start", "assemble", "prepare", "remove", "abort-transport",
+    ], label);
+    assert.deepEqual(events.at(-2)[1], { action: "remove", jobId: JOB_ID }, label);
+    assert.deepEqual(events.at(-1)[1], {
+      transportFile: "/private/transport.json",
+      processHandle: "handle-1",
+    }, label);
+  }
+});
+
+test("a proven removal in any real envelope aborts the exact registered controller lease", async () => {
+  for (const [label, removal] of PROVEN_REMOVALS) {
+    const events = [];
+    await assert.rejects(
+      runReportControllerPreparation(makeInput(), makeDependencies(events, {
+        async activate(value) { events.push(["activate", value]); throw new Error("synthetic activation failure"); },
+        async removeAutomation(value) { events.push(["remove", value]); return removal; },
+      })),
+      (error) => error instanceof AcpReportControllerPreparationError &&
+        error.code === "report_controller_preparation_failed",
+      label,
+    );
+    assert.deepEqual(events.map(([name]) => name), [
+      "create", "arm", "bind", "start", "assemble", "prepare", "register", "activate", "remove", "abort",
+    ], label);
+    // Removal is always proven before the lease is released, never after.
+    assert.deepEqual(events.at(-2)[1], { action: "remove", jobId: JOB_ID }, label);
+    assert.deepEqual(events.at(-1)[1], { action: "abort_preactivation", leaseToken: TOKEN }, label);
+  }
+});
+
+test("an unproven removal envelope never aborts or releases anything", async () => {
+  const cases = [
+    ["explicit nested denial", () => ({ details: { removed: false } })],
+    ["explicit top-level denial", () => ({ removed: false })],
+    ["truthy string instead of boolean", () => ({ removed: "true" })],
+    ["nested truthy string", () => ({ details: { removed: "true" } })],
+    ["truthy number instead of boolean", () => ({ details: { removed: 1 } })],
+    ["unrelated top-level status", () => ({ status: "error" })],
+    ["unrelated nested status", () => ({ details: { status: "not_found" } })],
+    ["removed-looking status value", () => ({ details: { status: "Removed" } })],
+    ["non-object details", () => ({ details: "removed" })],
+    ["array details", () => ({ details: [{ removed: true }] })],
+    ["null details", () => ({ details: null })],
+    ["empty envelope", () => ({})],
+    ["no envelope at all", () => undefined],
+    ["non-object envelope", () => "removed"],
+    ["boolean envelope", () => true],
+    // A wrapped envelope whose two levels disagree proves nothing either way.
+    ["contradicting levels", () => ({ removed: true, details: { removed: false } })],
+    ["contradicting status levels", () => ({ status: "removed", details: { status: "error" } })],
+    ["throws", () => { throw new Error("secret removal detail"); }],
+  ];
+  for (const [label, respond] of cases) {
+    const events = [];
+    await assert.rejects(
+      runReportControllerPreparation(makeInput(), makeDependencies(events, {
+        async activate(value) { events.push(["activate", value]); throw new Error("synthetic activation failure"); },
+        async removeAutomation(value) { events.push(["remove", value]); return respond(); },
+      })),
+      (error) => error instanceof AcpReportControllerPreparationError &&
+        error.code === "report_controller_pre_activation_cleanup_failed" &&
+        !error.message.includes("secret"),
+      label,
+    );
+    assert.deepEqual(events.map(([name]) => name), [
+      "create", "arm", "bind", "start", "assemble", "prepare", "register", "activate", "remove",
+    ], label);
+    assert.equal(events.some(([name]) => name.startsWith("abort")), false, label);
+  }
 });
 
 test("missing arm capability fails closed before any scheduler call", async () => {

@@ -250,10 +250,29 @@ async function createControllerPlaceholderJob(addCall, declarationKey, dependenc
   fail("report_controller_job_create_unresolved");
 }
 
+// The stored allowlist is attested as an exact finite SET, not as an ordered
+// list. Installed OpenClaw 2026.8.1 does not persist the requested order:
+// `capCronJobToolsAllow` rewrites a finite requested allowlist as
+// `creatorToolsAllow.filter(matches).map((tool) => tool.name)`, so the stored
+// array comes back in the creator's final executable tool-surface order — core
+// `automations` is built before core `message`, and plugin tools are appended
+// after both — no matter what order the arm request asked for. Position carries
+// no authority there; the authority a stored allowlist grants is exactly which
+// tool names it contains. So every permutation of the three intended names is
+// the same safe authority and is accepted, while a missing, extra, duplicated,
+// non-string, wildcard, or `group:`-prefixed entry is a different authority and
+// still fails closed. This set is unrelated to the public template and the
+// public structural attestation, which both stay in their pinned order.
+const CONTROLLER_TOOLS_ALLOW_SET = new Set(ACP_REPORT_CONTROLLER_TOOLS_ALLOW);
+
 function isExactControllerToolsAllow(toolsAllow) {
-  return Array.isArray(toolsAllow) &&
-    toolsAllow.length === ACP_REPORT_CONTROLLER_TOOLS_ALLOW.length &&
-    toolsAllow.every((tool, index) => tool === ACP_REPORT_CONTROLLER_TOOLS_ALLOW[index]);
+  if (!Array.isArray(toolsAllow) || toolsAllow.length !== CONTROLLER_TOOLS_ALLOW_SET.size) return false;
+  const seen = new Set();
+  for (const tool of toolsAllow) {
+    if (typeof tool !== "string" || !CONTROLLER_TOOLS_ALLOW_SET.has(tool) || seen.has(tool)) return false;
+    seen.add(tool);
+  }
+  return true;
 }
 
 // Installed OpenClaw 2026.8.1 answers the model-callable `automations`
@@ -264,7 +283,7 @@ function isExactControllerToolsAllow(toolsAllow) {
 // "unchanged" fields: the whole script-only controller contract — identity,
 // declaration key, name, session target, schedule, delivery, one-shot flag, and
 // the exact substituted script payload with its timeout, tool budget, and
-// ordered allowlist — is re-read off the returned job. Anything missing,
+// exact allowlist set — is re-read off the returned job. Anything missing,
 // altered, reshaped toward model/agentTurn/static-report execution, or carrying
 // a run/routing-altering field fails closed before reporting is ever bound.
 function assertArmedControllerJob(result, jobId, declarationKey, expectedScript) {
@@ -300,6 +319,39 @@ function resultStatus(result) {
   return isPlainObject(result?.details) ? result.details.status : result?.status;
 }
 
+const REMOVED_STATUS = "removed";
+
+// Read the removal signal carried by one envelope level. `undefined` means that
+// level says nothing about removal; `false` means it actively denies it and can
+// never be overridden by the other level.
+function readRemovalSignal(level) {
+  if (Object.hasOwn(level, "removed")) return level.removed === true;
+  if (Object.hasOwn(level, "status")) return level.status === REMOVED_STATUS;
+  return undefined;
+}
+
+// One strict bounded parser for every removal answer this boundary really
+// returns. Installed OpenClaw 2026.8.1 routes the model-callable `automations`
+// `action:"remove"` to Gateway `cron.remove`, which responds with the cron
+// store's own `{ removed: true }` result and whose tool layer then wraps that
+// payload with `jsonResult(...)` — so the model-visible envelope is
+// `{ content: [...], details: { removed: true } }` and carries no top-level
+// `removed` at all. A direct host capability may instead hand back the
+// unwrapped `{ removed: true }` or the `status:"removed"` form. Removal is
+// proven only by a strict boolean `true` or the exact string "removed", at the
+// top level or inside a plain-object `details`. A truthy string, an absent or
+// non-boolean `removed`, an unrelated status, a non-object `details`, an empty
+// envelope, or two levels that contradict each other all read as unproven, and
+// the caller then fails closed without aborting or releasing anything.
+function isProvenRemoval(result) {
+  if (!isPlainObject(result)) return false;
+  if (Object.hasOwn(result, "details") && !isPlainObject(result.details)) return false;
+  const signals = [readRemovalSignal(result)];
+  if (isPlainObject(result.details)) signals.push(readRemovalSignal(result.details));
+  const stated = signals.filter((signal) => signal !== undefined);
+  return stated.length > 0 && stated.every((signal) => signal === true);
+}
+
 export function buildReportControllerRegistration(input, leaseToken, jobId, prepared) {
   const registration = {
     action: "register",
@@ -329,8 +381,7 @@ export function buildReportControllerRegistration(input, leaseToken, jobId, prep
 async function rollbackBeforeActivation(jobId, leaseToken, prepared, registrationSubmitted, dependencies) {
   if (jobId !== undefined) {
     try {
-      const removed = await dependencies.removeAutomation({ action: "remove", jobId });
-      if (removed?.removed !== true && resultStatus(removed) !== "removed") {
+      if (!isProvenRemoval(await dependencies.removeAutomation({ action: "remove", jobId }))) {
         fail("report_controller_pre_activation_cleanup_failed");
       }
     } catch {
