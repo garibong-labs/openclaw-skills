@@ -1,10 +1,16 @@
 // Private preparation helpers for one durable ACP report-controller lease.
 //
 // The public template contains literal LEASE_TOKEN and JOB_ID placeholders.
-// Only buildReportControllerAutomationAddCall substitutes a generated private
-// token and reserved scheduler id. The resulting job object must go directly
-// to the authenticated `automations` add call. Neither the token nor the substituted script is
-// returned by runControllerPreparation or placed in the public supervisor
+// The model-callable `automations` boundary routes `action:"add"` to the public
+// Gateway `cron.add`, whose closed parameter schema has no `id` field, so a
+// caller cannot reserve a scheduler id. Preparation therefore runs a two-stage
+// sequence: `buildReportControllerPlaceholderAddCall` creates exactly one
+// DISABLED inert automation carrying a unique `declarationKey` and no private
+// data, and `buildReportControllerArmUpdateCall` then substitutes the private
+// lease token plus the scheduler-returned exact job id and enables the job in
+// one `action:"update"` call. There is never an enabled placeholder or
+// enabled wrong-script window. Neither the token nor the substituted script is
+// returned by runReportControllerPreparation or placed in the public supervisor
 // reporting bundle.
 
 import crypto from "node:crypto";
@@ -26,13 +32,28 @@ export const REPORT_CONTROLLER_AUTOMATION_TEMPLATE = fileURLToPath(
   new URL("../templates/report-controller-automation.json", import.meta.url),
 );
 
+// Inert body of the disabled placeholder job. It carries no lease token, no job
+// identity, and no tool call, so a placeholder that is never armed — or one left
+// behind by a permanently unresolved create — can only ever be a disabled no-op.
+export const REPORT_CONTROLLER_PLACEHOLDER_SCRIPT =
+  "// ACP report controller placeholder: created disabled and not yet armed.\nreturn;";
+
+// One replay of the identical declarationKey add converges on the exact job the
+// first attempt may have created; a second unresolved response fails closed.
+const MAX_CREATE_ATTEMPTS = 2;
+
 const LEASE_TOKEN_PLACEHOLDER = "LEASE_TOKEN";
 const JOB_ID_PLACEHOLDER = "JOB_ID";
 const SAFE_LEASE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{15,127}$/u;
 const SAFE_JOB_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
+const SAFE_DECLARATION_KEY = /^[A-Za-z0-9][A-Za-z0-9_-]{15,199}$/u;
 const SAFE_HANDLE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
 const SAFE_ACCOUNT = /^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$/u;
 const DECIMAL_ID = /^[0-9]{1,30}$/u;
+// The model-callable add boundary forwards the whole job object to the closed
+// `cron.add` schema, which rejects any unknown key. A reserved identity is not
+// reachable there, so neither spelling may ever reappear on an add job.
+const FORBIDDEN_ADD_JOB_KEYS = ["id", "jobId"];
 
 export class AcpReportControllerPreparationError extends Error {
   constructor(code) {
@@ -56,10 +77,13 @@ export function generateReportControllerLeaseToken(randomBytes = crypto.randomBy
   return token;
 }
 
-export function generateReportControllerJobId(randomUUID = crypto.randomUUID) {
-  const jobId = `acp-report-${randomUUID()}`;
-  if (!SAFE_JOB_ID.test(jobId)) fail("report_controller_job_create_invalid");
-  return jobId;
+// The declaration key is the only caller-chosen identity on the add boundary.
+// It is unique per preparation, carries no private data, and makes one exact
+// replay of the same add converge on the same job instead of creating a second.
+export function generateReportControllerDeclarationKey(randomUUID = crypto.randomUUID) {
+  const declarationKey = `acp-report-controller-${randomUUID()}`;
+  if (!SAFE_DECLARATION_KEY.test(declarationKey)) fail("report_controller_declaration_key_invalid");
+  return declarationKey;
 }
 
 export function loadReportControllerAutomationTemplate(fileSystem = fs) {
@@ -92,21 +116,56 @@ export function loadReportControllerAutomationTemplate(fileSystem = fs) {
   return clone(template);
 }
 
-export function buildReportControllerAutomationAddCall(leaseToken, jobId, options = {}) {
-  if (!SAFE_LEASE_TOKEN.test(leaseToken)) fail("report_controller_lease_token_invalid");
-  if (!SAFE_JOB_ID.test(jobId)) fail("report_controller_job_id_invalid");
+// Stage one: one DISABLED inert job. No lease token, no job identity, and — as
+// the closed `cron.add` schema requires — no reserved `id`/`jobId` key.
+export function buildReportControllerPlaceholderAddCall(declarationKey, options = {}) {
+  if (!SAFE_DECLARATION_KEY.test(declarationKey)) fail("report_controller_declaration_key_invalid");
   const template = loadReportControllerAutomationTemplate(options.fileSystem);
-  template.payload.script = template.payload.script
-    .replace(`"${LEASE_TOKEN_PLACEHOLDER}"`, JSON.stringify(leaseToken))
-    .replace(`"${JOB_ID_PLACEHOLDER}"`, JSON.stringify(jobId));
-  if (template.payload.script.includes(LEASE_TOKEN_PLACEHOLDER) ||
-      template.payload.script.includes(JOB_ID_PLACEHOLDER)) {
+  const job = {
+    name: template.name,
+    declarationKey,
+    sessionTarget: template.sessionTarget,
+    schedule: template.schedule,
+    payload: { ...template.payload, script: REPORT_CONTROLLER_PLACEHOLDER_SCRIPT },
+    delivery: template.delivery,
+    enabled: false,
+    deleteAfterRun: template.deleteAfterRun,
+  };
+  if (FORBIDDEN_ADD_JOB_KEYS.some((key) => Object.hasOwn(job, key)) ||
+      job.payload.script.includes(LEASE_TOKEN_PLACEHOLDER) ||
+      job.payload.script.includes(JOB_ID_PLACEHOLDER)) {
+    fail("report_controller_job_create_invalid");
+  }
+  return { action: "add", job };
+}
+
+// Stage two: substitute the private token and the scheduler-returned exact job
+// id into the pinned public script and enable the job in the same single call.
+export function buildReportControllerArmUpdateCall(jobId, leaseToken, options = {}) {
+  if (!SAFE_JOB_ID.test(jobId)) fail("report_controller_job_id_invalid");
+  if (!SAFE_LEASE_TOKEN.test(leaseToken)) fail("report_controller_lease_token_invalid");
+  const template = loadReportControllerAutomationTemplate(options.fileSystem);
+  const script = template.payload.script
+    .replace(`"${JOB_ID_PLACEHOLDER}"`, JSON.stringify(jobId))
+    .replace(`"${LEASE_TOKEN_PLACEHOLDER}"`, JSON.stringify(leaseToken));
+  if (script.includes(LEASE_TOKEN_PLACEHOLDER) || script.includes(JOB_ID_PLACEHOLDER) ||
+      !script.includes(JSON.stringify(jobId)) || !script.includes(JSON.stringify(leaseToken))) {
     fail("report_controller_automation_template_invalid");
   }
-  // The scheduler's internal create path accepts a pre-reserved durable id;
-  // this lets the enabled script carry its exact own identity atomically.
-  template.id = jobId;
-  return { action: "add", job: template };
+  return {
+    action: "update",
+    id: jobId,
+    job: {
+      payload: {
+        kind: template.payload.kind,
+        script,
+        timeoutSeconds: template.payload.timeoutSeconds,
+        toolBudget: template.payload.toolBudget,
+        toolsAllow: [...template.payload.toolsAllow],
+      },
+      enabled: true,
+    },
+  };
 }
 
 export function buildReportPumpStructuralAttestation(jobId, roundIndex) {
@@ -133,12 +192,52 @@ export function buildReportPumpStructuralAttestation(jobId, roundIndex) {
   };
 }
 
-function extractJobId(result, expectedJobId) {
-  const candidate = isPlainObject(result?.details) ? result.details.id : result?.id;
-  if (!SAFE_JOB_ID.test(candidate) || candidate !== expectedJobId) {
-    fail("report_controller_job_create_invalid");
+// The scheduler answers `add` with either the canonical job or the
+// declaration-key convergence envelope `{ created, updated?, job }`; the tool
+// layer may wrap either in `details`. Only a job whose declarationKey is
+// exactly ours proves which scheduler job this preparation owns.
+function readAutomationJob(result) {
+  const outer = isPlainObject(result?.details) ? result.details : result;
+  if (!isPlainObject(outer)) return undefined;
+  const job = isPlainObject(outer.job) ? outer.job : outer;
+  return isPlainObject(job) ? job : undefined;
+}
+
+function readCreatedControllerJob(result, declarationKey) {
+  const job = readAutomationJob(result);
+  if (job === undefined || typeof job.id !== "string" || !SAFE_JOB_ID.test(job.id) ||
+      job.declarationKey !== declarationKey) {
+    return undefined;
   }
-  return candidate;
+  return { id: job.id, enabled: job.enabled };
+}
+
+async function createControllerPlaceholderJob(addCall, declarationKey, dependencies) {
+  for (let attempt = 1; attempt <= MAX_CREATE_ATTEMPTS; attempt += 1) {
+    let created;
+    try {
+      created = await dependencies.createAutomation(clone(addCall));
+    } catch {
+      continue;
+    }
+    const job = readCreatedControllerJob(created, declarationKey);
+    if (job !== undefined) return job;
+  }
+  // The add may or may not have created a disabled inert job, and no exact id
+  // was ever proven. Never invent one, never enable anything, fail closed.
+  fail("report_controller_job_create_unresolved");
+}
+
+function assertArmedControllerJob(result, jobId, expectedScript) {
+  const job = readAutomationJob(result);
+  if (job === undefined || job.id !== jobId || job.enabled !== true) {
+    fail("report_controller_job_arm_invalid");
+  }
+  if (job.payload !== undefined &&
+      (!isPlainObject(job.payload) || job.payload.kind !== "script" ||
+        (job.payload.script !== undefined && job.payload.script !== expectedScript))) {
+    fail("report_controller_job_arm_invalid");
+  }
 }
 
 function assertPrepared(prepared) {
@@ -179,8 +278,8 @@ export function buildReportControllerRegistration(input, leaseToken, jobId, prep
   return registration;
 }
 
-async function rollbackBeforeActivation(jobId, automationCreated, leaseToken, prepared, registrationSubmitted, dependencies) {
-  if (automationCreated) {
+async function rollbackBeforeActivation(jobId, leaseToken, prepared, registrationSubmitted, dependencies) {
+  if (jobId !== undefined) {
     try {
       const removed = await dependencies.removeAutomation({ action: "remove", jobId });
       if (removed?.removed !== true && resultStatus(removed) !== "removed") {
@@ -256,7 +355,7 @@ export async function retryReportControllerActivationCommit(recovery, dependenci
 // shells out, polls, launches a background task, or returns the lease token.
 export async function runReportControllerPreparation(input, dependencies) {
   const required = [
-    "createAutomation", "bindReporting", "sendStartReceipt", "assemble",
+    "createAutomation", "armAutomation", "bindReporting", "sendStartReceipt", "assemble",
     "prepare", "registerController", "activate", "removeAutomation",
     "commitController", "abortController", "retainRecovery",
   ];
@@ -265,17 +364,25 @@ export async function runReportControllerPreparation(input, dependencies) {
     fail("report_controller_preparation_input_invalid");
   }
   const leaseToken = generateReportControllerLeaseToken(dependencies.randomBytes);
-  const jobId = generateReportControllerJobId(dependencies.randomUUID);
-  let automationCreated = false;
+  const declarationKey = generateReportControllerDeclarationKey(dependencies.randomUUID);
+  let jobId;
   let prepared;
   let registrationSubmitted = false;
   let activationConfirmed = false;
   try {
-    const created = await dependencies.createAutomation(
-      buildReportControllerAutomationAddCall(leaseToken, jobId),
+    const created = await createControllerPlaceholderJob(
+      buildReportControllerPlaceholderAddCall(declarationKey),
+      declarationKey,
+      dependencies,
     );
-    automationCreated = true;
-    extractJobId(created, jobId);
+    jobId = created.id;
+    if (created.enabled !== false) fail("report_controller_job_create_invalid");
+    const armCall = buildReportControllerArmUpdateCall(jobId, leaseToken);
+    assertArmedControllerJob(
+      await dependencies.armAutomation(armCall),
+      jobId,
+      armCall.job.payload.script,
+    );
     const reportPump = buildReportPumpStructuralAttestation(jobId, input.roundIndex);
     const bound = await dependencies.bindReporting({ jobId, reportPump });
     const startReceipt = await dependencies.sendStartReceipt({ jobId, reportPump, bound });
@@ -320,7 +427,6 @@ export async function runReportControllerPreparation(input, dependencies) {
     if (!activationConfirmed) {
       await rollbackBeforeActivation(
         jobId,
-        automationCreated,
         leaseToken,
         prepared,
         registrationSubmitted,

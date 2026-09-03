@@ -44,6 +44,8 @@ import {
 } from "./acp-lifecycle-ledger.mjs";
 
 const CONTROL_CONVERSATION_ID = "100000000000000001";
+// The scheduler, not the caller, mints the job id on the model-callable add.
+const COORDINATOR_JOB_ID = "5c1a7f60-6b9d-4a11-9f2e-71c0a4d5b8e3";
 const START_MESSAGE_ID = "100000000000000002";
 const PUMP_JOB_ID = "acp-report-pump-round-1";
 const TRANSPORT_CLI = fileURLToPath(new URL("acp-host-transport-cli.mjs", import.meta.url));
@@ -422,7 +424,17 @@ test("coordinator rollback releases a registered lease after exact supervisor pr
   }, {
     randomBytes: () => Buffer.alloc(32, 0xab),
     randomUUID: () => "coordinator-job",
-    async createAutomation(call) { calls.push("create"); return { id: call.job.id }; },
+    async createAutomation(call) {
+      calls.push("create");
+      assert.equal(Object.hasOwn(call.job, "id"), false);
+      assert.equal(call.job.enabled, false);
+      return { created: true, job: { id: COORDINATOR_JOB_ID, declarationKey: call.job.declarationKey, enabled: false } };
+    },
+    async armAutomation(call) {
+      calls.push("arm");
+      assert.equal(call.id, COORDINATOR_JOB_ID);
+      return { id: COORDINATOR_JOB_ID, enabled: true, payload: call.job.payload };
+    },
     async bindReporting() { calls.push("bind"); return {}; },
     async sendStartReceipt() { calls.push("start"); return {}; },
     async assemble() { calls.push("assemble"); return {}; },
@@ -439,7 +451,7 @@ test("coordinator rollback releases a registered lease after exact supervisor pr
     async retainRecovery() { assert.fail("recovery must not run"); },
   }), (error) => error instanceof AcpReportControllerPreparationError &&
     error.code === "report_controller_preparation_failed");
-  assert.deepEqual(calls, ["create", "bind", "start", "assemble", "prepare", "register",
+  assert.deepEqual(calls, ["create", "arm", "bind", "start", "assemble", "prepare", "register",
     "activate", "remove", "abort"]);
   assert.equal(readRecord(fixture).controllerLease.phase, "preactivation_aborted");
 });
@@ -2143,8 +2155,12 @@ test("normative contract documents every report-pump correction error code", () 
     "report_pump_input_invalid",
     "report_pump_input_schema",
     "report_controller_lease_token_invalid",
+    "report_controller_declaration_key_invalid",
     "report_controller_round_invalid",
     "report_controller_job_create_invalid",
+    "report_controller_job_create_unresolved",
+    "report_controller_job_id_invalid",
+    "report_controller_job_arm_invalid",
     "report_controller_registration_invalid",
     "report_controller_commit_recovery_invalid",
   ];

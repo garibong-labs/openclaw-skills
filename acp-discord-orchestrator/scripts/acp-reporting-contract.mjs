@@ -43,7 +43,8 @@ const MAX_WATCHDOG_TIMEOUT_SECONDS = 60;
 // Non-secret structural identity of the deterministic OpenClaw 2026.8.1
 // controller job. The digest is over the exact public script template with
 // its literal LEASE_TOKEN and JOB_ID placeholders, never over a substituted
-// job. The actual lease token and reserved id exist only in scheduler state.
+// job. The actual lease token and the substituted scheduler-returned job id
+// exist only in scheduler-private job state.
 export const ACP_REPORT_CONTROLLER_SCRIPT_VERSION = 'acp-report-controller-script.v1';
 export const ACP_REPORT_CONTROLLER_SCRIPT_SHA256 = 'dad87e9f3b11f74d7a541c3b0c5ac0cdaca2ffd4fd49161ec2b4b333c4b6c65c';
 export const ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS = 60;
