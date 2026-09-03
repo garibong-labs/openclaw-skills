@@ -34,6 +34,7 @@ import {
 // the standard schema/record codes; complete or cancel an in-flight v1 run
 // with the v1 skill before upgrading.
 export const ACP_HOST_TRANSPORT_SCHEMA_VERSION = "acp-host-transport.v2";
+export const ACP_HOST_CONTROLLER_LEASE_SCHEMA_VERSION = "acp-host-controller-lease.v1";
 export const DEFAULT_TRANSPORT_EVENT_WAIT_MS = 5000;
 export const REPORT_CADENCE_MS = 600000;
 const REPORT_DELIVERY_SUCCESS_STATUSES = Object.freeze(["sent", "delivered"]);
@@ -343,6 +344,22 @@ function initialPublicationState() {
   };
 }
 
+function initialControllerLeaseState() {
+  return { phase: "prepared" };
+}
+
+function validateControllerLease(value) {
+  if (!exactKeys(value, ["phase"]) || ![
+    "prepared",
+    "activation_in_progress",
+    "activation_confirmed",
+    "preactivation_aborted"
+  ].includes(value.phase)) {
+    transportFail("host_transport_record_invalid");
+  }
+  return value;
+}
+
 function isPumpJobId(value) {
   // Mirrors the reporting contract's reportPump.id rule: 1..200 characters
   // with no whitespace or control characters.
@@ -567,7 +584,7 @@ function parseTransportRecord(value) {
   ];
   if (
     !isPlainObject(value) ||
-    Object.keys(value).length !== required.length ||
+    !Object.keys(value).every((key) => required.includes(key) || key === "controllerLease") ||
     !required.every((key) => Object.hasOwn(value, key)) ||
     value.schemaVersion !== ACP_HOST_TRANSPORT_SCHEMA_VERSION ||
     typeof value.transportId !== "string" ||
@@ -590,6 +607,7 @@ function parseTransportRecord(value) {
   }
   validateReportingContext(value.reportingContext);
   validatePublication(value.publication);
+  if (value.controllerLease !== undefined) validateControllerLease(value.controllerLease);
   return value;
 }
 
@@ -791,7 +809,8 @@ export function prepareHostTransport(input, dependencies = {}) {
       pumpJobId: typeof config.reporting?.reportPump?.id === "string"
         ? config.reporting.reportPump.id
         : null
-    }
+    },
+    controllerLease: initialControllerLeaseState()
   };
   const environment = dependencies.environment ?? process.env;
   writePrivateJson(environmentFile, selectChildEnvironment(
@@ -863,6 +882,24 @@ export async function activateHostTransport(input, dependencies = {}) {
   if (required.event.type !== "activation_required") {
     transportFail("host_transport_pre_activation_failed");
   }
+  withTransportRecord(input.transportFile, "activate-begin", dependencies, (locked) => {
+    if (locked.record.processHandle !== handle) {
+      transportFail("host_transport_handle_mismatch");
+    }
+    if (locked.record.controllerLease.phase !== "prepared") {
+      transportFail("host_transport_activation_state_invalid");
+    }
+    const events = parseEvents(locked.record.eventsFile);
+    if (!events.some((event) => event.type === "activation_required") ||
+        events.some((event) => event.type !== "activation_required")) {
+      transportFail("host_transport_activation_state_uncertain");
+    }
+    if (!sessionExists(runTmux, handle)) {
+      transportFail("host_transport_not_running");
+    }
+    locked.record.controllerLease.phase = "activation_in_progress";
+    persistTransportRecord(locked);
+  });
   const activation = JSON.stringify({
     schemaVersion: ACP_HOST_ACTIVATION_SCHEMA_VERSION,
     processHandle: handle
@@ -870,6 +907,14 @@ export async function activateHostTransport(input, dependencies = {}) {
   const bufferName = `acp-${crypto.randomBytes(8).toString("hex")}`;
   const setResult = runTmux(["set-buffer", "-b", bufferName, activation], { timeoutMs: 5000 });
   if (setResult.error || setResult.status !== 0) {
+    withTransportRecord(input.transportFile, "activate-reset", dependencies, (locked) => {
+      if (locked.record.processHandle !== handle ||
+          locked.record.controllerLease.phase !== "activation_in_progress") {
+        transportFail("host_transport_activation_state_uncertain");
+      }
+      locked.record.controllerLease.phase = "prepared";
+      persistTransportRecord(locked);
+    });
     transportFail("host_transport_activation_write_failed");
   }
   const pasteResult = runTmux([
@@ -900,6 +945,15 @@ export async function activateHostTransport(input, dependencies = {}) {
   // Reload under the exclusive record lease for the read-modify-write of the
   // cadence anchor; the earlier load only served pre-activation event waits.
   withTransportRecord(input.transportFile, "activate", dependencies, (locked) => {
+    if (locked.record.processHandle !== handle ||
+        locked.record.controllerLease.phase !== "activation_in_progress") {
+      transportFail("host_transport_activation_state_uncertain");
+    }
+    const events = parseEvents(locked.record.eventsFile);
+    if (!events.some((event) => event.type === "activation_confirmed")) {
+      transportFail("host_transport_activation_state_uncertain");
+    }
+    locked.record.controllerLease.phase = "activation_confirmed";
     locked.record.publication.nextDueAt = new Date(
       elapsedOriginMs + REPORT_CADENCE_MS
     ).toISOString();
@@ -914,6 +968,73 @@ export async function activateHostTransport(input, dependencies = {}) {
       confirmed.event.runId
     )
   };
+}
+
+function controllerLeaseResult(type, processHandle) {
+  return {
+    schemaVersion: ACP_HOST_CONTROLLER_LEASE_SCHEMA_VERSION,
+    type,
+    processHandle
+  };
+}
+
+// Plugin-facing proof surface. The proof comes only from the exact private
+// record after activate has durably fenced and observed activation_confirmed.
+export function confirmHostTransportActivation(input, dependencies = {}) {
+  const handle = assertHandle(input.processHandle);
+  return withTransportRecord(input.transportFile, "confirm-activation", dependencies, (loaded) => {
+    if (loaded.record.processHandle !== handle ||
+        loaded.record.controllerLease.phase !== "activation_confirmed") {
+      transportFail("host_transport_activation_not_confirmed");
+    }
+    const events = parseEvents(loaded.record.eventsFile);
+    if (!events.some((event) => event.type === "activation_confirmed")) {
+      transportFail("host_transport_activation_not_confirmed");
+    }
+    return controllerLeaseResult("host_transport_activation_confirmed", handle);
+  });
+}
+
+function hasUnsafePreactivationEvidence(events) {
+  return events.some((event) => !["activation_required", "launcher_error"].includes(event.type));
+}
+
+// Plugin-facing preactivation rollback. The record lease serializes this
+// decision with activate-begin. No process id is accepted or inferred: only
+// the exact tmux session handle created by prepare may be stopped.
+export function abortHostTransportPreactivation(input, dependencies = {}) {
+  const handle = assertHandle(input.processHandle);
+  return withTransportRecord(input.transportFile, "abort-preactivation", dependencies, (loaded) => {
+    if (loaded.record.processHandle !== handle) {
+      transportFail("host_transport_handle_mismatch");
+    }
+    if (loaded.record.controllerLease.phase === "preactivation_aborted") {
+      return controllerLeaseResult("host_transport_preactivation_aborted", handle);
+    }
+    if (loaded.record.controllerLease.phase !== "prepared") {
+      transportFail("host_transport_preactivation_abort_denied");
+    }
+    const events = parseEvents(loaded.record.eventsFile);
+    if (hasUnsafePreactivationEvidence(events)) {
+      transportFail("host_transport_preactivation_abort_denied");
+    }
+    const runTmux = dependencies.runTmux ?? runTmuxDefault;
+    const active = sessionExists(runTmux, handle);
+    if (active) {
+      const stopped = runTmux(["kill-session", "-t", `=${handle}`], { timeoutMs: 5000 });
+      if (stopped.error || stopped.status !== 0) {
+        transportFail("host_transport_preactivation_abort_denied");
+      }
+    } else {
+      const exitCode = exitCodeFromFile(loaded.record.exitFile);
+      if (![22, 64].includes(exitCode) || events.length === 0) {
+        transportFail("host_transport_preactivation_abort_denied");
+      }
+    }
+    loaded.record.controllerLease.phase = "preactivation_aborted";
+    persistTransportRecord(loaded);
+    return controllerLeaseResult("host_transport_preactivation_aborted", handle);
+  });
 }
 
 function validateServiceCursorAck(loaded, acknowledgement, reissue, nowMs) {

@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "acp-report-controller-recovery.v1",
+  "type": "commit_activation_pending",
+  "leaseToken": "PRIVATE_OPAQUE_LEASE_TOKEN",
+  "jobId": "EXACT_CREATED_AUTOMATION_JOB_ID",
+  "transportFile": "/absolute/private/path/to/transport.json",
+  "processHandle": "EXACT_PREPARED_PROCESS_HANDLE"
+}

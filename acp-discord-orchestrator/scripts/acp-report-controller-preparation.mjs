@@ -143,6 +143,10 @@ function assertPrepared(prepared) {
   }
 }
 
+function resultStatus(result) {
+  return plainObject(result?.details) ? result.details.status : result?.status;
+}
+
 export function buildReportControllerRegistration(input, leaseToken, jobId, prepared) {
   const registration = {
     action: "register",
@@ -170,23 +174,68 @@ export function buildReportControllerRegistration(input, leaseToken, jobId, prep
 }
 
 async function rollbackBeforeActivation(jobId, leaseToken, registered, dependencies) {
-  let cleanupFailed = false;
   if (jobId !== undefined) {
     try {
-      await dependencies.removeAutomation({ action: "remove", jobId });
+      const removed = await dependencies.removeAutomation({ action: "remove", jobId });
+      if (removed?.removed !== true && resultStatus(removed) !== "removed") {
+        fail("report_controller_pre_activation_cleanup_failed");
+      }
     } catch {
-      cleanupFailed = true;
+      fail("report_controller_pre_activation_cleanup_failed");
     }
   }
   if (registered) {
     try {
-      const released = await dependencies.releaseController({ action: "release", leaseToken });
-      if (released?.status !== "released" && released?.details?.status !== "released") cleanupFailed = true;
+      const aborted = await dependencies.abortController({ action: "abort_preactivation", leaseToken });
+      if (resultStatus(aborted) !== "aborted") {
+        fail("report_controller_pre_activation_cleanup_failed");
+      }
     } catch {
-      cleanupFailed = true;
+      fail("report_controller_pre_activation_cleanup_failed");
     }
   }
-  if (cleanupFailed) fail("report_controller_pre_activation_cleanup_failed");
+}
+
+function commitRecoveryState(leaseToken, jobId, prepared) {
+  return {
+    schemaVersion: "acp-report-controller-recovery.v1",
+    type: "commit_activation_pending",
+    leaseToken,
+    jobId,
+    transportFile: prepared.transportFile,
+    processHandle: prepared.processHandle,
+  };
+}
+
+async function retainCommitRecovery(dependencies, recovery) {
+  const retained = await dependencies.retainRecovery(recovery);
+  if (retained?.retained !== true && resultStatus(retained) !== "retained") {
+    fail("report_controller_commit_recovery_failed");
+  }
+}
+
+export async function retryReportControllerActivationCommit(recovery, dependencies) {
+  if (!exactKeys(recovery, ["schemaVersion", "type", "leaseToken", "jobId", "transportFile", "processHandle"]) ||
+      recovery.schemaVersion !== "acp-report-controller-recovery.v1" ||
+      recovery.type !== "commit_activation_pending" ||
+      !SAFE_LEASE_TOKEN.test(recovery.leaseToken) || !SAFE_JOB_ID.test(recovery.jobId) ||
+      !path.isAbsolute(recovery.transportFile) || !SAFE_HANDLE.test(recovery.processHandle) ||
+      !plainObject(dependencies) || typeof dependencies.commitController !== "function") {
+    fail("report_controller_commit_recovery_invalid");
+  }
+  let committed;
+  try {
+    committed = await dependencies.commitController({
+      action: "commit_activation",
+      leaseToken: recovery.leaseToken,
+    });
+  } catch {
+    fail("report_controller_activation_commit_pending");
+  }
+  if (resultStatus(committed) !== "active") {
+    fail("report_controller_activation_commit_pending");
+  }
+  return { status: "active", jobId: recovery.jobId };
 }
 
 // Execute the capability-by-use sequence. Dependencies are the authenticated
@@ -196,7 +245,7 @@ export async function runReportControllerPreparation(input, dependencies) {
   const required = [
     "createAutomation", "bindReporting", "sendStartReceipt", "assemble",
     "prepare", "registerController", "activate", "removeAutomation",
-    "releaseController",
+    "commitController", "abortController", "retainRecovery",
   ];
   if (!plainObject(input) || !plainObject(dependencies) ||
       required.some((name) => typeof dependencies[name] !== "function")) {
@@ -205,7 +254,7 @@ export async function runReportControllerPreparation(input, dependencies) {
   const leaseToken = generateReportControllerLeaseToken(dependencies.randomBytes);
   let jobId;
   let registered = false;
-  let activated = false;
+  let activationConfirmed = false;
   try {
     const created = await dependencies.createAutomation(
       buildReportControllerAutomationAddCall(leaseToken),
@@ -219,8 +268,7 @@ export async function runReportControllerPreparation(input, dependencies) {
     assertPrepared(prepared);
     const registration = buildReportControllerRegistration(input, leaseToken, jobId, prepared);
     const registrationResult = await dependencies.registerController(registration);
-    if (registrationResult?.status !== "registered" &&
-        registrationResult?.details?.status !== "registered") {
+    if (resultStatus(registrationResult) !== "prepared") {
       fail("report_controller_registration_failed");
     }
     registered = true;
@@ -228,10 +276,32 @@ export async function runReportControllerPreparation(input, dependencies) {
       transportFile: prepared.transportFile,
       processHandle: prepared.processHandle,
     });
-    activated = true;
-    return { jobId, reportPump, startReceipt, prepared, activation };
+    if (activation?.type !== "host_transport_activated") {
+      fail("report_controller_activation_failed");
+    }
+    activationConfirmed = true;
+    let committed;
+    try {
+      committed = await dependencies.commitController({ action: "commit_activation", leaseToken });
+    } catch {
+      try {
+        await retainCommitRecovery(dependencies, commitRecoveryState(leaseToken, jobId, prepared));
+      } catch {
+        fail("report_controller_commit_recovery_failed");
+      }
+      fail("report_controller_activation_commit_pending");
+    }
+    if (resultStatus(committed) !== "active") {
+      try {
+        await retainCommitRecovery(dependencies, commitRecoveryState(leaseToken, jobId, prepared));
+      } catch {
+        fail("report_controller_commit_recovery_failed");
+      }
+      fail("report_controller_activation_commit_pending");
+    }
+    return { jobId, reportPump, startReceipt, prepared, activation, controllerStatus: "active" };
   } catch (error) {
-    if (!activated) await rollbackBeforeActivation(jobId, leaseToken, registered, dependencies);
+    if (!activationConfirmed) await rollbackBeforeActivation(jobId, leaseToken, registered, dependencies);
     if (error instanceof AcpReportControllerPreparationError) throw error;
     fail("report_controller_preparation_failed");
   }

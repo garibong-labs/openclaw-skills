@@ -11,12 +11,13 @@ import {
   buildReportPumpStructuralAttestation,
   generateReportControllerLeaseToken,
   loadReportControllerAutomationTemplate,
+  retryReportControllerActivationCommit,
   runReportControllerPreparation,
 } from "./acp-report-controller-preparation.mjs";
 import { validateAcpReportingContract } from "./acp-reporting-contract.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 
-const PINNED_PLUGIN_COMMIT = "f6e10e7312f7802165d8769251ac7a6133824695";
+const PINNED_PLUGIN_COMMIT = "7cdaf6463aac5c34868162f89476295a2a2f90ca";
 const PINNED_SCRIPT = `const leaseToken = "LEASE_TOKEN";
 const cleanup = async (result) => {
   if (result.status !== "terminal_acked" && result.status !== "tracking_lost") return;
@@ -119,19 +120,21 @@ function makeDependencies(events, overrides = {}) {
     async sendStartReceipt(value) { events.push(["start", value]); return { messageId: "receipt" }; },
     async assemble(value) { events.push(["assemble", value]); return { configFile: "/private/assembled.json" }; },
     async prepare(value) { events.push(["prepare", value]); return { transportFile: "/private/transport.json", processHandle: "handle-1" }; },
-    async registerController(value) { events.push(["register", value]); return { details: { status: "registered" } }; },
-    async activate(value) { events.push(["activate", value]); return { status: "activated" }; },
+    async registerController(value) { events.push(["register", value]); return { details: { status: "prepared" } }; },
+    async activate(value) { events.push(["activate", value]); return { type: "host_transport_activated" }; },
+    async commitController(value) { events.push(["commit", value]); return { details: { status: "active" } }; },
     async removeAutomation(value) { events.push(["remove", value]); return { removed: true }; },
-    async releaseController(value) { events.push(["release", value]); return { details: { status: "released" } }; },
+    async abortController(value) { events.push(["abort", value]); return { details: { status: "aborted" } }; },
+    async retainRecovery(value) { events.push(["retain", value]); return { status: "retained" }; },
     ...overrides,
   };
 }
 
-test("preparation creates and binds the exact job before receipt, registers after prepare, then activates", async () => {
+test("preparation registers prepared, activates, then commits active", async () => {
   const events = [];
   const result = await runReportControllerPreparation(makeInput(), makeDependencies(events));
   assert.deepEqual(events.map(([name]) => name), [
-    "create", "bind", "start", "assemble", "prepare", "register", "activate",
+    "create", "bind", "start", "assemble", "prepare", "register", "activate", "commit",
   ]);
   assert.equal(events[0][1].job.payload.script.includes(TOKEN), true);
   assert.equal(events[1][1].jobId, JOB_ID);
@@ -139,6 +142,8 @@ test("preparation creates and binds the exact job before receipt, registers afte
   assert.equal(events[5][1].jobId, JOB_ID);
   assert.equal(events[5][1].transportFile, "/private/transport.json");
   assert.deepEqual(events[6][1], { transportFile: "/private/transport.json", processHandle: "handle-1" });
+  assert.deepEqual(events[7][1], { action: "commit_activation", leaseToken: TOKEN });
+  assert.equal(result.controllerStatus, "active");
   assert.equal(JSON.stringify(result).includes(TOKEN), false);
 });
 
@@ -153,7 +158,7 @@ test("failure before registration removes only the newly created job and never a
   assert.deepEqual(events.map(([name]) => name), ["create", "bind", "start", "assemble", "prepare", "remove"]);
 });
 
-test("failure after confirmed registration removes the current job before attempting lease release and never reactivates", async () => {
+test("failure before activation confirmation removes the current job before aborting preactivation", async () => {
   const events = [];
   await assert.rejects(
     runReportControllerPreparation(makeInput(), makeDependencies(events, {
@@ -162,21 +167,56 @@ test("failure after confirmed registration removes the current job before attemp
     (error) => error instanceof AcpReportControllerPreparationError && error.code === "report_controller_preparation_failed",
   );
   assert.deepEqual(events.map(([name]) => name), [
-    "create", "bind", "start", "assemble", "prepare", "register", "activate", "remove", "release",
+    "create", "bind", "start", "assemble", "prepare", "register", "activate", "remove", "abort",
   ]);
   assert.deepEqual(events.at(-2)[1], { action: "remove", jobId: JOB_ID });
-  assert.deepEqual(events.at(-1)[1], { action: "release", leaseToken: TOKEN });
+  assert.deepEqual(events.at(-1)[1], { action: "abort_preactivation", leaseToken: TOKEN });
 });
 
-test("cleanup failures replace private causes with one bounded error code", async () => {
+test("automation removal failure never aborts the prepared lease", async () => {
   const events = [];
   await assert.rejects(
     runReportControllerPreparation(makeInput(), makeDependencies(events, {
       async activate(value) { events.push(["activate", value]); throw new Error("secret activation detail"); },
-      async releaseController(value) { events.push(["release", value]); return { status: "error" }; },
+      async removeAutomation(value) { events.push(["remove", value]); return { status: "error" }; },
     })),
     (error) => error instanceof AcpReportControllerPreparationError &&
       error.code === "report_controller_pre_activation_cleanup_failed" &&
       !error.message.includes("secret"),
   );
+  assert.equal(events.some(([name]) => name === "abort"), false);
+});
+
+test("commit failure retains exact recovery and never removes, aborts, or relaunches", async () => {
+  const events = [];
+  await assert.rejects(
+    runReportControllerPreparation(makeInput(), makeDependencies(events, {
+      async commitController(value) { events.push(["commit", value]); throw new Error("lost response"); },
+    })),
+    (error) => error instanceof AcpReportControllerPreparationError &&
+      error.code === "report_controller_activation_commit_pending",
+  );
+  assert.deepEqual(events.map(([name]) => name), [
+    "create", "bind", "start", "assemble", "prepare", "register", "activate", "commit", "retain",
+  ]);
+  const recovery = events.at(-1)[1];
+  assert.equal(recovery.leaseToken, TOKEN);
+  assert.equal(recovery.type, "commit_activation_pending");
+  assert.equal(events.some(([name]) => ["remove", "abort"].includes(name)), false);
+});
+
+test("fresh same-session recovery retries only commit_activation", async () => {
+  const calls = [];
+  const result = await retryReportControllerActivationCommit({
+    schemaVersion: "acp-report-controller-recovery.v1",
+    type: "commit_activation_pending",
+    leaseToken: TOKEN,
+    jobId: JOB_ID,
+    transportFile: "/private/transport.json",
+    processHandle: "handle-1",
+  }, {
+    async commitController(value) { calls.push(value); return { status: "active" }; },
+  });
+  assert.deepEqual(calls, [{ action: "commit_activation", leaseToken: TOKEN }]);
+  assert.deepEqual(result, { status: "active", jobId: JOB_ID });
 });

@@ -15,8 +15,10 @@ import {
   REPORT_CADENCE_MS,
   acknowledgeHostTransportReport,
   activateHostTransport,
+  abortHostTransportPreactivation,
   beginHostTransportReportDelivery,
   claimHostTransportReport,
+  confirmHostTransportActivation,
   prepareHostTransport,
   probeHostTransport,
   requireReport,
@@ -192,7 +194,8 @@ function readRecord(fixture) {
   return JSON.parse(fs.readFileSync(fixture.transportFile, "utf8"));
 }
 
-function writeStaticTransport({ root, handle, events, publication = publicationFixture(), exitCode = null }) {
+function writeStaticTransport({ root, handle, events, publication = publicationFixture(), exitCode = null,
+  controllerLease }) {
   if (process.platform !== "win32") fs.chmodSync(root, 0o700);
   const prefix = path.join(root, `host-transport-${handle}`);
   const transportFile = `${prefix}.json`;
@@ -208,13 +211,111 @@ function writeStaticTransport({ root, handle, events, publication = publicationF
     environmentFile: `${prefix}.env.json`,
     createdAt: new Date(0).toISOString(),
     reportingContext: reportingContextFixture(),
-    publication
+    publication,
+    ...(controllerLease === undefined ? {} : { controllerLease })
   };
   fs.writeFileSync(transportFile, JSON.stringify(record), { mode: 0o600 });
   fs.writeFileSync(record.eventsFile, events.map((event) => JSON.stringify(event)).join("\n") + "\n", { mode: 0o600 });
   if (exitCode !== null) fs.writeFileSync(record.exitFile, `${exitCode}\n`, { mode: 0o600 });
   return { transportFile, processHandle: handle, record };
 }
+
+test("controller activation proof returns only the exact closed plugin shape", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-controller-confirm-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-controller-confirm",
+    events: [event(1, "activation_confirmed")],
+    controllerLease: { phase: "activation_confirmed" },
+  });
+  assert.deepEqual(confirmHostTransportActivation(fixture), {
+    schemaVersion: "acp-host-controller-lease.v1",
+    type: "host_transport_activation_confirmed",
+    processHandle: fixture.processHandle,
+  });
+  assert.throws(() => confirmHostTransportActivation({ ...fixture, processHandle: "wrong-handle" }),
+    /host_transport_handle_mismatch|host_transport_activation_not_confirmed/u);
+  fixture.record.controllerLease.phase = "prepared";
+  fs.writeFileSync(fixture.transportFile, JSON.stringify(fixture.record), { mode: 0o600 });
+  assert.throws(() => confirmHostTransportActivation(fixture), /host_transport_activation_not_confirmed/u);
+});
+
+test("preactivation abort stops the exact session, seals atomically, and is idempotent", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-controller-abort-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-controller-abort",
+    events: [event(1, "activation_required")],
+    controllerLease: { phase: "prepared" },
+  });
+  const calls = [];
+  const dependencies = { runTmux(args) {
+    calls.push(args);
+    return args[0] === "has-session"
+      ? { status: 0, stdout: "", stderr: "" }
+      : { status: 0, stdout: "", stderr: "" };
+  } };
+  const expected = {
+    schemaVersion: "acp-host-controller-lease.v1",
+    type: "host_transport_preactivation_aborted",
+    processHandle: fixture.processHandle,
+  };
+  assert.deepEqual(abortHostTransportPreactivation(fixture, dependencies), expected);
+  assert.deepEqual(abortHostTransportPreactivation(fixture, dependencies), expected);
+  assert.deepEqual(calls, [
+    ["has-session", "-t", `=${fixture.processHandle}`],
+    ["kill-session", "-t", `=${fixture.processHandle}`],
+  ]);
+  assert.equal(readRecord(fixture).controllerLease.phase, "preactivation_aborted");
+});
+
+test("activate-vs-abort fence and uncertain or started evidence deny preactivation abort", () => {
+  for (const [name, phase, events, dependencies] of [
+    ["activation-in-progress", "activation_in_progress", [event(1, "activation_required")], ACTIVE_TMUX],
+    ["started", "prepared", [event(1, "activation_required"), event(2, "started")], ACTIVE_TMUX],
+    ["uncertain-dead", "prepared", [event(1, "activation_required")], DEAD_TMUX],
+  ]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `acp-controller-deny-${name}-`));
+    const fixture = writeStaticTransport({ root, handle: `acp-controller-${name}`,
+      events, controllerLease: { phase } });
+    assert.throws(() => abortHostTransportPreactivation(fixture, dependencies),
+      /host_transport_preactivation_abort_denied/u, name);
+    assert.equal(readRecord(fixture).controllerLease.phase, phase);
+  }
+});
+
+test("an uncertain activation write remains fenced against preactivation abort", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-controller-write-race-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-controller-write-race",
+    events: [event(1, "activation_required")],
+    controllerLease: { phase: "prepared" },
+  });
+  const dependencies = { runTmux(args) {
+    if (args[0] === "paste-buffer") return { status: 1, stdout: "", stderr: "uncertain" };
+    return { status: 0, stdout: "", stderr: "" };
+  } };
+  await assert.rejects(activateHostTransport(fixture, dependencies),
+    /host_transport_activation_write_failed/u);
+  assert.equal(readRecord(fixture).controllerLease.phase, "activation_in_progress");
+  assert.throws(() => abortHostTransportPreactivation(fixture, dependencies),
+    /host_transport_preactivation_abort_denied/u);
+});
+
+test("preactivation mapped launcher exit can be durably aborted without PID inference", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-controller-mapped-exit-"));
+  const fixture = writeStaticTransport({
+    root,
+    handle: "acp-controller-mapped-exit",
+    events: [{ schemaVersion: "acp-discord-orchestrator.v1", type: "launcher_error", code: "launcher_failed" }],
+    exitCode: 22,
+    controllerLease: { phase: "prepared" },
+  });
+  assert.equal(abortHostTransportPreactivation(fixture, DEAD_TMUX).type,
+    "host_transport_preactivation_aborted");
+  assert.equal(readRecord(fixture).controllerLease.phase, "preactivation_aborted");
+});
 
 function event(sequence, type = "activity", timestampMs = sequence * 1000, extra = {}) {
   return {
@@ -1778,6 +1879,11 @@ test("tmux host transport returns a handle before activation and reconciles exac
   const activated = await activateHostTransport(prepared);
   assert.equal(activated.type, "host_transport_activated");
   assert.equal(activated.processHandle, prepared.processHandle);
+  assert.deepEqual(confirmHostTransportActivation(prepared), {
+    schemaVersion: "acp-host-controller-lease.v1",
+    type: "host_transport_activation_confirmed",
+    processHandle: prepared.processHandle,
+  });
   assert.equal(fs.existsSync(activated.lifecycleLedgerFile), true);
 
   const status = await waitForExit(prepared);
