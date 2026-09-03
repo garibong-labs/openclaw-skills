@@ -9,9 +9,11 @@
 // data, and `buildReportControllerArmUpdateCall` then substitutes the private
 // lease token plus the scheduler-returned exact job id and enables the job in
 // one `action:"update"` call. There is never an enabled placeholder or
-// enabled wrong-script window. Neither the token nor the substituted script is
-// returned by runReportControllerPreparation or placed in the public supervisor
-// reporting bundle.
+// enabled wrong-script window. That update answers with the complete persisted
+// job, and preparation attests the whole final controller contract off it before
+// anything is bound, started, prepared, registered, or activated. Neither the
+// token nor the substituted script is returned by runReportControllerPreparation
+// or placed in the public supervisor reporting bundle.
 
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -41,6 +43,25 @@ export const REPORT_CONTROLLER_PLACEHOLDER_SCRIPT =
 // One replay of the identical declarationKey add converges on the exact job the
 // first attempt may have created; a second unresolved response fails closed.
 const MAX_CREATE_ATTEMPTS = 2;
+
+// The exact final controller contract. Every one of these is proven against the
+// persisted job the scheduler returns; none is inferred from the request.
+const CONTROLLER_JOB_NAME = "ACP report controller";
+const CONTROLLER_SESSION_TARGET = "isolated";
+const CONTROLLER_SCHEDULE_KIND = "every";
+const CONTROLLER_INTERVAL_MS = 600000;
+const CONTROLLER_DELIVERY_MODE = "none";
+const CONTROLLER_PAYLOAD_KIND = "script";
+const CONTROLLER_PAYLOAD_KEYS = ["kind", "script", "timeoutSeconds", "toolBudget", "toolsAllow"];
+// `anchorMs` is the scheduler-owned phase anchor stamped onto every `every`
+// schedule at create time. It shifts only when the fixed 600000-ms period starts,
+// never what the job runs, which tools it may call, or where output is routed, so
+// it is the one dynamic key accepted inside the attested schedule.
+const CONTROLLER_SCHEDULE_DYNAMIC_KEYS = ["anchorMs"];
+// Fields the intended controller job never carries and that would change what
+// runs (`trigger` script), when it runs (`pacing`), or where output goes
+// (`sessionKey`, `failureAlert`). Present in any form, the arm is unproven.
+const FORBIDDEN_ARMED_JOB_KEYS = ["trigger", "pacing", "sessionKey", "failureAlert"];
 
 const LEASE_TOKEN_PLACEHOLDER = "LEASE_TOKEN";
 const JOB_ID_PLACEHOLDER = "JOB_ID";
@@ -94,13 +115,14 @@ export function loadReportControllerAutomationTemplate(fileSystem = fs) {
     fail("report_controller_automation_template_invalid");
   }
   if (!hasExactKeys(template, ["name", "sessionTarget", "schedule", "payload", "delivery", "enabled", "deleteAfterRun"]) ||
-      template.name !== "ACP report controller" || template.sessionTarget !== "isolated" ||
+      template.name !== CONTROLLER_JOB_NAME || template.sessionTarget !== CONTROLLER_SESSION_TARGET ||
       template.enabled !== true || template.deleteAfterRun !== false ||
       !hasExactKeys(template.schedule, ["kind", "everyMs"]) ||
-      template.schedule.kind !== "every" || template.schedule.everyMs !== 600000 ||
-      !hasExactKeys(template.delivery, ["mode"]) || template.delivery.mode !== "none" ||
-      !hasExactKeys(template.payload, ["kind", "script", "timeoutSeconds", "toolBudget", "toolsAllow"]) ||
-      template.payload.kind !== "script" ||
+      template.schedule.kind !== CONTROLLER_SCHEDULE_KIND ||
+      template.schedule.everyMs !== CONTROLLER_INTERVAL_MS ||
+      !hasExactKeys(template.delivery, ["mode"]) || template.delivery.mode !== CONTROLLER_DELIVERY_MODE ||
+      !hasExactKeys(template.payload, CONTROLLER_PAYLOAD_KEYS) ||
+      template.payload.kind !== CONTROLLER_PAYLOAD_KIND ||
       template.payload.timeoutSeconds !== ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS ||
       template.payload.toolBudget !== ACP_REPORT_CONTROLLER_TOOL_BUDGET ||
       !Array.isArray(template.payload.toolsAllow) ||
@@ -228,14 +250,40 @@ async function createControllerPlaceholderJob(addCall, declarationKey, dependenc
   fail("report_controller_job_create_unresolved");
 }
 
-function assertArmedControllerJob(result, jobId, expectedScript) {
+function isExactControllerToolsAllow(toolsAllow) {
+  return Array.isArray(toolsAllow) &&
+    toolsAllow.length === ACP_REPORT_CONTROLLER_TOOLS_ALLOW.length &&
+    toolsAllow.every((tool, index) => tool === ACP_REPORT_CONTROLLER_TOOLS_ALLOW[index]);
+}
+
+// Installed OpenClaw 2026.8.1 answers the model-callable `automations`
+// `action:"update"` with the complete persisted job read view (the Gateway
+// `cron.update` handler responds with `cronJobReadView(job)`), so the update
+// result itself proves the stored final job and no extra read-back call is
+// needed or made. Nothing here is inferred from the request or from
+// "unchanged" fields: the whole script-only controller contract — identity,
+// declaration key, name, session target, schedule, delivery, one-shot flag, and
+// the exact substituted script payload with its timeout, tool budget, and
+// ordered allowlist — is re-read off the returned job. Anything missing,
+// altered, reshaped toward model/agentTurn/static-report execution, or carrying
+// a run/routing-altering field fails closed before reporting is ever bound.
+function assertArmedControllerJob(result, jobId, declarationKey, expectedScript) {
   const job = readAutomationJob(result);
-  if (job === undefined || job.id !== jobId || job.enabled !== true) {
-    fail("report_controller_job_arm_invalid");
-  }
-  if (job.payload !== undefined &&
-      (!isPlainObject(job.payload) || job.payload.kind !== "script" ||
-        (job.payload.script !== undefined && job.payload.script !== expectedScript))) {
+  if (job === undefined ||
+      job.id !== jobId || job.declarationKey !== declarationKey ||
+      job.enabled !== true || job.name !== CONTROLLER_JOB_NAME ||
+      job.sessionTarget !== CONTROLLER_SESSION_TARGET || job.deleteAfterRun !== false ||
+      FORBIDDEN_ARMED_JOB_KEYS.some((key) => job[key] !== undefined) ||
+      !hasExactKeys(job.schedule, ["kind", "everyMs"], CONTROLLER_SCHEDULE_DYNAMIC_KEYS) ||
+      job.schedule.kind !== CONTROLLER_SCHEDULE_KIND ||
+      job.schedule.everyMs !== CONTROLLER_INTERVAL_MS ||
+      !hasExactKeys(job.delivery, ["mode"]) || job.delivery.mode !== CONTROLLER_DELIVERY_MODE ||
+      !hasExactKeys(job.payload, CONTROLLER_PAYLOAD_KEYS) ||
+      job.payload.kind !== CONTROLLER_PAYLOAD_KIND ||
+      job.payload.script !== expectedScript ||
+      job.payload.timeoutSeconds !== ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS ||
+      job.payload.toolBudget !== ACP_REPORT_CONTROLLER_TOOL_BUDGET ||
+      !isExactControllerToolsAllow(job.payload.toolsAllow)) {
     fail("report_controller_job_arm_invalid");
   }
 }
@@ -378,9 +426,12 @@ export async function runReportControllerPreparation(input, dependencies) {
     jobId = created.id;
     if (created.enabled !== false) fail("report_controller_job_create_invalid");
     const armCall = buildReportControllerArmUpdateCall(jobId, leaseToken);
+    // Nothing below this line runs until the scheduler has proven it stored the
+    // exact intended final controller job.
     assertArmedControllerJob(
       await dependencies.armAutomation(armCall),
       jobId,
+      declarationKey,
       armCall.job.payload.script,
     );
     const reportPump = buildReportPumpStructuralAttestation(jobId, input.roundIndex);

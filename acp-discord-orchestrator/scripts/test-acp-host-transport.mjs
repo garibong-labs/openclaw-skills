@@ -415,6 +415,7 @@ test("coordinator rollback releases a registered lease after exact supervisor pr
     controllerLease: { phase: "activation_in_progress" },
   });
   const calls = [];
+  let declarationKey;
   await assert.rejects(runReportControllerPreparation({
     roundIndex: 1,
     destination: { channel: "discord", accountId: "account-example",
@@ -428,12 +429,24 @@ test("coordinator rollback releases a registered lease after exact supervisor pr
       calls.push("create");
       assert.equal(Object.hasOwn(call.job, "id"), false);
       assert.equal(call.job.enabled, false);
-      return { created: true, job: { id: COORDINATOR_JOB_ID, declarationKey: call.job.declarationKey, enabled: false } };
+      declarationKey = call.job.declarationKey;
+      return { created: true, job: { id: COORDINATOR_JOB_ID, declarationKey, enabled: false } };
     },
+    // The full persisted job the real update boundary answers with.
     async armAutomation(call) {
       calls.push("arm");
       assert.equal(call.id, COORDINATOR_JOB_ID);
-      return { id: COORDINATOR_JOB_ID, enabled: true, payload: call.job.payload };
+      return {
+        id: COORDINATOR_JOB_ID,
+        declarationKey,
+        name: "ACP report controller",
+        enabled: true,
+        sessionTarget: "isolated",
+        deleteAfterRun: false,
+        schedule: { kind: "every", everyMs: 600000, anchorMs: 1756900000000 },
+        payload: call.job.payload,
+        delivery: { mode: "none" },
+      };
     },
     async bindReporting() { calls.push("bind"); return {}; },
     async sendStartReceipt() { calls.push("start"); return {}; },

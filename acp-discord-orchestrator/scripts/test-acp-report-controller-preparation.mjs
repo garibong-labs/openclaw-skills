@@ -198,12 +198,19 @@ function createdJob(overrides = {}) {
   };
 }
 
+// The exact persisted job installed OpenClaw 2026.8.1 returns from the
+// model-callable automations update (Gateway cron.update -> cronJobReadView),
+// including the scheduler-owned `anchorMs` phase anchor and inert bookkeeping.
 function armedJob(overrides = {}) {
   return {
     details: {
       id: JOB_ID,
       declarationKey: DECLARATION_KEY,
+      name: "ACP report controller",
       enabled: true,
+      sessionTarget: "isolated",
+      deleteAfterRun: false,
+      schedule: { kind: "every", everyMs: 600000, anchorMs: 1756900000000 },
       payload: {
         kind: "script",
         script: ARMED_SCRIPT,
@@ -211,9 +218,28 @@ function armedJob(overrides = {}) {
         toolBudget: 5,
         toolsAllow: ["acp_report_controller", "message", "automations"],
       },
+      delivery: { mode: "none" },
+      createdAtMs: 1756890000000,
+      updatedAtMs: 1756900000000,
+      configRevision: "rev-1",
+      nextRunAtMs: 1756900600000,
+      state: {},
       ...overrides,
     },
   };
+}
+
+// Same persisted job with the script payload altered, or with named job/payload
+// keys dropped entirely, to model a partial or drifted scheduler answer.
+function armedJobVariant({ job = {}, payload = {}, dropJobKeys = [], dropPayloadKeys = [] } = {}) {
+  const response = armedJob(job);
+  const armed = response.details;
+  if (!dropJobKeys.includes("payload")) {
+    armed.payload = { ...armed.payload, ...payload };
+    for (const key of dropPayloadKeys) delete armed.payload[key];
+  }
+  for (const key of dropJobKeys) delete armed[key];
+  return response;
 }
 
 function makeDependencies(events, overrides = {}) {
@@ -239,10 +265,41 @@ function makeDependencies(events, overrides = {}) {
 
 test("preparation creates disabled, arms the exact returned id, then binds, registers, and commits", async () => {
   const events = [];
-  const result = await runReportControllerPreparation(makeInput(), makeDependencies(events));
+  let armAnswer;
+  const result = await runReportControllerPreparation(makeInput(), makeDependencies(events, {
+    async armAutomation(call) {
+      events.push(["arm", call]);
+      armAnswer = armedJob();
+      return armAnswer;
+    },
+  }));
   assert.deepEqual(events.map(([name]) => name), [
     "create", "arm", "bind", "start", "assemble", "prepare", "register", "activate", "commit",
   ]);
+  // Binding and the public start receipt only run once the scheduler has proven
+  // the whole persisted final controller contract, dynamic metadata and all.
+  assert.deepEqual(armAnswer.details, {
+    id: JOB_ID,
+    declarationKey: DECLARATION_KEY,
+    name: "ACP report controller",
+    enabled: true,
+    sessionTarget: "isolated",
+    deleteAfterRun: false,
+    schedule: { kind: "every", everyMs: 600000, anchorMs: 1756900000000 },
+    payload: {
+      kind: "script",
+      script: ARMED_SCRIPT,
+      timeoutSeconds: 60,
+      toolBudget: 5,
+      toolsAllow: ["acp_report_controller", "message", "automations"],
+    },
+    delivery: { mode: "none" },
+    createdAtMs: 1756890000000,
+    updatedAtMs: 1756900000000,
+    configRevision: "rev-1",
+    nextRunAtMs: 1756900600000,
+    state: {},
+  });
   // Nothing private, and nothing enabled, exists before the exact id is known.
   assert.equal(events[0][1].job.enabled, false);
   assert.equal(events[0][1].job.declarationKey, DECLARATION_KEY);
@@ -323,11 +380,93 @@ test("a returned job that is not disabled is removed instead of armed", async ()
 test("an unproven arm removes the exact created job and never binds or starts", async () => {
   const cases = [
     ["throws", "report_controller_preparation_failed", () => { throw new Error("secret arm detail"); }],
+    ["unreadable", "report_controller_job_arm_invalid", () => ({ details: { status: "error" } })],
+    // A response weak enough to prove nothing about the stored job.
+    ["only id and enabled", "report_controller_job_arm_invalid",
+      () => ({ details: { id: JOB_ID, enabled: true } })],
     ["still disabled", "report_controller_job_arm_invalid", () => armedJob({ enabled: false })],
     ["wrong id", "report_controller_job_arm_invalid", () => armedJob({ id: "other-job-id" })],
+    ["missing id", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ dropJobKeys: ["id"] })],
+    ["wrong declaration key", "report_controller_job_arm_invalid",
+      () => armedJob({ declarationKey: "acp-report-controller-somebody-else-0000" })],
+    ["missing declaration key", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ dropJobKeys: ["declarationKey"] })],
+    ["wrong name", "report_controller_job_arm_invalid", () => armedJob({ name: "Something else" })],
+    ["missing name", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ dropJobKeys: ["name"] })],
+    ["wrong session target", "report_controller_job_arm_invalid",
+      () => armedJob({ sessionTarget: "main" })],
+    ["missing session target", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ dropJobKeys: ["sessionTarget"] })],
+    ["wrong schedule kind", "report_controller_job_arm_invalid",
+      () => armedJob({ schedule: { kind: "cron", expr: "*/10 * * * *" } })],
+    ["wrong schedule interval", "report_controller_job_arm_invalid",
+      () => armedJob({ schedule: { kind: "every", everyMs: 1000 } })],
+    ["extra schedule field", "report_controller_job_arm_invalid",
+      () => armedJob({ schedule: { kind: "every", everyMs: 600000, staggerMs: 5000 } })],
+    ["missing schedule", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ dropJobKeys: ["schedule"] })],
+    ["wrong delivery mode", "report_controller_job_arm_invalid",
+      () => armedJob({ delivery: { mode: "announce" } })],
+    ["extra delivery field", "report_controller_job_arm_invalid",
+      () => armedJob({ delivery: { mode: "none", to: "https://example.invalid/hook" } })],
+    ["missing delivery", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ dropJobKeys: ["delivery"] })],
+    ["deleteAfterRun drift", "report_controller_job_arm_invalid",
+      () => armedJob({ deleteAfterRun: true })],
+    ["missing deleteAfterRun", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ dropJobKeys: ["deleteAfterRun"] })],
+    // Run/routing-altering fields the intended job never carries.
+    ["condition trigger drift", "report_controller_job_arm_invalid",
+      () => armedJob({ trigger: { script: "return json({ fire: true });" } })],
+    ["pacing drift", "report_controller_job_arm_invalid",
+      () => armedJob({ pacing: { maxPerHour: 1 } })],
+    ["session key drift", "report_controller_job_arm_invalid",
+      () => armedJob({ sessionKey: "agent:main" })],
+    ["failure alert drift", "report_controller_job_arm_invalid",
+      () => armedJob({ failureAlert: { mode: "announce" } })],
+    // Payload: presence, shape, and every executable field.
+    ["missing payload", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ dropJobKeys: ["payload"] })],
+    ["non-object payload", "report_controller_job_arm_invalid",
+      () => armedJob({ payload: "script" })],
+    ["missing script", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ dropPayloadKeys: ["script"] })],
     ["wrong script", "report_controller_job_arm_invalid",
-      () => armedJob({ payload: { kind: "script", script: PINNED_SCRIPT } })],
-    ["unreadable", "report_controller_job_arm_invalid", () => ({ details: { status: "error" } })],
+      () => armedJobVariant({ payload: { script: PINNED_SCRIPT } })],
+    ["wrong payload kind", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ payload: { kind: "command" } })],
+    ["agentTurn payload drift", "report_controller_job_arm_invalid",
+      () => armedJob({ payload: { kind: "agentTurn", message: "post the report", toolsAllow: ["message"] } })],
+    ["model payload drift", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ payload: { model: "some-model" } })],
+    ["static report payload drift", "report_controller_job_arm_invalid",
+      () => armedJob({ payload: { kind: "systemEvent", text: "round 2 complete" } })],
+    ["wrong timeout", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ payload: { timeoutSeconds: 300 } })],
+    ["missing timeout", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ dropPayloadKeys: ["timeoutSeconds"] })],
+    ["wrong tool budget", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ payload: { toolBudget: 50 } })],
+    ["missing tool budget", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ dropPayloadKeys: ["toolBudget"] })],
+    ["wrong tool allowlist", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ payload: { toolsAllow: ["acp_report_controller", "message", "exec"] } })],
+    ["misordered tool allowlist", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ payload: { toolsAllow: ["automations", "message", "acp_report_controller"] } })],
+    ["extra tool allowlist entry", "report_controller_job_arm_invalid",
+      () => armedJobVariant({
+        payload: { toolsAllow: ["acp_report_controller", "message", "automations", "exec"] },
+      })],
+    ["short tool allowlist", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ payload: { toolsAllow: ["acp_report_controller", "message"] } })],
+    ["unrestricted tool allowlist", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ payload: { toolsAllow: ["*"] } })],
+    ["missing tool allowlist", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ dropPayloadKeys: ["toolsAllow"] })],
+    ["extra payload field", "report_controller_job_arm_invalid",
+      () => armedJobVariant({ payload: { allowUnsafeExternalContent: true } })],
   ];
   for (const [label, expected, respond] of cases) {
     const events = [];
