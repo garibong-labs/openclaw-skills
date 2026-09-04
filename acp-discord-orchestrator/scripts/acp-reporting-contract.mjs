@@ -1,6 +1,6 @@
 /**
- * ACP reporting contract (acp-reporting-v2, with a bounded acp-reporting-v1
- * compatibility path for the canonical Claude agent).
+ * ACP reporting contract (current acp-reporting-v3, with bounded v2 and v1
+ * compatibility paths).
  *
  * Pure, deterministic, dependency-free validation of the reporting bundle an
  * ACP turn must register before doing any work: the public round-start
@@ -40,11 +40,28 @@ const MAX_DELIVERED_AT_LENGTH = 40;
 const WATCHDOG_EVERY_MS = 600000;
 const MAX_WATCHDOG_TIMEOUT_SECONDS = 60;
 
+// Non-secret structural identity of the deterministic OpenClaw 2026.8.1
+// controller job. The digest is over the exact public script template with
+// its literal LEASE_TOKEN and JOB_ID placeholders, never over a substituted
+// job. The actual lease token and the substituted scheduler-returned job id
+// exist only in scheduler-private job state.
+export const ACP_REPORT_CONTROLLER_SCRIPT_VERSION = 'acp-report-controller-script.v1';
+export const ACP_REPORT_CONTROLLER_SCRIPT_SHA256 = '1dd0ccd2d2bd25ef25c002672a2b6ac4ccf7721b2b9e6304bdf4ddd8ce8ca6f2';
+export const ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS = 60;
+export const ACP_REPORT_CONTROLLER_TOOL_BUDGET = 5;
+export const ACP_REPORT_CONTROLLER_TOOLS_ALLOW = Object.freeze([
+  'acp_report_controller',
+  'message',
+  'automations',
+]);
+
 export const ACP_REPORTING_SCHEMA_VERSION_V1 = 'acp-reporting-v1';
 export const ACP_REPORTING_SCHEMA_VERSION_V2 = 'acp-reporting-v2';
+export const ACP_REPORTING_SCHEMA_VERSION_V3 = 'acp-reporting-v3';
 export const ACP_REPORTING_SCHEMA_VERSIONS = Object.freeze([
   ACP_REPORTING_SCHEMA_VERSION_V1,
   ACP_REPORTING_SCHEMA_VERSION_V2,
+  ACP_REPORTING_SCHEMA_VERSION_V3,
 ]);
 
 // Closed, fail-closed agent presentation mapping. The key is the canonical
@@ -97,6 +114,12 @@ export const ACP_TERMINAL_REPORT_STATUSES = Object.freeze([
 // `0분 전`.
 export const ACP_REPORT_NO_NEW_RESULT = '새로 확인된 ACP 결과 없음';
 
+export function isReportPumpId(value) {
+  return typeof value === 'string' &&
+    value.length >= 1 && value.length <= MAX_WATCHDOG_ID_LENGTH &&
+    !NO_WHITESPACE_OR_CONTROL_RE.test(value);
+}
+
 // The only valid phaseIndex → phaseName mappings for the 라운드 metadata line.
 export const ACP_REPORT_PHASES = Object.freeze({
   1: '분석',
@@ -123,6 +146,11 @@ export const ACP_REPORTING_ERROR_CODES = Object.freeze([
   'invalid_reporting_watchdog_delivery',
   'invalid_reporting_watchdog_payload',
   'invalid_reporting_watchdog_message',
+  'invalid_reporting_report_pump',
+  'invalid_reporting_report_pump_round',
+  'invalid_reporting_report_pump_schedule',
+  'invalid_reporting_report_pump_delivery',
+  'invalid_reporting_report_pump_payload',
   'invalid_reporting_report',
   'invalid_reporting_forbidden_content',
 ]);
@@ -663,7 +691,7 @@ const TERMINAL_REPORT_INPUT_KEYS = Object.freeze([
   'externalAction',
 ]);
 const MAX_REPORT_MINUTES = 99999;
-const MAX_REPORT_RESULT_DELTA = 9999;
+export const MAX_REPORT_RESULT_DELTA = 9999;
 
 function validateReportMinutes(value, label) {
   if (!Number.isInteger(value) || value < 0 || value > MAX_REPORT_MINUTES) {
@@ -953,12 +981,7 @@ function validateWatchdog(watchdog, expected) {
     'watchdog'
   );
   const { id } = watchdog;
-  if (
-    typeof id !== 'string' ||
-    id.length === 0 ||
-    id.length > MAX_WATCHDOG_ID_LENGTH ||
-    NO_WHITESPACE_OR_CONTROL_RE.test(id)
-  ) {
+  if (!isReportPumpId(id)) {
     fail('invalid_reporting_watchdog', 'watchdog.id must be 1..200 characters with no whitespace or control characters');
   }
   if (watchdog.roundIndex !== expected.roundIndex) {
@@ -1017,6 +1040,85 @@ function validateWatchdog(watchdog, expected) {
   return { id, timeoutSeconds, message };
 }
 
+// Validates the acp-reporting-v3 report-pump attestation and returns the
+// validated variable part ({ id }) captured at validation time. The pump
+// supersedes the v1/v2 disabled-snapshot watchdog: it is one ENABLED
+// 600-second automation bound to the round and the control conversation, and
+// it attests only the non-secret structural identity of the deterministic
+// script payload — never its token-substituted script or a static report. The
+// public report content is machine-derived per claim from current normalized
+// evidence at the host transport's closed claim-report action. The attested
+// `id` is the exact scheduler job identity the pump must present to
+// claim-report; the transport binds it at prepare time and rejects any other
+// job.
+function validateReportPump(reportPump, expected) {
+  if (!isPlainObject(reportPump)) {
+    fail('invalid_reporting_report_pump', 'reportPump must be a plain object');
+  }
+  assertExactKeys(
+    reportPump,
+    ['id', 'roundIndex', 'enabled', 'sessionTarget', 'schedule', 'payload', 'delivery', 'deleteAfterRun'],
+    'invalid_reporting_report_pump',
+    'reportPump'
+  );
+  const { id } = reportPump;
+  if (!isReportPumpId(id)) {
+    fail('invalid_reporting_report_pump', 'reportPump.id must be 1..200 characters with no whitespace or control characters');
+  }
+  if (reportPump.roundIndex !== expected.roundIndex) {
+    fail('invalid_reporting_report_pump_round', 'reportPump.roundIndex must equal the reporting roundIndex');
+  }
+  if (reportPump.enabled !== true) {
+    fail('invalid_reporting_report_pump', 'reportPump.enabled must be exactly true');
+  }
+  if (reportPump.sessionTarget !== 'isolated') {
+    fail('invalid_reporting_report_pump', 'reportPump.sessionTarget must be exactly "isolated"');
+  }
+  if (reportPump.deleteAfterRun !== false) {
+    fail('invalid_reporting_report_pump', 'reportPump.deleteAfterRun must be exactly false');
+  }
+  const { schedule } = reportPump;
+  if (!isPlainObject(schedule)) {
+    fail('invalid_reporting_report_pump_schedule', 'reportPump.schedule must be a plain object');
+  }
+  assertExactKeys(schedule, ['kind', 'everyMs'], 'invalid_reporting_report_pump_schedule', 'reportPump.schedule');
+  if (schedule.kind !== 'every' || schedule.everyMs !== WATCHDOG_EVERY_MS) {
+    fail('invalid_reporting_report_pump_schedule', `reportPump.schedule must be exactly { kind: "every", everyMs: ${WATCHDOG_EVERY_MS} }`);
+  }
+  const { delivery } = reportPump;
+  if (!isPlainObject(delivery)) {
+    fail('invalid_reporting_report_pump_delivery', 'reportPump.delivery must be a plain object');
+  }
+  assertExactKeys(delivery, ['mode'], 'invalid_reporting_report_pump_delivery', 'reportPump.delivery');
+  if (delivery.mode !== 'none') {
+    fail('invalid_reporting_report_pump_delivery', 'reportPump.delivery.mode must be exactly "none"');
+  }
+  const { payload } = reportPump;
+  if (!isPlainObject(payload)) {
+    fail('invalid_reporting_report_pump_payload', 'reportPump.payload must be a plain object');
+  }
+  assertExactKeys(
+    payload,
+    ['kind', 'scriptVersion', 'scriptSha256', 'timeoutSeconds', 'toolBudget', 'toolsAllow'],
+    'invalid_reporting_report_pump_payload',
+    'reportPump.payload'
+  );
+  const { kind, scriptVersion, scriptSha256, timeoutSeconds, toolBudget, toolsAllow } = payload;
+  if (
+    kind !== 'script' ||
+    scriptVersion !== ACP_REPORT_CONTROLLER_SCRIPT_VERSION ||
+    scriptSha256 !== ACP_REPORT_CONTROLLER_SCRIPT_SHA256 ||
+    timeoutSeconds !== ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS ||
+    toolBudget !== ACP_REPORT_CONTROLLER_TOOL_BUDGET ||
+    !Array.isArray(toolsAllow) ||
+    toolsAllow.length !== ACP_REPORT_CONTROLLER_TOOLS_ALLOW.length ||
+    toolsAllow.some((tool, index) => tool !== ACP_REPORT_CONTROLLER_TOOLS_ALLOW[index])
+  ) {
+    fail('invalid_reporting_report_pump_payload', 'reportPump.payload must match the deterministic controller script attestation');
+  }
+  return { id };
+}
+
 // Attestation redundancy in this schema is intentional, not derivable:
 // startReceipt.{conversationId,messageId,deliveredAt} re-state the lifecycle
 // receipt, startReceipt.message re-states startMessage, watchdog.roundIndex
@@ -1045,14 +1147,36 @@ const TOP_LEVEL_KEYS_V1 = Object.freeze([
 // `agent` is rejected as an unknown key, keeping v1 byte-compatible with
 // the pre-migration Claude bundles.
 const TOP_LEVEL_KEYS_V2 = Object.freeze(['agent', ...TOP_LEVEL_KEYS_V1]);
+// acp-reporting-v3 supersedes the disabled-snapshot watchdog with the enabled
+// report-pump attestation: `watchdog` and `watchdogDestination` are replaced
+// by `reportPump` and `pumpDestination`. Everything else is the v2 shape,
+// agent attestation included. v3 carries only a non-secret script-template
+// attestation and no lease token, executable script, or static report.
+const TOP_LEVEL_KEYS_V3 = Object.freeze([
+  'agent',
+  'schemaVersion',
+  'roundIndex',
+  'repository',
+  'branch',
+  'startMessage',
+  'startDestination',
+  'pumpDestination',
+  'terminalDestination',
+  'startReceipt',
+  'reportPump',
+]);
 
 /**
  * Validate a reporting bundle against the ACP reporting contract.
  *
- * The current schema is acp-reporting-v2. The legacy acp-reporting-v1 shape
- * is accepted only when the bound canonical agent is `claude`, as a bounded
- * migration path; every other agent must present a v2 bundle whose top-level
- * `agent` equals the canonical config agent.
+ * The current schema is acp-reporting-v3, whose enabled `reportPump`
+ * attestation supersedes the v1/v2 disabled-snapshot `watchdog`: the pump
+ * carries no static report payload or lease token, because report content is
+ * machine-derived per claim at the host transport. acp-reporting-v2 remains accepted for
+ * already-prepared configs, and the legacy acp-reporting-v1 shape is accepted
+ * only when the bound canonical agent is `claude`, as a bounded migration
+ * path; every v2/v3 bundle's top-level `agent` must equal the canonical
+ * config agent.
  *
  * Every untrusted property is read exactly once into a local before it is
  * checked, and the normalized copy is built only from those validated locals
@@ -1079,7 +1203,7 @@ export function validateAcpReportingContract(reporting, context) {
   }
   const { schemaVersion } = reporting;
   if (!ACP_REPORTING_SCHEMA_VERSIONS.includes(schemaVersion)) {
-    fail('invalid_reporting_schema_version', `schemaVersion must be "${ACP_REPORTING_SCHEMA_VERSION_V2}" (or "${ACP_REPORTING_SCHEMA_VERSION_V1}" during the bounded Claude migration)`);
+    fail('invalid_reporting_schema_version', `schemaVersion must be "${ACP_REPORTING_SCHEMA_VERSION_V3}" (or "${ACP_REPORTING_SCHEMA_VERSION_V2}", or "${ACP_REPORTING_SCHEMA_VERSION_V1}" during the bounded Claude migration)`);
   }
   if (
     schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V1 &&
@@ -1087,16 +1211,18 @@ export function validateAcpReportingContract(reporting, context) {
   ) {
     fail('invalid_reporting_schema_version', `schemaVersion "${ACP_REPORTING_SCHEMA_VERSION_V1}" is only accepted for the canonical "${ACP_REPORTING_V1_COMPAT_AGENT}" agent during migration`);
   }
-  const topLevelKeys = schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V2
-    ? TOP_LEVEL_KEYS_V2
-    : TOP_LEVEL_KEYS_V1;
+  const topLevelKeys = schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V3
+    ? TOP_LEVEL_KEYS_V3
+    : schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V2
+      ? TOP_LEVEL_KEYS_V2
+      : TOP_LEVEL_KEYS_V1;
   for (const key of Object.keys(reporting)) {
     if (!topLevelKeys.includes(key)) {
       fail('invalid_reporting_unknown_key', `reporting contains unsupported key "${describeKey(key)}"`);
     }
   }
   if (
-    schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V2 &&
+    schemaVersion !== ACP_REPORTING_SCHEMA_VERSION_V1 &&
     reporting.agent !== ctx.agent
   ) {
     fail('invalid_reporting_agent', 'reporting.agent must equal the canonical config agent');
@@ -1116,7 +1242,10 @@ export function validateAcpReportingContract(reporting, context) {
     controlConversationId: ctx.controlConversationId,
   };
   validateStartMessage(startMessage, expected);
-  for (const key of ['startDestination', 'watchdogDestination', 'terminalDestination']) {
+  const destinationKeys = schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V3
+    ? ['startDestination', 'pumpDestination', 'terminalDestination']
+    : ['startDestination', 'watchdogDestination', 'terminalDestination'];
+  for (const key of destinationKeys) {
     if (reporting[key] !== ctx.controlConversationId) {
       fail('invalid_reporting_destination', `${key} must be exactly the control conversation id`);
     }
@@ -1138,6 +1267,43 @@ export function validateAcpReportingContract(reporting, context) {
   }
   if (receipt.message !== startMessage) {
     fail('invalid_reporting_start_receipt', 'startReceipt.message does not match startMessage');
+  }
+  if (schemaVersion === ACP_REPORTING_SCHEMA_VERSION_V3) {
+    const reportPump = validateReportPump(reporting.reportPump, expected);
+    return deepFreeze({
+      schemaVersion,
+      agent: ctx.agent,
+      roundIndex,
+      repository,
+      branch,
+      startMessage,
+      startDestination: ctx.controlConversationId,
+      pumpDestination: ctx.controlConversationId,
+      terminalDestination: ctx.controlConversationId,
+      startReceipt: {
+        conversationId: lifecycle.conversationId,
+        messageId: lifecycle.messageId,
+        deliveredAt: lifecycle.deliveredAt,
+        message: startMessage,
+      },
+      reportPump: {
+        id: reportPump.id,
+        roundIndex,
+        enabled: true,
+        sessionTarget: 'isolated',
+        schedule: { kind: 'every', everyMs: WATCHDOG_EVERY_MS },
+        payload: {
+          kind: 'script',
+          scriptVersion: ACP_REPORT_CONTROLLER_SCRIPT_VERSION,
+          scriptSha256: ACP_REPORT_CONTROLLER_SCRIPT_SHA256,
+          timeoutSeconds: ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS,
+          toolBudget: ACP_REPORT_CONTROLLER_TOOL_BUDGET,
+          toolsAllow: [...ACP_REPORT_CONTROLLER_TOOLS_ALLOW],
+        },
+        delivery: { mode: 'none' },
+        deleteAfterRun: false,
+      },
+    });
   }
   const watchdog = validateWatchdog(reporting.watchdog, expected);
   return deepFreeze({

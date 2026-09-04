@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "acp-report-pump-snapshot.v1",
+  "phaseIndex": 2,
+  "phaseStartedCadence": 0,
+  "executionState": "범위 내 작업이 계속되는 중",
+  "inProgress": "진행 중인 작업 한 줄",
+  "verification": "자체 검증 결과 한 줄",
+  "next": "다음 단계 한 줄",
+  "newResultDelta": 0,
+  "terminal": {
+    "summary": "요청 범위 구현과 로컬 커밋 완료",
+    "verification": "필수 테스트 통과",
+    "result": "로컬 커밋 1개",
+    "next": "소유자 독립 검증 시작",
+    "externalAction": "없음"
+  }
+}

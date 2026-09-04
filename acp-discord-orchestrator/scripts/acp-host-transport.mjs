@@ -24,15 +24,42 @@ import {
 import {
   ACP_SUPPORTED_AGENTS,
   buildAcpIntermediateReport,
-  buildAcpTerminalReport
+  buildAcpTerminalReport,
+  isReportPumpId
 } from "./acp-reporting-contract.mjs";
+import {
+  hasExactKeys as exactKeys,
+  isPlainObject
+} from "./acp-private-json-input.mjs";
 
-export const ACP_HOST_TRANSPORT_SCHEMA_VERSION = "acp-host-transport.v1";
+// v2 is an incompatible bump over acp-host-transport.v1: the private record
+// gains the fenced publication-attempt state, `ack-report` requires the
+// exact attempt/fencing identity, and the closed action set gains
+// `claim-report` and `begin-delivery`. v1 records and inputs fail closed with
+// the standard schema/record codes; complete or cancel an in-flight v1 run
+// with the v1 skill before upgrading.
+export const ACP_HOST_TRANSPORT_SCHEMA_VERSION = "acp-host-transport.v2";
+export const ACP_HOST_CONTROLLER_LEASE_SCHEMA_VERSION = "acp-host-controller-lease.v1";
 export const DEFAULT_TRANSPORT_EVENT_WAIT_MS = 5000;
 export const REPORT_CADENCE_MS = 600000;
 const REPORT_DELIVERY_SUCCESS_STATUSES = Object.freeze(["sent", "delivered"]);
 export const MAX_REPORT_RECEIPT_AGE_MS = 300000;
 export const MAX_SERVICE_CURSOR_REISSUES = 3;
+// Bounded publication-attempt protocol: one report obligation allows at most
+// this many claimed delivery attempts before the transport refuses to mint
+// more and requires owner intervention.
+export const MAX_REPORT_PUBLICATION_ATTEMPTS = 3;
+// A claimed attempt is a live lease for this long. A newer claim may
+// supersede only an expired attempt (recording its explicit missing/uncertain
+// outcome); a live attempt is never silently stolen.
+export const REPORT_ATTEMPT_TTL_MS = 300000;
+// Exclusive record-mutation lock: bounded wait before failing closed. The
+// stale-age export is retained as a wire/API compatibility constant, but a
+// pathname-only Node filesystem API cannot atomically prove inode identity and
+// unlink that same inode. Expired locks therefore fail closed instead of being
+// reclaimed through an unsafe pathname compare/act sequence.
+export const TRANSPORT_LOCK_WAIT_MS = 5000;
+export const TRANSPORT_LOCK_STALE_MS = 30000;
 
 const SAFE_HANDLE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const SAFE_EVENT_TYPE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
@@ -80,14 +107,6 @@ function transportFail(code) {
   const error = new Error(code);
   error.code = code;
   throw error;
-}
-
-function isPlainObject(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
 }
 
 function isPrivateMode(stat) {
@@ -186,10 +205,79 @@ function replacePrivateJsonAtomically(filePath, value) {
   }
 }
 
-function exactKeys(value, required) {
-  return isPlainObject(value) &&
-    Object.keys(value).length === required.length &&
-    required.every((key) => Object.hasOwn(value, key));
+function sleepSyncMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Exclusive lease for every transport-record mutation. Atomic sibling-temp
+// rename only prevents torn files; it is NOT serialization — two concurrent
+// read-modify-write callers could still each rename a complete-but-stale
+// record. This lock serializes the whole read-modify-write critical section,
+// while the monotonic publication fence (record.publication.fence) orders the
+// long-lived claim→deliver→acknowledge attempts that span multiple calls.
+// No lock is silently stolen, including an apparently stale one. Node's
+// portable pathname primitives cannot express conditional unlink-by-identity;
+// removing a pathname after lstat would allow a fresh replacement to be
+// deleted in the gap. A crashed holder therefore requires owner intervention.
+// This fail-closed rule also makes release safe for protocol participants: no
+// contender can replace the pathname while the owning closure is active.
+export function acquireTransportLock(recordFile, action, dependencies = {}) {
+  const lockFile = `${recordFile}.lock`;
+  const waitMs = dependencies.lockWaitMs ?? TRANSPORT_LOCK_WAIT_MS;
+  const sleep = dependencies.sleepMs ?? sleepSyncMs;
+  const clockNowMs = dependencies.lockNowMs ?? Date.now;
+  const fileSystem = dependencies.fileSystem ?? fs;
+  const ownerToken = crypto.randomUUID();
+  const deadlineMs = clockNowMs() + waitMs;
+  let backoffMs = 25;
+  for (;;) {
+    if (clockNowMs() >= deadlineMs) {
+      transportFail("host_transport_lock_timeout");
+    }
+    try {
+      fileSystem.writeFileSync(lockFile, JSON.stringify({
+        schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+        type: "host_transport_lease",
+        action,
+        ownerToken,
+        acquiredAtMs: Date.now()
+      }) + "\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
+      break;
+    } catch (error) {
+      if (!error || error.code !== "EEXIST") {
+        transportFail("host_transport_lock_failed");
+      }
+    }
+    // EEXIST is complete contention evidence. Never inspect, rewrite, or unlink
+    // the pathname: it may already denote a fresh holder. Every contention
+    // path waits with bounded backoff and rechecks the same deadline.
+    sleep(Math.min(backoffMs, Math.max(0, deadlineMs - clockNowMs())));
+    backoffMs = Math.min(backoffMs * 2, 250);
+  }
+  return function releaseTransportLock() {
+    try {
+      const holder = JSON.parse(fileSystem.readFileSync(lockFile, "utf8"));
+      if (holder && holder.ownerToken === ownerToken) {
+        fileSystem.unlinkSync(lockFile);
+      }
+    } catch {
+      // Release is best-effort: an unreadable or foreign lock is left alone
+      // for explicit owner recovery; it is never reclaimed by pathname age.
+    }
+  };
+}
+
+// Every record mutation runs through this wrapper: validate the private
+// record path, take the exclusive lease, and only then read-modify-write the
+// record, so no interleaved caller can act on a stale copy.
+function withTransportRecord(transportFile, action, dependencies, fn) {
+  const checked = assertPrivateRegularFile(transportFile, "host_transport_file");
+  const release = acquireTransportLock(checked, action, dependencies);
+  try {
+    return fn(loadHostTransportRecord(checked));
+  } finally {
+    release();
+  }
 }
 
 function validInstant(value) {
@@ -223,8 +311,37 @@ function initialPublicationState() {
     terminalStatus: null,
     controlCursor: null,
     controlCursorIssuedAt: null,
-    controlCursorReissues: 0
+    controlCursorReissues: 0,
+    // Fenced publication-attempt protocol: `fence` increases monotonically on
+    // every claimed attempt, `attempt` is the single live claim (delivery
+    // states claim_acquired → delivery_pending), `attemptCount` bounds
+    // retries per report obligation, and `lastAttemptOutcome` records the
+    // explicit acknowledged/uncertain/missing end of the previous attempt.
+    fence: 0,
+    attempt: null,
+    attemptCount: 0,
+    lastAttemptOutcome: null,
+    // `halted` stops all publication after tracking loss; `pumpJobId` binds
+    // the one scheduler job identity allowed to claim reports for this run.
+    halted: null,
+    pumpJobId: null
   };
+}
+
+function initialControllerLeaseState() {
+  return { phase: "prepared" };
+}
+
+function validateControllerLease(value) {
+  if (!exactKeys(value, ["phase"]) || ![
+    "prepared",
+    "activation_in_progress",
+    "activation_confirmed",
+    "preactivation_aborted"
+  ].includes(value.phase)) {
+    transportFail("host_transport_record_invalid");
+  }
+  return value;
 }
 
 // The public 마지막 ACP 활동 age is bound to normalized ACP activity events
@@ -268,7 +385,8 @@ function validatePublication(value) {
     "state", "kind", "cadence", "reportId", "requiredAt",
     "evidenceThroughSequence", "receiptMessageId", "acknowledgedMessageIds", "nextCadence", "nextDueAt",
     "terminalSequence", "terminalStatus", "controlCursor", "controlCursorIssuedAt",
-    "controlCursorReissues"
+    "controlCursorReissues", "fence", "attempt", "attemptCount", "lastAttemptOutcome",
+    "halted", "pumpJobId"
   ];
   if (!exactKeys(value, keys) ||
     !["report_required", "publication_pending", "receipt_acked"].includes(value.state) ||
@@ -291,7 +409,31 @@ function validatePublication(value) {
     ((value.controlCursor === null) !== (value.controlCursorIssuedAt === null)) ||
     !Number.isSafeInteger(value.controlCursorReissues) ||
     value.controlCursorReissues < 0 || value.controlCursorReissues > MAX_SERVICE_CURSOR_REISSUES ||
-    (value.controlCursor === null && value.controlCursorReissues !== 0)) {
+    (value.controlCursor === null && value.controlCursorReissues !== 0) ||
+    !Number.isSafeInteger(value.fence) || value.fence < 0 ||
+    !Number.isSafeInteger(value.attemptCount) ||
+    value.attemptCount < 0 || value.attemptCount > MAX_REPORT_PUBLICATION_ATTEMPTS ||
+    ![null, "acknowledged", "uncertain", "missing"].includes(value.lastAttemptOutcome) ||
+    ![null, "tracking_lost"].includes(value.halted) ||
+    (value.pumpJobId !== null && !isReportPumpId(value.pumpJobId))) {
+    transportFail("host_transport_record_invalid");
+  }
+  const attempt = value.attempt;
+  const validAttempt = attempt === null || (
+    exactKeys(attempt, [
+      "attemptId", "fence", "state", "jobId", "runToken", "claimedAt", "expiresAt"
+    ]) &&
+    typeof attempt.attemptId === "string" && SAFE_HANDLE.test(attempt.attemptId) &&
+    attempt.fence === value.fence && value.fence >= 1 &&
+    ["claim_acquired", "delivery_pending"].includes(attempt.state) &&
+    isReportPumpId(attempt.jobId) && attempt.jobId === value.pumpJobId &&
+    typeof attempt.runToken === "string" && SAFE_HANDLE.test(attempt.runToken) &&
+    validInstant(attempt.claimedAt) && validInstant(attempt.expiresAt) &&
+    Date.parse(attempt.expiresAt) > Date.parse(attempt.claimedAt)
+  );
+  if (!validAttempt ||
+    (attempt !== null && (value.state === "receipt_acked" || value.kind === null)) ||
+    (attempt !== null && value.attemptCount < 1)) {
     transportFail("host_transport_record_invalid");
   }
   const hasReportIdentity = value.kind !== null && value.reportId !== null && value.requiredAt !== null;
@@ -414,11 +556,12 @@ function parseTransportRecord(value) {
     "environmentFile",
     "createdAt",
     "reportingContext",
-    "publication"
+    "publication",
+    "controllerLease"
   ];
   if (
     !isPlainObject(value) ||
-    Object.keys(value).length !== required.length ||
+    !Object.keys(value).every((key) => required.includes(key)) ||
     !required.every((key) => Object.hasOwn(value, key)) ||
     value.schemaVersion !== ACP_HOST_TRANSPORT_SCHEMA_VERSION ||
     typeof value.transportId !== "string" ||
@@ -429,6 +572,9 @@ function parseTransportRecord(value) {
   ) {
     transportFail("host_transport_record_invalid");
   }
+  // Mandatory on every v2 record and validated before any caller can
+  // dereference its phase.
+  validateControllerLease(value.controllerLease);
   for (const key of [
     "configFile",
     "entryFile",
@@ -596,6 +742,10 @@ export function prepareHostTransport(input, dependencies = {}) {
   probeHostTransport(dependencies);
   const configFile = assertPrivateRegularFile(input.configFile, "host_transport_config_file");
   const config = (dependencies.loadConfig ?? loadSupervisorConfig)(configFile);
+  const configuredPumpJobId = config.reporting?.reportPump?.id;
+  if (configuredPumpJobId !== undefined && !isReportPumpId(configuredPumpJobId)) {
+    transportFail("host_transport_pump_job_invalid");
+  }
   const stateDir = preparePrivateDirectory(config.stateDir);
   const randomUUID = dependencies.randomUUID ?? crypto.randomUUID;
   const handle = createHandle(randomUUID);
@@ -633,7 +783,17 @@ export function prepareHostTransport(input, dependencies = {}) {
       branch: config.reporting.branch,
       controlConversationId: config.lifecycle.controlConversationId
     },
-    publication: initialPublicationState()
+    publication: {
+      ...initialPublicationState(),
+      // An acp-reporting-v3 config attests the enabled report-pump automation
+      // id; bind it now so only that exact scheduler job can claim reports.
+      // v1/v2 watchdog configs stay accepted (bounded migration): their
+      // records bind the pump job on its first successful claim instead.
+      pumpJobId: configuredPumpJobId !== undefined
+        ? configuredPumpJobId
+        : null
+    },
+    controllerLease: initialControllerLeaseState()
   };
   const environment = dependencies.environment ?? process.env;
   writePrivateJson(environmentFile, selectChildEnvironment(
@@ -705,6 +865,24 @@ export async function activateHostTransport(input, dependencies = {}) {
   if (required.event.type !== "activation_required") {
     transportFail("host_transport_pre_activation_failed");
   }
+  withTransportRecord(input.transportFile, "activate-begin", dependencies, (locked) => {
+    if (locked.record.processHandle !== handle) {
+      transportFail("host_transport_handle_mismatch");
+    }
+    if (locked.record.controllerLease.phase !== "prepared") {
+      transportFail("host_transport_activation_state_invalid");
+    }
+    const events = parseEvents(locked.record.eventsFile);
+    if (!events.some((event) => event.type === "activation_required") ||
+        events.some((event) => event.type !== "activation_required")) {
+      transportFail("host_transport_activation_state_uncertain");
+    }
+    if (!sessionExists(runTmux, handle)) {
+      transportFail("host_transport_not_running");
+    }
+    locked.record.controllerLease.phase = "activation_in_progress";
+    persistTransportRecord(locked);
+  });
   const activation = JSON.stringify({
     schemaVersion: ACP_HOST_ACTIVATION_SCHEMA_VERSION,
     processHandle: handle
@@ -712,6 +890,14 @@ export async function activateHostTransport(input, dependencies = {}) {
   const bufferName = `acp-${crypto.randomBytes(8).toString("hex")}`;
   const setResult = runTmux(["set-buffer", "-b", bufferName, activation], { timeoutMs: 5000 });
   if (setResult.error || setResult.status !== 0) {
+    withTransportRecord(input.transportFile, "activate-reset", dependencies, (locked) => {
+      if (locked.record.processHandle !== handle ||
+          locked.record.controllerLease.phase !== "activation_in_progress") {
+        transportFail("host_transport_activation_state_uncertain");
+      }
+      locked.record.controllerLease.phase = "prepared";
+      persistTransportRecord(locked);
+    });
     transportFail("host_transport_activation_write_failed");
   }
   const pasteResult = runTmux([
@@ -739,10 +925,23 @@ export async function activateHostTransport(input, dependencies = {}) {
     : 0;
   const elapsedOriginMs = (Number.isFinite(activatedAtMs) ? activatedAtMs : nowValue(dependencies)) -
     elapsedAtActivation;
-  loaded.record.publication.nextDueAt = new Date(
-    elapsedOriginMs + REPORT_CADENCE_MS
-  ).toISOString();
-  persistTransportRecord(loaded);
+  // Reload under the exclusive record lease for the read-modify-write of the
+  // cadence anchor; the earlier load only served pre-activation event waits.
+  withTransportRecord(input.transportFile, "activate", dependencies, (locked) => {
+    if (locked.record.processHandle !== handle ||
+        locked.record.controllerLease.phase !== "activation_in_progress") {
+      transportFail("host_transport_activation_state_uncertain");
+    }
+    const events = parseEvents(locked.record.eventsFile);
+    if (!events.some((event) => event.type === "activation_confirmed")) {
+      transportFail("host_transport_activation_state_uncertain");
+    }
+    locked.record.controllerLease.phase = "activation_confirmed";
+    locked.record.publication.nextDueAt = new Date(
+      elapsedOriginMs + REPORT_CADENCE_MS
+    ).toISOString();
+    persistTransportRecord(locked);
+  });
   return {
     schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
     type: "host_transport_activated",
@@ -752,6 +951,123 @@ export async function activateHostTransport(input, dependencies = {}) {
       confirmed.event.runId
     )
   };
+}
+
+function controllerLeaseResult(type, processHandle) {
+  return {
+    schemaVersion: ACP_HOST_CONTROLLER_LEASE_SCHEMA_VERSION,
+    type,
+    processHandle
+  };
+}
+
+// Plugin-facing proof surface. The proof comes only from the exact private
+// record after activate has durably fenced and observed activation_confirmed.
+export function confirmHostTransportActivation(input, dependencies = {}) {
+  const handle = assertHandle(input.processHandle);
+  return withTransportRecord(input.transportFile, "confirm-activation", dependencies, (loaded) => {
+    if (loaded.record.processHandle !== handle ||
+        loaded.record.controllerLease.phase !== "activation_confirmed") {
+      transportFail("host_transport_activation_not_confirmed");
+    }
+    const events = parseEvents(loaded.record.eventsFile);
+    if (!events.some((event) => event.type === "activation_confirmed")) {
+      transportFail("host_transport_activation_not_confirmed");
+    }
+    return controllerLeaseResult("host_transport_activation_confirmed", handle);
+  });
+}
+
+function hasUnsafePreactivationEvidence(events) {
+  return events.some((event) => !["activation_required", "launcher_error"].includes(event.type));
+}
+
+const NORMALIZED_EVENT_BASE_KEYS = Object.freeze([
+  "schemaVersion",
+  "runId",
+  "requestId",
+  "sequence",
+  "timestamp",
+  "elapsedMs",
+  "type"
+]);
+
+function isExactNormalizedEvent(event, type, payloadKeys) {
+  return exactKeys(event, [...NORMALIZED_EVENT_BASE_KEYS, ...payloadKeys]) &&
+    event.schemaVersion === ACP_FOREGROUND_SCHEMA_VERSION &&
+    event.type === type &&
+    typeof event.runId === "string" && SAFE_HANDLE.test(event.runId) &&
+    typeof event.requestId === "string" && SAFE_HANDLE.test(event.requestId) &&
+    Number.isSafeInteger(event.sequence) && event.sequence >= 1 &&
+    validInstant(event.timestamp) &&
+    Number.isSafeInteger(event.elapsedMs) && event.elapsedMs >= 0;
+}
+
+// `activation_in_progress` normally means that the activation line may have
+// reached the PTY and therefore cannot be rolled back. The sole safe
+// exception is the supervisor's closed, canonical rejection sequence: its
+// first event requests activation and its second (and final) event rejects it
+// before activation confirmation or any ACP mutation/activity evidence.
+// Exact keys keep arbitrary event payloads and message-text classifications
+// out of this proof boundary.
+function hasExactPreactivationSupervisorRejection(events) {
+  if (events.length !== 2) return false;
+  const [required, rejected] = events;
+  if (!isExactNormalizedEvent(required, "activation_required", ["activationSchemaVersion"]) ||
+      required.activationSchemaVersion !== ACP_HOST_ACTIVATION_SCHEMA_VERSION ||
+      required.sequence !== 1 ||
+      !isExactNormalizedEvent(rejected, "supervisor_error", ["code"]) ||
+      typeof rejected.code !== "string" || !SAFE_EVENT_TYPE.test(rejected.code) ||
+      rejected.sequence !== 2) {
+    return false;
+  }
+  return rejected.runId === required.runId &&
+    rejected.requestId === required.requestId &&
+    Date.parse(rejected.timestamp) >= Date.parse(required.timestamp) &&
+    rejected.elapsedMs >= required.elapsedMs;
+}
+
+// Plugin-facing preactivation rollback. The record lease serializes this
+// decision with activate-begin. No process id is accepted or inferred: only
+// the exact tmux session handle created by prepare may be stopped.
+export function abortHostTransportPreactivation(input, dependencies = {}) {
+  const handle = assertHandle(input.processHandle);
+  return withTransportRecord(input.transportFile, "abort-preactivation", dependencies, (loaded) => {
+    if (loaded.record.processHandle !== handle) {
+      transportFail("host_transport_handle_mismatch");
+    }
+    if (loaded.record.controllerLease.phase === "preactivation_aborted") {
+      return controllerLeaseResult("host_transport_preactivation_aborted", handle);
+    }
+    const phase = loaded.record.controllerLease.phase;
+    if (!["prepared", "activation_in_progress"].includes(phase)) {
+      transportFail("host_transport_preactivation_abort_denied");
+    }
+    const events = parseEvents(loaded.record.eventsFile);
+    const rejectedBeforeActivation = phase === "activation_in_progress" &&
+      hasExactPreactivationSupervisorRejection(events);
+    if ((phase === "activation_in_progress" && !rejectedBeforeActivation) ||
+        (phase === "prepared" && hasUnsafePreactivationEvidence(events))) {
+      transportFail("host_transport_preactivation_abort_denied");
+    }
+    const runTmux = dependencies.runTmux ?? runTmuxDefault;
+    const active = sessionExists(runTmux, handle);
+    if (active) {
+      const stopped = runTmux(["kill-session", "-t", `=${handle}`], { timeoutMs: 5000 });
+      if (stopped.error || stopped.status !== 0) {
+        transportFail("host_transport_preactivation_abort_denied");
+      }
+    } else {
+      const exitCode = exitCodeFromFile(loaded.record.exitFile);
+      const mappedExit = rejectedBeforeActivation ? exitCode === 22 : [22, 64].includes(exitCode);
+      if (!mappedExit || events.length === 0) {
+        transportFail("host_transport_preactivation_abort_denied");
+      }
+    }
+    loaded.record.controllerLease.phase = "preactivation_aborted";
+    persistTransportRecord(loaded);
+    return controllerLeaseResult("host_transport_preactivation_aborted", handle);
+  });
 }
 
 function validateServiceCursorAck(loaded, acknowledgement, reissue, nowMs) {
@@ -810,6 +1126,7 @@ export function requireReport(loaded, kind, cadence, requiredAtMs, evidenceThrou
   publication.requiredAt = new Date(requiredAtMs).toISOString();
   publication.evidenceThroughSequence = evidenceThroughSequence;
   publication.receiptMessageId = null;
+  publication.lastAttemptOutcome = null;
   if (terminal) {
     publication.terminalSequence = terminal.sequence;
     publication.terminalStatus = terminalStatus(terminal);
@@ -821,10 +1138,20 @@ export function requireReport(loaded, kind, cadence, requiredAtMs, evidenceThrou
   }
 }
 
-function reportBoundary(publication, exposedState, events) {
+function reportBoundary(publication, events) {
   if (publication.kind === null) return null;
   return {
-    state: exposedState,
+    state: publication.state,
+    // Explicit delivery-state model of the fenced attempt protocol:
+    // claim_acquired → delivery_pending → acknowledged. `unclaimed` marks an
+    // obligation whose attempt slot is empty (a superseded attempt awaiting
+    // its bounded re-claim).
+    deliveryState: publication.state === "receipt_acked"
+      ? "acknowledged"
+      : publication.attempt !== null
+        ? publication.attempt.state
+        : "unclaimed",
+    lastAttemptOutcome: publication.lastAttemptOutcome,
     reportId: publication.reportId,
     kind: publication.kind,
     cadence: publication.cadence,
@@ -844,117 +1171,309 @@ function reportBoundary(publication, exposedState, events) {
   };
 }
 
-export function statusHostTransport(input, dependencies = {}) {
-  const loaded = loadHostTransportRecord(input.transportFile);
-  const handle = assertHandle(input.processHandle);
-  if (loaded.record.processHandle !== handle) {
-    transportFail("host_transport_handle_mismatch");
-  }
-  const afterSequence = input.afterSequence ?? 0;
-  if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
-    transportFail("host_transport_cursor_invalid");
-  }
-  const nowMs = nowValue(dependencies);
-  const reissuingCursor = validateServiceCursorAck(
-    loaded,
-    input.serviceCursorAck,
-    input.reissueServiceCursor,
-    nowMs
-  );
-  const events = parseEvents(loaded.record.eventsFile);
-  const terminal = events.find((event) => [
+function findTerminalEvent(events) {
+  return events.find((event) => [
     "terminal",
     "supervisor_error",
     "launcher_error"
   ].includes(event.type));
-  const publication = loaded.record.publication;
-  let exposedPublicationState = publication.state;
-  if (terminal && publication.terminalSequence !== terminal.sequence) {
-    // Canonical terminal evidence supersedes any overdue intermediate report.
-    const terminalEvidenceLimit = publication.kind === "intermediate" &&
-      publication.state !== "receipt_acked"
-      ? publication.evidenceThroughSequence
-      : terminal.sequence;
-    const terminalTimestampMs = Date.parse(terminal.timestamp);
-    requireReport(
+}
+
+// Observation only. `status` reports the stored publication boundary, issues
+// service cursors, and returns bounded evidence, but it never mints,
+// supersedes, or re-claims a report obligation: publication transitions are
+// owned exclusively by the closed `claim-report` action, so a status poll can
+// never race a claimer into double-minting an obligation.
+export function statusHostTransport(input, dependencies = {}) {
+  const handle = assertHandle(input.processHandle);
+  const afterSequence = input.afterSequence ?? 0;
+  if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
+    transportFail("host_transport_cursor_invalid");
+  }
+  return withTransportRecord(input.transportFile, "status", dependencies, (loaded) => {
+    if (loaded.record.processHandle !== handle) {
+      transportFail("host_transport_handle_mismatch");
+    }
+    const nowMs = nowValue(dependencies);
+    const reissuingCursor = validateServiceCursorAck(
       loaded,
-      "terminal",
-      0,
-      Number.isFinite(terminalTimestampMs) ? terminalTimestampMs : nowMs,
-      terminalEvidenceLimit,
-      terminal,
-      dependencies
+      input.serviceCursorAck,
+      input.reissueServiceCursor,
+      nowMs
     );
-    exposedPublicationState = "report_required";
-  } else if (
-    !terminal && publication.state === "receipt_acked" &&
-    publication.nextDueAt !== null && nowMs >= Date.parse(publication.nextDueAt)
-  ) {
-    requireReport(
-      loaded,
-      "intermediate",
-      publication.nextCadence,
-      Date.parse(publication.nextDueAt),
-      events.at(-1)?.sequence ?? 0,
-      null,
-      dependencies
-    );
-    exposedPublicationState = "report_required";
-  }
-  const evidenceLimit = publication.state === "receipt_acked"
-    ? Number.POSITIVE_INFINITY
-    : publication.evidenceThroughSequence;
-  const selected = events
-    .filter((event) => event.sequence > afterSequence)
-    .filter((event) => event.sequence <= evidenceLimit || event.sequence === publication.terminalSequence)
-    .slice(0, MAX_RETURNED_EVENTS);
-  const selectedSequences = new Set(selected.map((event) => event.sequence));
-  let returnedSequence = afterSequence;
-  // A terminal may be exposed out of order while an intermediate boundary
-  // hides newer evidence. Advance only across the consecutive event-log
-  // prefix actually returned; after terminal receipt acknowledgement the
-  // lifted boundary makes the hidden gap available to the next poll.
-  for (const event of events) {
-    if (event.sequence <= afterSequence) continue;
-    if (!selectedSequences.has(event.sequence)) break;
-    returnedSequence = event.sequence;
-  }
-  const exitCode = exitCodeFromFile(loaded.record.exitFile);
-  const active = sessionExists(dependencies.runTmux ?? runTmuxDefault, handle);
-  const cursor = reissuingCursor
-    ? publication.controlCursor
-    : newPrivateId("service", dependencies);
-  if (!reissuingCursor) {
-    publication.controlCursor = cursor;
-    publication.controlCursorIssuedAt = new Date(nowMs).toISOString();
-    publication.controlCursorReissues = 0;
-  }
-  if (publication.state === "report_required") {
-    publication.state = "publication_pending";
-  }
-  persistTransportRecord(loaded);
-  const terminalPending = terminal && publication.kind === "terminal" && publication.state !== "receipt_acked";
-  const boundary = reportBoundary(publication, exposedPublicationState, events);
+    const events = parseEvents(loaded.record.eventsFile);
+    const terminal = findTerminalEvent(events);
+    const publication = loaded.record.publication;
+    const evidenceLimit = publication.state === "receipt_acked"
+      ? Number.POSITIVE_INFINITY
+      : publication.evidenceThroughSequence;
+    const selected = events
+      .filter((event) => event.sequence > afterSequence)
+      .filter((event) => event.sequence <= evidenceLimit || event.sequence === publication.terminalSequence)
+      .slice(0, MAX_RETURNED_EVENTS);
+    const selectedSequences = new Set(selected.map((event) => event.sequence));
+    let returnedSequence = afterSequence;
+    // A terminal may be exposed out of order while an intermediate boundary
+    // hides newer evidence. Advance only across the consecutive event-log
+    // prefix actually returned; after terminal receipt acknowledgement the
+    // lifted boundary makes the hidden gap available to the next poll.
+    for (const event of events) {
+      if (event.sequence <= afterSequence) continue;
+      if (!selectedSequences.has(event.sequence)) break;
+      returnedSequence = event.sequence;
+    }
+    const exitCode = exitCodeFromFile(loaded.record.exitFile);
+    const active = sessionExists(dependencies.runTmux ?? runTmuxDefault, handle);
+    const cursor = reissuingCursor
+      ? publication.controlCursor
+      : newPrivateId("service", dependencies);
+    if (!reissuingCursor) {
+      publication.controlCursor = cursor;
+      publication.controlCursorIssuedAt = new Date(nowMs).toISOString();
+      publication.controlCursorReissues = 0;
+    }
+    persistTransportRecord(loaded);
+    const terminalAcked = publication.kind === "terminal" && publication.state === "receipt_acked";
+    const terminalPending = terminal && !terminalAcked;
+    const boundary = reportBoundary(publication, events);
+    return {
+      schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+      type: "host_transport_status",
+      status: publication.halted === "tracking_lost"
+        ? "tracking_lost"
+        : terminalPending
+        ? "terminal_publication_pending"
+        : active ? "active" : exitCode === null ? "unavailable" : "exited",
+      processHandle: handle,
+      // Advance only through evidence returned in this response. Jumping to the
+      // file tail while `truncated` would make the next poll skip events.
+      lastSequence: returnedSequence,
+      truncated: events.filter((event) =>
+        event.sequence > afterSequence &&
+        (event.sequence <= evidenceLimit || event.sequence === publication.terminalSequence)
+      ).length > selected.length,
+      events: selected,
+      serviceCursor: cursor,
+      ...(boundary ? { reportPublication: boundary } : {}),
+      ...(publication.halted === null ? {} : { publicationHalted: publication.halted }),
+      ...(terminal ? { terminalType: terminal.type } : {}),
+      ...(exitCode === null ? {} : { exitCode })
+    };
+  });
+}
+
+function claimResult(status, extra = {}) {
   return {
     schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
-    type: "host_transport_status",
-    status: terminalPending
-      ? "terminal_publication_pending"
-      : active ? "active" : exitCode === null ? "unavailable" : "exited",
-    processHandle: handle,
-    // Advance only through evidence returned in this response. Jumping to the
-    // file tail while `truncated` would make the next poll skip events.
-    lastSequence: returnedSequence,
-    truncated: events.filter((event) =>
-      event.sequence > afterSequence &&
-      (event.sequence <= evidenceLimit || event.sequence === publication.terminalSequence)
-    ).length > selected.length,
-    events: selected,
-    serviceCursor: cursor,
-    ...(boundary ? { reportPublication: boundary } : {}),
-    ...(terminal ? { terminalType: terminal.type } : {}),
-    ...(exitCode === null ? {} : { exitCode })
+    type: "host_transport_report_claim",
+    status,
+    ...extra
   };
+}
+
+// The one closed publication-minting action. Under the exclusive record
+// lease it atomically checks the exact handle, destination, and bound pump
+// job identity, derives a fresh canonical intermediate or terminal report
+// boundary from the current normalized evidence, records exactly one fenced
+// publication attempt (delivery state `claim_acquired`), and returns only the
+// bounded data the delivery layer needs. No static report snapshot is ever
+// replayed: cadence, terminal status, and the activity instant come from the
+// live record and event log at claim time.
+export function claimHostTransportReport(input, dependencies = {}) {
+  const handle = assertHandle(input.processHandle);
+  if (!isReportPumpId(input.jobId)) {
+    transportFail("host_transport_pump_job_invalid");
+  }
+  if (typeof input.runToken !== "string" || !SAFE_HANDLE.test(input.runToken)) {
+    transportFail("host_transport_pump_run_token_invalid");
+  }
+  return withTransportRecord(input.transportFile, "claim-report", dependencies, (loaded) => {
+    const record = loaded.record;
+    if (record.processHandle !== handle) {
+      transportFail("host_transport_handle_mismatch");
+    }
+    if (input.destination !== record.reportingContext.controlConversationId) {
+      transportFail("host_transport_pump_destination_mismatch");
+    }
+    const publication = record.publication;
+    if (publication.pumpJobId !== null && publication.pumpJobId !== input.jobId) {
+      transportFail("host_transport_pump_job_mismatch");
+    }
+    if (publication.halted === "tracking_lost") {
+      return claimResult("tracking_lost");
+    }
+    if (publication.kind === "terminal" && publication.state === "receipt_acked") {
+      // Terminal receipt is acknowledged: publication is complete, no lease
+      // remains held, and the pump must deterministically clean itself up
+      // (disable/delete its automation) instead of claiming again.
+      return claimResult("terminal_acked");
+    }
+    const nowMs = nowValue(dependencies);
+    const events = parseEvents(record.eventsFile);
+    const terminal = findTerminalEvent(events);
+    const exitCode = exitCodeFromFile(record.exitFile);
+    const active = sessionExists(dependencies.runTmux ?? runTmuxDefault, handle);
+    const bindingJob = publication.pumpJobId === null;
+    if (bindingJob) {
+      publication.pumpJobId = input.jobId;
+    }
+    if (!terminal && !active) {
+      // The exact tracked session is gone without terminal evidence:
+      // control-plane tracking loss. Stop publication permanently — a report
+      // that claims ACP is still running would be false — even when a mapped
+      // exit file survived — and never relaunch.
+      publication.halted = "tracking_lost";
+      persistTransportRecord(loaded);
+      return claimResult("tracking_lost");
+    }
+    const recordPreviousAttemptOutcome = () => {
+      const attempt = publication.attempt;
+      if (attempt === null) return;
+      // Explicit, never-inferred outcomes: a crash after the Discord handoff
+      // (delivery_pending) is `uncertain` — the message may or may not exist
+      // — while a crash before the handoff (claim_acquired) is a safe
+      // `missing`. Neither is ever recorded as success.
+      publication.lastAttemptOutcome = attempt.state === "delivery_pending"
+        ? "uncertain"
+        : "missing";
+      publication.attempt = null;
+    };
+    const mintAttempt = () => {
+      if (publication.attemptCount >= MAX_REPORT_PUBLICATION_ATTEMPTS) {
+        transportFail("host_transport_report_attempts_exhausted");
+      }
+      publication.fence += 1;
+      publication.attemptCount += 1;
+      publication.attempt = {
+        attemptId: newPrivateId("attempt", dependencies),
+        fence: publication.fence,
+        state: "claim_acquired",
+        jobId: input.jobId,
+        runToken: input.runToken,
+        claimedAt: new Date(nowMs).toISOString(),
+        expiresAt: new Date(nowMs + REPORT_ATTEMPT_TTL_MS).toISOString()
+      };
+    };
+    if (terminal && publication.terminalSequence !== terminal.sequence) {
+      // Canonical terminal evidence supersedes any overdue intermediate
+      // report; a pending intermediate attempt ends with its explicit
+      // missing/uncertain outcome and its stale fence can never acknowledge
+      // the terminal report.
+      const terminalEvidenceLimit = publication.kind === "intermediate" &&
+        publication.state !== "receipt_acked"
+        ? publication.evidenceThroughSequence
+        : terminal.sequence;
+      recordPreviousAttemptOutcome();
+      const terminalTimestampMs = Date.parse(terminal.timestamp);
+      requireReport(
+        loaded,
+        "terminal",
+        0,
+        Number.isFinite(terminalTimestampMs) ? terminalTimestampMs : nowMs,
+        terminalEvidenceLimit,
+        terminal,
+        dependencies
+      );
+      publication.state = "publication_pending";
+      publication.attemptCount = 0;
+      mintAttempt();
+    } else if (publication.state !== "receipt_acked") {
+      const attempt = publication.attempt;
+      if (attempt !== null && nowMs < Date.parse(attempt.expiresAt)) {
+        // A live claim is never silently stolen, not even by the same job.
+        transportFail("host_transport_report_claim_held");
+      }
+      recordPreviousAttemptOutcome();
+      mintAttempt();
+    } else if (
+      !terminal &&
+      publication.nextDueAt !== null && nowMs >= Date.parse(publication.nextDueAt)
+    ) {
+      requireReport(
+        loaded,
+        "intermediate",
+        publication.nextCadence,
+        Date.parse(publication.nextDueAt),
+        events.at(-1)?.sequence ?? 0,
+        null,
+        dependencies
+      );
+      publication.state = "publication_pending";
+      publication.attemptCount = 0;
+      mintAttempt();
+    } else {
+      if (bindingJob) {
+        persistTransportRecord(loaded);
+      }
+      return claimResult("none_due");
+    }
+    persistTransportRecord(loaded);
+    const context = record.reportingContext;
+    return claimResult("claimed", {
+      attemptId: publication.attempt.attemptId,
+      fence: publication.attempt.fence,
+      attemptCount: publication.attemptCount,
+      reportId: publication.reportId,
+      reportKind: publication.kind,
+      cadence: publication.cadence,
+      requiredAt: publication.requiredAt,
+      identity: {
+        agent: context.agent,
+        model: context.model,
+        roundIndex: context.roundIndex,
+        repository: context.repository,
+        branch: context.branch
+      },
+      ...(publication.kind === "terminal"
+        ? {
+            terminalStatus: publication.terminalStatus,
+            elapsedMs: Number.isSafeInteger(terminal?.elapsedMs) && terminal.elapsedMs >= 0
+              ? terminal.elapsedMs
+              : null
+          }
+        : { lastAcpActivityAt: lastAcpActivityInstant(events) })
+    });
+  });
+}
+
+// Marks the exact fenced attempt as handed to the delivery layer. Persisting
+// `delivery_pending` BEFORE the Discord handoff is what makes a later crash
+// classifiable: an expired claim_acquired attempt was provably never handed
+// off (`missing`), while an expired delivery_pending attempt has an
+// `uncertain` outcome that is never inferred as success.
+export function beginHostTransportReportDelivery(input, dependencies = {}) {
+  const handle = assertHandle(input.processHandle);
+  return withTransportRecord(input.transportFile, "begin-delivery", dependencies, (loaded) => {
+    if (loaded.record.processHandle !== handle) {
+      transportFail("host_transport_handle_mismatch");
+    }
+    const publication = loaded.record.publication;
+    if (publication.halted !== null) {
+      transportFail("host_transport_publication_halted");
+    }
+    const attempt = publication.attempt;
+    if (
+      attempt === null ||
+      input.attemptId !== attempt.attemptId ||
+      input.fence !== attempt.fence
+    ) {
+      transportFail("host_transport_report_fencing_stale");
+    }
+    if (nowValue(dependencies) >= Date.parse(attempt.expiresAt)) {
+      transportFail("host_transport_report_attempt_expired");
+    }
+    if (attempt.state !== "claim_acquired") {
+      transportFail("host_transport_report_delivery_already_pending");
+    }
+    attempt.state = "delivery_pending";
+    persistTransportRecord(loaded);
+    return {
+      schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+      type: "host_transport_report_delivery_pending",
+      reportKind: publication.kind,
+      cadence: publication.cadence
+    };
+  });
 }
 
 function canonicalAcknowledgedReport(record, publication, report) {
@@ -980,12 +1499,19 @@ function canonicalAcknowledgedReport(record, publication, report) {
 }
 
 export function acknowledgeHostTransportReport(input, dependencies = {}) {
-  const loaded = loadHostTransportRecord(input.transportFile);
   const handle = assertHandle(input.processHandle);
+  return withTransportRecord(input.transportFile, "ack-report", dependencies, (loaded) =>
+    acknowledgeLockedReport(loaded, handle, input, dependencies));
+}
+
+function acknowledgeLockedReport(loaded, handle, input, dependencies) {
   if (loaded.record.processHandle !== handle) {
     transportFail("host_transport_handle_mismatch");
   }
   const publication = loaded.record.publication;
+  if (publication.halted !== null) {
+    transportFail("host_transport_publication_halted");
+  }
   if (publication.state === "receipt_acked") {
     transportFail(publication.kind === null
       ? "host_transport_report_not_required"
@@ -993,6 +1519,21 @@ export function acknowledgeHostTransportReport(input, dependencies = {}) {
   }
   if (input.reportId !== publication.reportId || input.reportKind !== publication.kind || input.cadence !== publication.cadence) {
     transportFail("host_transport_report_ack_mismatch");
+  }
+  // Acknowledgement requires the exact fenced attempt identity minted by
+  // claim-report: a superseded (stale-fence) claimer can never close a newer
+  // attempt's obligation, and an attempt that never persisted the
+  // delivery_pending handoff cannot claim a receipt exists for it.
+  const attempt = publication.attempt;
+  if (
+    attempt === null ||
+    input.attemptId !== attempt.attemptId ||
+    input.fence !== attempt.fence
+  ) {
+    transportFail("host_transport_report_fencing_stale");
+  }
+  if (attempt.state !== "delivery_pending") {
+    transportFail("host_transport_report_ack_state");
   }
   const canonicalReport = canonicalAcknowledgedReport(loaded.record, publication, input.report);
   const canonicalDigest = crypto.createHash("sha256").update(canonicalReport, "utf8").digest("hex");
@@ -1023,6 +1564,12 @@ export function acknowledgeHostTransportReport(input, dependencies = {}) {
   }
   publication.state = "receipt_acked";
   publication.receiptMessageId = receipt.messageId;
+  // The attempt lease is released deterministically on acknowledgement and
+  // its outcome is recorded explicitly; the next obligation starts with a
+  // fresh bounded attempt budget.
+  publication.attempt = null;
+  publication.attemptCount = 0;
+  publication.lastAttemptOutcome = "acknowledged";
   publication.acknowledgedMessageIds = [
     ...publication.acknowledgedMessageIds,
     receipt.messageId
@@ -1047,14 +1594,36 @@ export function acknowledgeHostTransportReport(input, dependencies = {}) {
   };
 }
 
-export function reconcileHostTransport(input) {
-  const loaded = loadHostTransportRecord(input.transportFile);
+export function reconcileHostTransport(input, dependencies = {}) {
   const handle = assertHandle(input.processHandle);
+  return withTransportRecord(input.transportFile, "reconcile", dependencies, (loaded) =>
+    reconcileLockedTransport(loaded, handle));
+}
+
+function reconcileLockedTransport(loaded, handle) {
   if (loaded.record.processHandle !== handle) {
     transportFail("host_transport_handle_mismatch");
   }
   const events = parseEvents(loaded.record.eventsFile);
   const exitCode = exitCodeFromFile(loaded.record.exitFile);
+  if (loaded.record.publication.halted === "tracking_lost") {
+    const runId = events.at(0)?.runId;
+    if (!runId) {
+      transportFail("host_transport_run_missing");
+    }
+    const ledgerFile = lifecycleLedgerPath(path.dirname(loaded.record.eventsFile), runId);
+    const ledger = loadLifecycleLedger(ledgerFile).document;
+    const reconciled = reconcileLifecycleLedger({
+      ledgerFile,
+      processHandle: ledger.processHandle,
+      outcome: "tracking_lost"
+    });
+    return {
+      schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+      type: "host_transport_reconciled",
+      status: reconciled.state
+    };
+  }
   if (exitCode === null) {
     transportFail("host_transport_exit_pending");
   }
@@ -1090,19 +1659,12 @@ export function reconcileHostTransport(input) {
       status: "terminal_publication_pending"
     };
   }
-  const reconciled = ledger.state === "exit_reconciled"
-    ? reconcileLifecycleLedger({
-        ledgerFile,
-        processHandle: ledger.processHandle,
-        outcome: "exited",
-        exitCode
-      })
-    : reconcileLifecycleLedger({
-        ledgerFile,
-        processHandle: ledger.processHandle,
-        outcome: "exited",
-        exitCode
-      });
+  const reconciled = reconcileLifecycleLedger({
+    ledgerFile,
+    processHandle: ledger.processHandle,
+    outcome: "exited",
+    exitCode
+  });
   return {
     schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
     type: "host_transport_reconciled",
@@ -1111,21 +1673,22 @@ export function reconcileHostTransport(input) {
 }
 
 export function cancelHostTransport(input, dependencies = {}) {
-  const loaded = loadHostTransportRecord(input.transportFile);
   const handle = assertHandle(input.processHandle);
-  if (loaded.record.processHandle !== handle) {
-    transportFail("host_transport_handle_mismatch");
-  }
-  const runTmux = dependencies.runTmux ?? runTmuxDefault;
-  if (!sessionExists(runTmux, handle)) {
-    transportFail("host_transport_not_running");
-  }
-  const result = runTmux(["send-keys", "-t", `=${handle}:0.0`, "C-c"], { timeoutMs: 5000 });
-  if (result.error || result.status !== 0) {
-    transportFail("host_transport_cancel_failed");
-  }
-  return {
-    schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
-    type: "host_transport_cancel_signalled"
-  };
+  return withTransportRecord(input.transportFile, "cancel", dependencies, (loaded) => {
+    if (loaded.record.processHandle !== handle) {
+      transportFail("host_transport_handle_mismatch");
+    }
+    const runTmux = dependencies.runTmux ?? runTmuxDefault;
+    if (!sessionExists(runTmux, handle)) {
+      transportFail("host_transport_not_running");
+    }
+    const result = runTmux(["send-keys", "-t", `=${handle}:0.0`, "C-c"], { timeoutMs: 5000 });
+    if (result.error || result.status !== 0) {
+      transportFail("host_transport_cancel_failed");
+    }
+    return {
+      schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+      type: "host_transport_cancel_signalled"
+    };
+  });
 }

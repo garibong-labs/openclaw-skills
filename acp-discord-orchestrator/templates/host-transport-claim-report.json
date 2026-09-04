@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "acp-host-transport.v2",
+  "action": "claim-report",
+  "transportFile": "/absolute/private/transport.json",
+  "processHandle": "EXACT_HOST_HANDLE",
+  "jobId": "EXACT_REPORT_PUMP_JOB_ID",
+  "runToken": "OPAQUE_RUN_TOKEN",
+  "destination": "CONTROL_CONVERSATION_ID"
+}

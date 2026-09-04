@@ -1,0 +1,24 @@
+{
+  "name": "ACP report controller",
+  "sessionTarget": "isolated",
+  "schedule": {
+    "kind": "every",
+    "everyMs": 600000
+  },
+  "payload": {
+    "kind": "script",
+    "script": "const leaseToken = \"LEASE_TOKEN\";\nconst jobId = \"JOB_ID\";\nconst isPlainObject = (value) => {\n  if (value === null || typeof value !== \"object\" || Array.isArray(value)) return false;\n  const prototype = Object.getPrototypeOf(value);\n  return prototype === Object.prototype || prototype === null;\n};\nconst removalProven = (response) => {\n  if (!isPlainObject(response)) return false;\n  if (Object.hasOwn(response, \"details\") && !isPlainObject(response.details)) return false;\n  const evidence = Object.hasOwn(response, \"details\") ? [response, response.details] : [response];\n  let positive = false;\n  for (const value of evidence) {\n    if (Object.hasOwn(value, \"removed\")) {\n      if (value.removed !== true) return false;\n      positive = true;\n    }\n    if (Object.hasOwn(value, \"status\")) {\n      if (value.status !== \"removed\") return false;\n      positive = true;\n    }\n    if (Object.hasOwn(value, \"error\") || Object.hasOwn(value, \"failure\")) return false;\n    if (Object.hasOwn(value, \"success\") && value.success !== true) return false;\n  }\n  return positive;\n};\nconst removeCurrentJob = async () => removalProven(\n  await automations({ action: \"remove\", jobId }),\n);\nconst cleanup = async (result) => {\n  if (result.status !== \"terminal_acked\" && result.status !== \"tracking_lost\") return;\n  if (!await removeCurrentJob()) return;\n  await acp_report_controller({ action: \"release\", leaseToken });\n};\nconst first = await acp_report_controller({ action: \"tick\", leaseToken });\nif (first.status === \"delivery_pending\") {\n  await message({ action: \"send\", message: first.publicationToken, final: false });\n  const afterSend = await acp_report_controller({ action: \"tick\", leaseToken });\n  await cleanup(afterSend);\n  return {};\n}\nawait cleanup(first);\nreturn {};",
+    "timeoutSeconds": 60,
+    "toolBudget": 5,
+    "toolsAllow": [
+      "acp_report_controller",
+      "message",
+      "automations"
+    ]
+  },
+  "delivery": {
+    "mode": "none"
+  },
+  "enabled": true,
+  "deleteAfterRun": false
+}

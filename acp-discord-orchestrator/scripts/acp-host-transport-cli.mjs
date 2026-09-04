@@ -1,17 +1,23 @@
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import {
   ACP_HOST_TRANSPORT_SCHEMA_VERSION,
   acknowledgeHostTransportReport,
   activateHostTransport,
+  beginHostTransportReportDelivery,
   cancelHostTransport,
+  claimHostTransportReport,
   prepareHostTransport,
   probeHostTransport,
   reconcileHostTransport,
   statusHostTransport
 } from "./acp-host-transport.mjs";
+import {
+  assertExactKeys as assertGenericExactKeys,
+  isCliEntry,
+  safeCode
+} from "./acp-private-json-input.mjs";
 
 const INVALID_INPUT_EXIT = 64;
 const TRANSPORT_ERROR_EXIT = 22;
@@ -23,12 +29,6 @@ function cliFail(code) {
   throw error;
 }
 
-function safeCode(value) {
-  return typeof value === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value)
-    ? value
-    : "host_transport_failed";
-}
-
 function exitCodeFor(code) {
   return code === "usage" ||
     code.startsWith("invalid_") ||
@@ -38,6 +38,8 @@ function exitCodeFor(code) {
     code === "host_transport_handle_invalid" ||
     code === "host_transport_handle_mismatch" ||
     code === "host_transport_cursor_invalid" ||
+    code === "host_transport_report_fencing_stale" ||
+    code.startsWith("host_transport_pump_") ||
     code.startsWith("host_transport_service_cursor_") ||
     code.startsWith("host_transport_report_ack_") ||
     code.startsWith("host_transport_report_receipt_")
@@ -89,11 +91,7 @@ function readPrivateInput(filePath) {
 }
 
 function assertExactKeys(input, required, optional = []) {
-  const allowed = new Set([...required, ...optional]);
-  const keys = Object.keys(input);
-  if (!required.every((key) => keys.includes(key)) || keys.some((key) => !allowed.has(key))) {
-    cliFail("host_transport_input_shape");
-  }
+  assertGenericExactKeys(input, required, optional, cliFail, "host_transport_input_shape");
 }
 
 async function dispatch(input) {
@@ -116,6 +114,27 @@ async function dispatch(input) {
     ]);
     return statusHostTransport(input);
   }
+  if (input.action === "claim-report") {
+    assertExactKeys(input, [
+      ...base,
+      "transportFile",
+      "processHandle",
+      "jobId",
+      "runToken",
+      "destination"
+    ]);
+    return claimHostTransportReport(input);
+  }
+  if (input.action === "begin-delivery") {
+    assertExactKeys(input, [
+      ...base,
+      "transportFile",
+      "processHandle",
+      "attemptId",
+      "fence"
+    ]);
+    return beginHostTransportReportDelivery(input);
+  }
   if (input.action === "ack-report") {
     assertExactKeys(input, [
       ...base,
@@ -124,6 +143,8 @@ async function dispatch(input) {
       "reportId",
       "reportKind",
       "cadence",
+      "attemptId",
+      "fence",
       "report",
       "receipt"
     ]);
@@ -148,24 +169,13 @@ export async function main(argv = process.argv.slice(2)) {
     process.stdout.write(JSON.stringify(result) + "\n");
     return 0;
   } catch (error) {
-    const code = safeCode(error && error.code);
+    const code = safeCode(error && error.code, "host_transport_failed");
     process.stderr.write(JSON.stringify({
       schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
       type: "host_transport_error",
       code
     }) + "\n");
     return exitCodeFor(code);
-  }
-}
-
-function isCliEntry(argvPath, moduleUrl) {
-  if (typeof argvPath !== "string" || argvPath.length === 0) {
-    return false;
-  }
-  try {
-    return fs.realpathSync(path.resolve(argvPath)) === fs.realpathSync(fileURLToPath(moduleUrl));
-  } catch {
-    return false;
   }
 }
 
