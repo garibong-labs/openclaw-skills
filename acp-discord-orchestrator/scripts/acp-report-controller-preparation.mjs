@@ -325,9 +325,15 @@ const REMOVED_STATUS = "removed";
 // level says nothing about removal; `false` means it actively denies it and can
 // never be overridden by the other level.
 function readRemovalSignal(level) {
-  if (Object.hasOwn(level, "removed")) return level.removed === true;
-  if (Object.hasOwn(level, "status")) return level.status === REMOVED_STATUS;
-  return undefined;
+  const signals = [];
+  if (Object.hasOwn(level, "removed")) signals.push(level.removed === true);
+  if (Object.hasOwn(level, "status")) signals.push(level.status === REMOVED_STATUS);
+  // An explicit error cannot coexist with proof of successful removal. The
+  // value is deliberately not inspected or surfaced: its presence alone makes
+  // the bounded envelope ambiguous.
+  if (Object.hasOwn(level, "error")) signals.push(false);
+  if (signals.length === 0) return undefined;
+  return signals.every((signal) => signal === true);
 }
 
 // One strict bounded parser for every removal answer this boundary really

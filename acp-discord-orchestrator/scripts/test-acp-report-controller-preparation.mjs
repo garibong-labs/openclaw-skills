@@ -619,6 +619,18 @@ const PROVEN_REMOVALS = [
   ["unwrapped top-level removed", { removed: true }],
   ["top-level removed status", { status: "removed" }],
   ["nested details status", { details: { status: "removed" } }],
+  ["coexisting top-level positives", { removed: true, status: "removed" }],
+  ["coexisting cross-level positives",
+    { removed: true, details: { removed: true, status: "removed" } }],
+];
+
+const CONTRADICTORY_REMOVALS = [
+  ["same-level top-level contradiction", { removed: true, status: "error" }],
+  ["same-level nested contradiction", { details: { removed: true, status: "error" } }],
+  ["cross-level removed contradiction", { removed: true, details: { removed: false } }],
+  ["cross-level status contradiction", { status: "removed", details: { status: "error" } }],
+  ["explicit top-level error", { removed: true, error: "bounded-private-error" }],
+  ["explicit nested error", { details: { status: "removed", error: true } }],
 ];
 
 test("a proven removal in any real envelope aborts the exact unregistered prepared transport", async () => {
@@ -686,8 +698,7 @@ test("an unproven removal envelope never aborts or releases anything", async () 
     ["non-object envelope", () => "removed"],
     ["boolean envelope", () => true],
     // A wrapped envelope whose two levels disagree proves nothing either way.
-    ["contradicting levels", () => ({ removed: true, details: { removed: false } })],
-    ["contradicting status levels", () => ({ status: "removed", details: { status: "error" } })],
+    ...CONTRADICTORY_REMOVALS.map(([label, envelope]) => [label, () => envelope]),
     ["throws", () => { throw new Error("secret removal detail"); }],
   ];
   for (const [label, respond] of cases) {
@@ -704,6 +715,26 @@ test("an unproven removal envelope never aborts or releases anything", async () 
     );
     assert.deepEqual(events.map(([name]) => name), [
       "create", "arm", "bind", "start", "assemble", "prepare", "register", "activate", "remove",
+    ], label);
+    assert.equal(events.some(([name]) => name.startsWith("abort")), false, label);
+  }
+});
+
+test("contradictory removal envelopes never abort an unregistered prepared transport", async () => {
+  for (const [label, removal] of CONTRADICTORY_REMOVALS) {
+    const events = [];
+    const input = makeInput();
+    input.destination = { channel: "discord", accountId: "account-example", conversationId: {} };
+    await assert.rejects(
+      runReportControllerPreparation(input, makeDependencies(events, {
+        async removeAutomation(value) { events.push(["remove", value]); return removal; },
+      })),
+      (error) => error instanceof AcpReportControllerPreparationError &&
+        error.code === "report_controller_pre_activation_cleanup_failed",
+      label,
+    );
+    assert.deepEqual(events.map(([name]) => name), [
+      "create", "arm", "bind", "start", "assemble", "prepare", "remove",
     ], label);
     assert.equal(events.some(([name]) => name.startsWith("abort")), false, label);
   }

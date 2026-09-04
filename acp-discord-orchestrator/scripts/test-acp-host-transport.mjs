@@ -1406,36 +1406,41 @@ test("record mutations serialize on the exclusive lease and never steal a live l
   }), /host_transport_lock_timeout/);
   assert.equal(fs.existsSync(lockFile), true);
 
-  // Only a stale lease (crashed holder, beyond the stale age) is taken over.
+  // An apparently stale lease also fails closed: pathname age is not identity,
+  // and reclaiming it could unlink a fresh replacement in the compare/act gap.
   const old = new Date(Date.now() - 120000);
   fs.utimesSync(lockFile, old, old);
-  const status = statusHostTransport(fixture, {
+  assert.throws(() => statusHostTransport(fixture, {
     ...ACTIVE_TMUX,
     nowMs: 1000,
     lockWaitMs: 80,
-    randomUUID: () => "lease-takeover"
-  });
-  assert.equal(status.type, "host_transport_status");
-  // The lease is released deterministically when the action returns.
-  assert.equal(fs.existsSync(lockFile), false);
+  }), /host_transport_lock_timeout/);
+  assert.equal(fs.readFileSync(lockFile, "utf8").includes("foreign-live-holder"), true);
 });
 
-test("failed stale-lock unlink still observes bounded sleep and timeout", () => {
+test("stale-lock replacement race never unlinks the fresh owner or admits a writer", () => {
   const exists = () => {
     const error = new Error("exists");
     error.code = "EEXIST";
     throw error;
   };
   let sleeps = 0;
+  let unlinkCalls = 0;
+  let freshOwnerWasUnlinked = false;
+  let observedOldLease = false;
   const startedAt = Date.now();
   assert.throws(() => acquireTransportLock("/private/fake-record.json", "status", {
     fileSystem: {
       writeFileSync: exists,
-      lstatSync: () => ({ mtimeMs: 0 }),
+      lstatSync: () => {
+        observedOldLease = true;
+        // This is the old takeover boundary: the pathname now denotes a fresh
+        // holder. The implementation must not perform any pathname deletion.
+        return { mtimeMs: Date.now() };
+      },
       unlinkSync() {
-        const error = new Error("denied");
-        error.code = "EPERM";
-        throw error;
+        unlinkCalls += 1;
+        freshOwnerWasUnlinked = true;
       },
     },
     lockWaitMs: 35,
@@ -1445,6 +1450,9 @@ test("failed stale-lock unlink still observes bounded sleep and timeout", () => 
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
     },
   }), /host_transport_lock_timeout/u);
+  assert.equal(observedOldLease, true);
+  assert.equal(unlinkCalls, 0);
+  assert.equal(freshOwnerWasUnlinked, false);
   assert.ok(sleeps >= 1);
   assert.ok(Date.now() - startedAt < 500);
 });

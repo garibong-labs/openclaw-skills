@@ -49,8 +49,11 @@ export const MAX_REPORT_PUBLICATION_ATTEMPTS = 3;
 // supersede only an expired attempt (recording its explicit missing/uncertain
 // outcome); a live attempt is never silently stolen.
 export const REPORT_ATTEMPT_TTL_MS = 300000;
-// Exclusive record-mutation lock: bounded wait before failing closed, and the
-// stale age after which a crashed holder's lock file may be taken over.
+// Exclusive record-mutation lock: bounded wait before failing closed. The
+// stale-age export is retained as a wire/API compatibility constant, but a
+// pathname-only Node filesystem API cannot atomically prove inode identity and
+// unlink that same inode. Expired locks therefore fail closed instead of being
+// reclaimed through an unsafe pathname compare/act sequence.
 export const TRANSPORT_LOCK_WAIT_MS = 5000;
 export const TRANSPORT_LOCK_STALE_MS = 30000;
 
@@ -216,13 +219,15 @@ function sleepSyncMs(ms) {
 // record. This lock serializes the whole read-modify-write critical section,
 // while the monotonic publication fence (record.publication.fence) orders the
 // long-lived claim→deliver→acknowledge attempts that span multiple calls.
-// A live lock is never silently stolen: takeover happens only after the
-// bounded stale age, which only a crashed or wedged holder can reach because
-// every action releases the lock before returning.
+// No lock is silently stolen, including an apparently stale one. Node's
+// portable pathname primitives cannot express conditional unlink-by-identity;
+// removing a pathname after lstat would allow a fresh replacement to be
+// deleted in the gap. A crashed holder therefore requires owner intervention.
+// This fail-closed rule also makes release safe for protocol participants: no
+// contender can replace the pathname while the owning closure is active.
 export function acquireTransportLock(recordFile, action, dependencies = {}) {
   const lockFile = `${recordFile}.lock`;
   const waitMs = dependencies.lockWaitMs ?? TRANSPORT_LOCK_WAIT_MS;
-  const staleMs = dependencies.lockStaleMs ?? TRANSPORT_LOCK_STALE_MS;
   const sleep = dependencies.sleepMs ?? sleepSyncMs;
   const fileSystem = dependencies.fileSystem ?? fs;
   const ownerToken = crypto.randomUUID();
@@ -245,26 +250,14 @@ export function acquireTransportLock(recordFile, action, dependencies = {}) {
         transportFail("host_transport_lock_failed");
       }
     }
-    let stat = null;
     try {
-      stat = fileSystem.lstatSync(lockFile);
+      fileSystem.lstatSync(lockFile);
     } catch (error) {
       if (error && error.code === "ENOENT") {
         sleep(25);
         continue;
       }
       transportFail("host_transport_lock_failed");
-    }
-    if (Date.now() - stat.mtimeMs > staleMs) {
-      // Expired lease of a crashed holder — not a live lease. Remove it and
-      // race for a fresh acquisition; losing that race just loops again.
-      try {
-        fileSystem.unlinkSync(lockFile);
-      } catch {
-        // Another taker may have removed it first.
-      }
-      sleep(25);
-      continue;
     }
     sleep(25);
   }
@@ -276,7 +269,7 @@ export function acquireTransportLock(recordFile, action, dependencies = {}) {
       }
     } catch {
       // Release is best-effort: an unreadable or foreign lock is left alone
-      // and a leftover lease is reclaimed later through the stale-age path.
+      // for explicit owner recovery; it is never reclaimed by pathname age.
     }
   };
 }

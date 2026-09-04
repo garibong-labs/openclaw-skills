@@ -20,8 +20,9 @@
 // transcription of them — and then drives the shipped preparation helper with
 // exactly what they produce. It is deliberately not a node:test file: it needs
 // a local OpenClaw install, so it is run and reported separately from the
-// portable suites. With no usable install it reports SKIP and exits 0 rather
-// than failing a machine that simply has nothing to probe.
+// portable suites. SKIP is reserved for the absence of an exact supported
+// installation. Once that package is found, discovery, lifting, import,
+// closed-schema, and behavioural drift are failures, never skips.
 //
 // Bundles are located by content signature, never by their hashed filenames and
 // never by hashing a whole bundle, so an unrelated OpenClaw rebuild does not
@@ -41,7 +42,7 @@ import {
 } from "./acp-report-controller-preparation.mjs";
 
 const EXPECTED_VERSION = "2026.8.1";
-const DIST_CANDIDATES = [
+const DEFAULT_DIST_CANDIDATES = [
   "/opt/homebrew/lib/node_modules/openclaw",
   "/usr/local/lib/node_modules/openclaw",
   "/usr/lib/node_modules/openclaw",
@@ -57,35 +58,60 @@ function skip(reason) {
   process.exit(0);
 }
 
+function failProbe(code) {
+  process.stdout.write(`FAIL installed-boundary probe: ${code}\n`);
+  process.exit(1);
+}
+
+const requestedRoot = process.argv.length === 3 ? path.resolve(process.argv[2]) : undefined;
+if (process.argv.length > 3) failProbe("invalid_arguments");
+const DIST_CANDIDATES = requestedRoot === undefined ? DEFAULT_DIST_CANDIDATES : [requestedRoot];
+
 function resolveInstall() {
   for (const root of DIST_CANDIDATES) {
-    if (fs.existsSync(path.join(root, "dist"))) return root;
+    if (!fs.existsSync(root)) continue;
+    let candidateVersion;
+    try {
+      const metadata = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+      if (metadata.name !== "openclaw") continue;
+      candidateVersion = metadata.version;
+    } catch {
+      failProbe("package_metadata_unreadable");
+    }
+    if (candidateVersion !== EXPECTED_VERSION) continue;
+    if (!fs.existsSync(path.join(root, "dist"))) failProbe("supported_dist_missing");
+    return root;
   }
   return undefined;
 }
 
 const root = resolveInstall();
-if (root === undefined) skip("no installed OpenClaw found");
+if (root === undefined) skip("no supported OpenClaw installation found");
 const dist = path.join(root, "dist");
 
-let version;
-try {
-  version = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version;
-} catch {
-  skip("installed OpenClaw package.json is unreadable");
-}
-if (version !== EXPECTED_VERSION) {
-  skip(`installed OpenClaw is ${version}, not the pinned ${EXPECTED_VERSION}`);
-}
+const version = EXPECTED_VERSION;
 
 // Find the one bundle whose source contains a signature, so hashed rebuild
 // filenames never matter.
 function findBundle(signature) {
-  const matches = fs.readdirSync(dist)
-    .filter((entry) => entry.endsWith(".js"))
+  let entries;
+  try {
+    entries = fs.readdirSync(dist);
+  } catch {
+    failProbe("supported_dist_unreadable");
+  }
+  const matches = entries.filter((entry) => entry.endsWith(".js"))
     .map((entry) => path.join(dist, entry))
-    .filter((file) => fs.readFileSync(file, "utf8").includes(signature));
-  return matches.length === 1 ? matches[0] : undefined;
+    .filter((file) => {
+      try {
+        return fs.readFileSync(file, "utf8").includes(signature);
+      } catch {
+        failProbe("bundle_unreadable");
+      }
+    });
+  if (matches.length === 0) failProbe("bundle_signature_missing");
+  if (matches.length !== 1) failProbe("bundle_signature_ambiguous");
+  return matches[0];
 }
 
 const cronToolBundle = findBundle("function capCronJobToolsAllow(");
@@ -95,35 +121,39 @@ const cronGatewayBundle = findBundle('"cron.remove": async (');
 const cronParamsBundle = findBundle("const CronAddParamsSchema = closedObject({");
 const pacingBundle = findBundle("function normalizeCronJobInput(");
 const readViewBundle = findBundle("function cronJobReadView(");
-if (cronToolBundle === undefined || toolResultsBundle === undefined ||
-    toolsBundle === undefined || cronGatewayBundle === undefined ||
-    cronParamsBundle === undefined || pacingBundle === undefined ||
-    readViewBundle === undefined) {
-  skip("installed bundle layout no longer matches the probed signatures");
+
+function readBundle(file) {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    failProbe("bundle_unreadable");
+  }
 }
 
-const cronToolSource = fs.readFileSync(cronToolBundle, "utf8");
-const toolsSource = fs.readFileSync(toolsBundle, "utf8");
-const cronGatewaySource = fs.readFileSync(cronGatewayBundle, "utf8");
-const cronParamsSource = fs.readFileSync(cronParamsBundle, "utf8");
-const readViewSource = fs.readFileSync(readViewBundle, "utf8");
+const cronToolSource = readBundle(cronToolBundle);
+const toolsSource = readBundle(toolsBundle);
+const cronGatewaySource = readBundle(cronGatewayBundle);
+const cronParamsSource = readBundle(cronParamsBundle);
+const readViewSource = readBundle(readViewBundle);
+
+function liftUniqueFunction(source, name) {
+  const marker = `function ${name}(`;
+  const first = source.indexOf(marker);
+  if (first < 0 || source.indexOf(marker, first + marker.length) >= 0) return undefined;
+  const end = source.indexOf("\n}\n", first);
+  return end < 0 ? undefined : source.slice(first, end + 3);
+}
 
 // Lift the real allowlist-capping functions out of the installed bundle and run
 // them against the installed policy helpers. Nothing here is a transcription:
 // the executed bytes are the installed ones.
 function loadInstalledToolsAllowCap() {
-  const lift = (name) => {
-    const start = cronToolSource.indexOf(`function ${name}(`);
-    if (start < 0) return undefined;
-    const end = cronToolSource.indexOf("\n}\n", start);
-    return end < 0 ? undefined : cronToolSource.slice(start, end + 3);
-  };
   const lifted = [
     "normalizeCronToolsAllow",
     "normalizeCronCreatorToolsAllow",
     "hasCronTriggerScript",
     "capCronJobToolsAllow",
-  ].map(lift);
+  ].map((name) => liftUniqueFunction(cronToolSource, name));
   if (lifted.some((body) => body === undefined)) return undefined;
   // Reuse the cron-tool bundle's own import statements rather than guessing
   // which sibling bundle provides each helper: that binds the lifted code to
@@ -155,7 +185,7 @@ function loadInstalledToolsAllowCap() {
 
 const liftedSource = loadInstalledToolsAllowCap();
 if (liftedSource === undefined) {
-  skip("installed allowlist-capping helpers no longer match the probed signatures");
+  failProbe("allowlist_helper_lift_failed");
 }
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "acp-boundary-probe-"));
@@ -166,10 +196,70 @@ try {
   ({ capCronJobToolsAllow } = await import(pathToFileURL(liftedFile).href));
 } catch {
   fs.rmSync(scratch, { recursive: true, force: true });
-  skip("installed allowlist-capping helpers could not be executed in isolation");
+  failProbe("allowlist_helper_import_failed");
 }
 
-const { t: jsonResult } = await import(pathToFileURL(toolResultsBundle).href);
+let jsonResult;
+try {
+  ({ t: jsonResult } = await import(pathToFileURL(toolResultsBundle).href));
+  if (typeof jsonResult !== "function") failProbe("json_result_export_invalid");
+} catch {
+  fs.rmSync(scratch, { recursive: true, force: true });
+  failProbe("json_result_import_failed");
+}
+
+function loadInstalledReadView() {
+  const body = liftUniqueFunction(readViewSource, "cronJobReadView");
+  if (body === undefined) return undefined;
+  const aliases = ["toPublicCronJob", "resolveCronJobConfigRevision"];
+  const imports = [];
+  for (const alias of aliases) {
+    const matching = readViewSource.split("\n").filter((line) =>
+      line.startsWith("import ") && new RegExp(`(?:\\bas ${alias}\\b|\\b${alias}\\b)`, "u").test(line));
+    if (matching.length !== 1) return undefined;
+    const match = /^import (.+) from "(\.\/[^"]+)";$/u.exec(matching[0]);
+    if (match === null) return undefined;
+    const target = path.join(dist, match[2].slice(2));
+    if (!fs.existsSync(target)) return undefined;
+    imports.push(`import ${match[1]} from ${JSON.stringify(pathToFileURL(target).href)};`);
+  }
+  return `${imports.join("\n")}\n${body}\nexport { cronJobReadView };\n`;
+}
+
+const readViewLiftedSource = loadInstalledReadView();
+if (readViewLiftedSource === undefined) failProbe("read_view_helper_lift_failed");
+const readViewLiftedFile = path.join(scratch, "installed-cron-read-view.mjs");
+fs.writeFileSync(readViewLiftedFile, readViewLiftedSource);
+let cronJobReadView;
+try {
+  ({ cronJobReadView } = await import(pathToFileURL(readViewLiftedFile).href));
+  if (typeof cronJobReadView !== "function") failProbe("read_view_export_invalid");
+} catch {
+  fs.rmSync(scratch, { recursive: true, force: true });
+  failProbe("read_view_helper_import_failed");
+}
+
+let validateCronAddParams;
+try {
+  ({ st: validateCronAddParams } = await import(pathToFileURL(cronParamsBundle).href));
+  if (typeof validateCronAddParams !== "function") failProbe("cron_add_schema_export_invalid");
+} catch {
+  fs.rmSync(scratch, { recursive: true, force: true });
+  failProbe("cron_add_schema_import_failed");
+}
+
+let normalizeCronJobCreate;
+let normalizeCronJobPatch;
+try {
+  ({ r: normalizeCronJobCreate, a: normalizeCronJobPatch } =
+    await import(pathToFileURL(pacingBundle).href));
+  if (typeof normalizeCronJobCreate !== "function" || typeof normalizeCronJobPatch !== "function") {
+    failProbe("cron_normalizer_export_invalid");
+  }
+} catch {
+  fs.rmSync(scratch, { recursive: true, force: true });
+  failProbe("cron_normalizer_import_failed");
+}
 
 // The creator tool surface the armed controller run really has: the two core
 // tools in the order installed OpenClaw builds them, then the appended plugin
@@ -253,13 +343,28 @@ check("the shipped arm request still carries the canonical pinned order", () => 
 
 check("the real stored read view arms and reaches bind and start", async () => {
   const stored = storedToolsAllowFor([...ACP_REPORT_CONTROLLER_TOOLS_ALLOW]);
+  const add = buildReportControllerPlaceholderAddCall(DECLARATION_KEY);
+  const normalized = normalizeCronJobCreate(add.job, { sessionContext: { sessionKey: "agent:main" } });
+  const arm = buildReportControllerArmUpdateCall(JOB_ID, TOKEN);
+  const persisted = {
+    ...normalized,
+    id: JOB_ID,
+    declarationKey: DECLARATION_KEY,
+    enabled: true,
+    deleteAfterRun: false,
+    payload: { ...arm.job.payload, toolsAllow: stored },
+    createdAtMs: 1756890000000,
+    updatedAtMs: 1756900000000,
+    state: { nextRunAtMs: 1756900600000 },
+  };
+  const installedReadView = cronJobReadView(persisted);
   const events = [];
   const result = await runReportControllerPreparation(makeInput(), makeDependencies(events, {
     async armAutomation(call) {
       events.push(["arm", call]);
-      // The update read view installed OpenClaw really answers with, carrying
-      // the allowlist exactly as the installed cap stored it.
-      return armedReadView(call.job.payload.script, stored);
+      // Execute the installed persisted-read-view helper over the normalized
+      // stored job; a handwritten successful fixture cannot substitute here.
+      return { details: installedReadView };
     },
   }));
   assert.deepEqual(events.map(([name]) => name), [
@@ -277,11 +382,16 @@ check("installed cron.add schema is closed and reserves no caller id", () => {
   const block = cronParamsSource.slice(start, cronParamsSource.indexOf("\n});", start));
   for (const key of ["id:", "jobId:"]) assert.equal(block.includes(key), false, key);
   assert.equal(block.includes("declarationKey: Type.Optional("), true);
-  return "no reservable identity on cron.add";
+  const add = buildReportControllerPlaceholderAddCall(DECLARATION_KEY);
+  const normalized = normalizeCronJobCreate(add.job, { sessionContext: { sessionKey: "agent:main" } });
+  assert.equal(validateCronAddParams(normalized), true, JSON.stringify(validateCronAddParams.errors));
+  assert.equal(validateCronAddParams({ ...normalized, id: JOB_ID }), false);
+  assert.equal(validateCronAddParams({ ...normalized, jobId: JOB_ID }), false);
+  assert.equal(validateCronAddParams({ ...normalized, unexpected: true }), false);
+  return "installed closed validator accepts exact input and rejects id/jobId/unknown";
 });
 
 check("installed create normalization keeps the placeholder disabled and inert", async () => {
-  const { r: normalizeCronJobCreate } = await import(pathToFileURL(pacingBundle).href);
   const add = buildReportControllerPlaceholderAddCall(DECLARATION_KEY);
   const normalized = normalizeCronJobCreate(add.job, { sessionContext: { sessionKey: "agent:main" } });
   // An explicit `enabled: false` survives create normalization, so the
@@ -302,7 +412,6 @@ check("installed create normalization keeps the placeholder disabled and inert",
 });
 
 check("installed patch normalization preserves the exact armed payload", async () => {
-  const { a: normalizeCronJobPatch } = await import(pathToFileURL(pacingBundle).href);
   const arm = buildReportControllerArmUpdateCall(JOB_ID, TOKEN);
   const normalized = normalizeCronJobPatch(arm.job);
   assert.equal(normalized.enabled, true);
@@ -319,14 +428,20 @@ check("installed cron.update answers with the complete persisted read view", () 
   // Why no separate read-back call is needed or made.
   assert.equal(cronGatewaySource.includes('context.logGateway.info("cron: job updated", { jobId });'), true);
   assert.equal(cronGatewaySource.includes("respond(true, cronJobReadView(job), void 0);"), true);
-  const start = readViewSource.indexOf("function cronJobReadView(");
-  assert.notEqual(start, -1);
-  const block = readViewSource.slice(start, readViewSource.indexOf("\n}\n", start));
-  // The read view is the public job plus inert bookkeeping only, which is why
-  // the attestation pins the contract fields and tolerates the rest.
-  assert.equal(block.includes("...toPublicCronJob(job)"), true);
-  assert.equal(block.includes("nextRunAtMs: job.state.nextRunAtMs"), true);
-  return "update result is the persisted job plus inert bookkeeping";
+  const add = buildReportControllerPlaceholderAddCall(DECLARATION_KEY);
+  const normalized = normalizeCronJobCreate(add.job, { sessionContext: { sessionKey: "agent:main" } });
+  const view = cronJobReadView({
+    ...normalized, id: JOB_ID, createdAtMs: 1, updatedAtMs: 2,
+    state: { nextRunAtMs: 3, queuedAtMs: 4 },
+    createdActor: { private: true }, toolsAllowProvenance: { private: true },
+  });
+  assert.equal(view.id, JOB_ID);
+  assert.equal(view.nextRunAtMs, 3);
+  assert.equal(view.state.queuedAtMs, undefined);
+  assert.equal(Object.hasOwn(view, "createdActor"), false);
+  assert.equal(Object.hasOwn(view, "toolsAllowProvenance"), false);
+  assert.match(view.configRevision, /^sha256:[A-Za-z0-9_-]+$/u);
+  return "executed installed read view strips private state and derives revision";
 });
 
 check("installed remove envelope carries removed only under details", () => {
@@ -462,9 +577,11 @@ for (const [label, run] of checks) {
   try {
     const note = await run();
     process.stdout.write(`  ok   ${label}${note ? ` — ${note}` : ""}\n`);
-  } catch (error) {
+  } catch {
     failed += 1;
-    process.stdout.write(`  FAIL ${label}: ${error.message}\n`);
+    // Labels are fixed probe source; installed exception text can contain
+    // paths or otherwise unbounded data and is never emitted.
+    process.stdout.write(`  FAIL ${label}\n`);
   }
 }
 fs.rmSync(scratch, { recursive: true, force: true });
