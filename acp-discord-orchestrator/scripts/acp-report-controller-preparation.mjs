@@ -43,6 +43,11 @@ export const REPORT_CONTROLLER_PLACEHOLDER_SCRIPT =
 // One replay of the identical declarationKey add converges on the exact job the
 // first attempt may have created; a second unresolved response fails closed.
 const MAX_CREATE_ATTEMPTS = 2;
+// Registration has the same lost-response ambiguity as creation, but the
+// merged controller plugin makes only an exact replay idempotent. The first
+// unresolved answer therefore gets one identical replay; no third attempt is
+// made inside one preparation run.
+const MAX_REGISTRATION_ATTEMPTS = 2;
 
 // The exact final controller contract. Every one of these is proven against the
 // persisted job the scheduler returns; none is inferred from the request.
@@ -386,6 +391,70 @@ export function buildReportControllerRegistration(input, leaseToken, jobId, prep
   return registration;
 }
 
+// These are the merged plugin's bounded registration failures that occur
+// before a new lease can be durably persisted. Only an exact structured error
+// carrying one of these codes proves non-persistence and permits the existing
+// remove-before-abort rollback. A throw, missing/malformed response, generic
+// `controller.failed`, or any unknown code is uncertain.
+const PROVEN_REGISTRATION_REJECTION_CODES = new Set([
+  "acp_lifecycle_guard.controller.caller_invalid",
+  "acp_lifecycle_guard.controller.input_invalid",
+  "acp_lifecycle_guard.controller.token_invalid",
+  "acp_lifecycle_guard.controller.identity_invalid",
+  "acp_lifecycle_guard.controller.posix_required",
+  "acp_lifecycle_guard.controller.path_invalid",
+  "acp_lifecycle_guard.controller.path_unavailable",
+  "acp_lifecycle_guard.controller.path_unsafe",
+  "acp_lifecycle_guard.controller.permissions_invalid",
+  "acp_lifecycle_guard.controller.trust_entry_invalid",
+  "acp_lifecycle_guard.controller.file_too_large",
+  "acp_lifecycle_guard.controller.trust_scope_mismatch",
+  "acp_lifecycle_guard.controller.destination_invalid",
+  "acp_lifecycle_guard.controller.duplicate",
+  "acp_lifecycle_guard.controller.prepared_recovery_required",
+  "acp_lifecycle_guard.controller.registry_full",
+]);
+
+function exactControllerResult(result) {
+  if (!isPlainObject(result)) return undefined;
+  if (Object.hasOwn(result, "details")) {
+    if (!hasExactKeys(result, ["details"], ["content"]) || !isPlainObject(result.details)) {
+      return undefined;
+    }
+    return result.details;
+  }
+  return result;
+}
+
+function isExactPreparedRegistration(result) {
+  const structured = exactControllerResult(result);
+  return isPlainObject(structured) && hasExactKeys(structured, ["status"]) &&
+    structured.status === "prepared";
+}
+
+function isProvenRegistrationRejection(result) {
+  const structured = exactControllerResult(result);
+  return isPlainObject(structured) && hasExactKeys(structured, ["status", "code"]) &&
+    structured.status === "error" &&
+    PROVEN_REGISTRATION_REJECTION_CODES.has(structured.code);
+}
+
+async function registerControllerWithReplay(registration, dependencies) {
+  for (let attempt = 1; attempt <= MAX_REGISTRATION_ATTEMPTS; attempt += 1) {
+    let result;
+    try {
+      // Clone from the one immutable logical input on every attempt. A tool
+      // implementation cannot mutate the object used by the bounded replay.
+      result = await dependencies.registerController(clone(registration));
+    } catch {
+      continue;
+    }
+    if (isExactPreparedRegistration(result)) return "prepared";
+    if (attempt === 1 && isProvenRegistrationRejection(result)) return "rejected";
+  }
+  return "unresolved";
+}
+
 async function rollbackBeforeActivation(jobId, leaseToken, prepared, registrationConfirmed, dependencies) {
   if (jobId !== undefined) {
     try {
@@ -426,6 +495,14 @@ function commitRecoveryState(leaseToken, jobId, prepared) {
   };
 }
 
+function registrationRecoveryState(registration) {
+  return {
+    schemaVersion: "acp-report-controller-recovery.v1",
+    type: "registration_pending",
+    registration: clone(registration),
+  };
+}
+
 async function retainCommitRecovery(dependencies, recovery) {
   const retained = await dependencies.retainRecovery(recovery);
   if (retained?.retained !== true && resultStatus(retained) !== "retained") {
@@ -457,6 +534,88 @@ export async function retryReportControllerActivationCommit(recovery, dependenci
   return { status: "active", jobId: recovery.jobId };
 }
 
+// Resume only the uncertain registration boundary from a fresh authenticated
+// `main` run in the same canonical owner session. The retained registration is
+// submitted byte-for-byte logically unchanged; only an exact `prepared`
+// response permits activation. An unresolved or negative retry leaves every
+// artifact intact for operator recovery and never activates or cleans up.
+export async function retryReportControllerRegistration(recovery, dependencies) {
+  if (!hasExactKeys(recovery, ["schemaVersion", "type", "registration"]) ||
+      recovery.schemaVersion !== "acp-report-controller-recovery.v1" ||
+      recovery.type !== "registration_pending" ||
+      !isPlainObject(dependencies) || typeof dependencies.registerController !== "function" ||
+      typeof dependencies.activate !== "function" ||
+      typeof dependencies.commitController !== "function" ||
+      typeof dependencies.removeAutomation !== "function" ||
+      typeof dependencies.abortController !== "function" ||
+      typeof dependencies.retainRecovery !== "function") {
+    fail("report_controller_registration_recovery_invalid");
+  }
+  const registration = recovery.registration;
+  if (!isPlainObject(registration) ||
+      !hasExactKeys(registration, ["action", "leaseToken", "transportFile", "processHandle", "jobId",
+        "destination", "reportPumpEntry", "hostTransportEntry"], ["snapshotFile"]) ||
+      registration.action !== "register") {
+    fail("report_controller_registration_recovery_invalid");
+  }
+  // Reuse the production registration validator without changing any retained
+  // value. This also rejects an altered recovery record before a tool call.
+  const validated = buildReportControllerRegistration({
+    destination: registration.destination,
+    reportPumpEntry: registration.reportPumpEntry,
+    hostTransportEntry: registration.hostTransportEntry,
+    ...(registration.snapshotFile === undefined ? {} : { snapshotFile: registration.snapshotFile }),
+  }, registration.leaseToken, registration.jobId, {
+    transportFile: registration.transportFile,
+    processHandle: registration.processHandle,
+  });
+  if (JSON.stringify(validated) !== JSON.stringify(registration)) {
+    fail("report_controller_registration_recovery_invalid");
+  }
+  let result;
+  try {
+    result = await dependencies.registerController(clone(registration));
+  } catch {
+    fail("report_controller_registration_recovery_pending");
+  }
+  if (!isExactPreparedRegistration(result)) {
+    fail("report_controller_registration_recovery_pending");
+  }
+  const prepared = {
+    transportFile: registration.transportFile,
+    processHandle: registration.processHandle,
+  };
+  let activation;
+  try {
+    activation = await dependencies.activate(prepared);
+    if (activation?.type !== "host_transport_activated") {
+      fail("report_controller_activation_failed");
+    }
+  } catch (error) {
+    await rollbackBeforeActivation(registration.jobId, registration.leaseToken,
+      prepared, true, dependencies);
+    if (error instanceof AcpReportControllerPreparationError) throw error;
+    fail("report_controller_preparation_failed");
+  }
+  let committed;
+  try {
+    committed = await dependencies.commitController({
+      action: "commit_activation",
+      leaseToken: registration.leaseToken,
+    });
+  } catch {
+    await retainCommitRecovery(dependencies,
+      commitRecoveryState(registration.leaseToken, registration.jobId, prepared));
+    fail("report_controller_activation_commit_pending");
+  }
+  if (resultStatus(committed) !== "active") {
+    await retainCommitRecovery(dependencies,
+      commitRecoveryState(registration.leaseToken, registration.jobId, prepared));
+    fail("report_controller_activation_commit_pending");
+  }
+  return { status: "active", jobId: registration.jobId, prepared, activation };
+}
+
 // Execute the capability-by-use sequence. Dependencies are the authenticated
 // host capabilities owned by the direct main-owner run. This helper never
 // shells out, polls, launches a background task, or returns the lease token.
@@ -475,6 +634,7 @@ export async function runReportControllerPreparation(input, dependencies) {
   let jobId;
   let prepared;
   let registrationConfirmed = false;
+  let registrationRecoveryPending = false;
   let activationConfirmed = false;
   try {
     const created = await createControllerPlaceholderJob(
@@ -500,9 +660,18 @@ export async function runReportControllerPreparation(input, dependencies) {
     prepared = await dependencies.prepare({ jobId, reportPump, assembled });
     assertPrepared(prepared);
     const registration = buildReportControllerRegistration(input, leaseToken, jobId, prepared);
-    const registrationResult = await dependencies.registerController(registration);
-    if (resultStatus(registrationResult) !== "prepared") {
+    const registrationStatus = await registerControllerWithReplay(registration, dependencies);
+    if (registrationStatus === "rejected") {
       fail("report_controller_registration_failed");
+    }
+    if (registrationStatus !== "prepared") {
+      registrationRecoveryPending = true;
+      try {
+        await retainCommitRecovery(dependencies, registrationRecoveryState(registration));
+      } catch {
+        fail("report_controller_registration_recovery_failed");
+      }
+      fail("report_controller_registration_recovery_pending");
     }
     registrationConfirmed = true;
     const activation = await dependencies.activate({
@@ -534,7 +703,7 @@ export async function runReportControllerPreparation(input, dependencies) {
     }
     return { jobId, reportPump, startReceipt, prepared, activation, controllerStatus: "active" };
   } catch (error) {
-    if (!activationConfirmed) {
+    if (!activationConfirmed && !registrationRecoveryPending) {
       await rollbackBeforeActivation(
         jobId,
         leaseToken,

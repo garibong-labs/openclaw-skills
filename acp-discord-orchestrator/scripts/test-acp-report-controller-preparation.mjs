@@ -15,13 +15,14 @@ import {
   generateReportControllerLeaseToken,
   loadReportControllerAutomationTemplate,
   retryReportControllerActivationCommit,
+  retryReportControllerRegistration,
   runReportControllerPreparation,
 } from "./acp-report-controller-preparation.mjs";
 import { validateAcpReportingContract } from "./acp-reporting-contract.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 
-const PINNED_PLUGIN_COMMIT = "1a3eea2a5d225549f7b8c6f7f8733c1b6689c956";
-const TEMPLATE_SHA256 = "f23e4523986ab12d39c2485ac3deaa217d02b6f1ec07d229e9b3362b21294bf5";
+const PINNED_PLUGIN_COMMIT = "fedec3441129e7e6fa1246f1611749d0c6041a4b";
+const TEMPLATE_SHA256 = "4306cabcb709e2ae52d3567a98792b78a1bfa1479dfae36d703fa6cef9d8c451";
 const PINNED_SCRIPT = `const leaseToken = "LEASE_TOKEN";
 const jobId = "JOB_ID";
 const isPlainObject = (value) => {
@@ -63,14 +64,9 @@ if (first.status === "delivery_pending") {
   await cleanup(afterSend);
   return {};
 }
-if (first.status === "error" && first.code === "acp_lifecycle_guard.controller.lease_prepared") {
-  if (!await removeCurrentJob()) return {};
-  await acp_report_controller({ action: "abort_preactivation", leaseToken });
-  return {};
-}
 await cleanup(first);
 return {};`;
-const SCRIPT_SHA256 = "cea9764f3abf95a064caeebc50640d8a9cc5167c1eb244388845a1287a547662";
+const SCRIPT_SHA256 = "1dd0ccd2d2bd25ef25c002672a2b6ac4ccf7721b2b9e6304bdf4ddd8ce8ca6f2";
 // The scheduler owns job identity: the returned id is deliberately unrelated to
 // the caller-chosen declaration key so every binding must use the returned one.
 const UUID = "11111111-2222-3333-4444-555555555555";
@@ -128,7 +124,6 @@ test("every non-throwing controller-script path returns the scheduler-safe plain
     [[{ status: "terminal_acked" }], { removed: false }],
     [[{ status: "error", code: "acp_lifecycle_guard.controller.lease_prepared" }],
       { status: "removed" }],
-    [[{ status: "error", code: "acp_lifecycle_guard.controller.lease_prepared" }], {}],
   ];
   for (const [results, removal] of cases) {
     await executePinnedController(structuredClone(results), structuredClone(removal));
@@ -665,11 +660,14 @@ test("malformed registration after transport preparation removes the job then ab
   });
 });
 
-test("non-prepared registration removes the job before exact transport abort", async () => {
+test("proven first-call pre-persistence rejection removes the exact job then directly aborts transport", async () => {
   const events = [];
   await assert.rejects(
     runReportControllerPreparation(makeInput(), makeDependencies(events, {
-      async registerController(value) { events.push(["register", value]); return { status: "rejected" }; },
+      async registerController(value) {
+        events.push(["register", value]);
+        return { details: { status: "error", code: "acp_lifecycle_guard.controller.destination_invalid" } };
+      },
     })),
     (error) => error instanceof AcpReportControllerPreparationError &&
       error.code === "report_controller_registration_failed",
@@ -677,23 +675,183 @@ test("non-prepared registration removes the job before exact transport abort", a
   assert.deepEqual(events.map(([name]) => name), [
     "create", "arm", "bind", "start", "assemble", "prepare", "register", "remove", "abort-transport",
   ]);
+  assert.deepEqual(events.at(-2)[1], { action: "remove", jobId: JOB_ID });
+  assert.deepEqual(events.at(-1)[1], {
+    transportFile: "/private/transport.json",
+    processHandle: "handle-1",
+  });
+  assert.equal(events.some(([name]) => ["abort", "release", "activate", "commit"].includes(name)), false);
 });
 
-test("thrown registration removes the job before exact transport abort", async () => {
+test("lost persisted registration response replays the byte-identical input and reaches activation commit", async () => {
   const events = [];
-  await assert.rejects(
-    runReportControllerPreparation(makeInput(), makeDependencies(events, {
+  let registrations = 0;
+  const result = await runReportControllerPreparation(makeInput(), makeDependencies(events, {
       async registerController(value) {
         events.push(["register", value]);
-        throw new Error("synthetic registration failure");
+        registrations += 1;
+        if (registrations === 1) throw new Error("synthetic lost persisted response");
+        return { details: { status: "prepared" } };
       },
-    })),
-    (error) => error instanceof AcpReportControllerPreparationError &&
-      error.code === "report_controller_preparation_failed",
-  );
+    }));
   assert.deepEqual(events.map(([name]) => name), [
-    "create", "arm", "bind", "start", "assemble", "prepare", "register", "remove", "abort-transport",
+    "create", "arm", "bind", "start", "assemble", "prepare", "register", "register", "activate", "commit",
   ]);
+  assert.equal(registrations, 2, "the replay recovers one persisted lease without a third capacity use");
+  assert.deepEqual(events[6][1], events[7][1]);
+  assert.equal(JSON.stringify(events[6][1]), JSON.stringify(events[7][1]));
+  assert.equal(events[6][1].leaseToken, TOKEN);
+  assert.equal(result.controllerStatus, "active");
+});
+
+test("an unresolved registration replay retains exact recovery and performs no cleanup or activation", async () => {
+  const cases = [
+    ["throws twice", () => { throw new Error("synthetic lost response"); }],
+    ["missing twice", () => undefined],
+    ["negative replay", (() => {
+      let attempt = 0;
+      return () => (++attempt === 1 ? undefined :
+        { details: { status: "error", code: "acp_lifecycle_guard.controller.duplicate" } });
+    })()],
+    ["mismatched prepared envelope", () => ({ status: "prepared", details: { status: "prepared" } })],
+  ];
+  for (const [label, respond] of cases) {
+    const events = [];
+    await assert.rejects(
+      runReportControllerPreparation(makeInput(), makeDependencies(events, {
+        async registerController(value) { events.push(["register", value]); return respond(); },
+      })),
+      (error) => error instanceof AcpReportControllerPreparationError &&
+        error.code === "report_controller_registration_recovery_pending",
+      label,
+    );
+    assert.deepEqual(events.map(([name]) => name), [
+      "create", "arm", "bind", "start", "assemble", "prepare", "register", "register", "retain",
+    ], label);
+    assert.deepEqual(events[6][1], events[7][1], label);
+    assert.equal(events.some(([name]) => ["remove", "abort", "abort-transport", "activate", "commit"]
+      .includes(name)), false, label);
+    assert.deepEqual(events.at(-1)[1], {
+      schemaVersion: "acp-report-controller-recovery.v1",
+      type: "registration_pending",
+      registration: events[6][1],
+    }, label);
+  }
+});
+
+test("unresolved production preparation survives one and repeated shipped-template ticks, then recovers", async () => {
+  const events = [];
+  let leaseCapacity = 0;
+  let persistedLease;
+  let retainedRecovery;
+  let jobPresent = true;
+  const transport = {
+    transportFile: "/private/transport.json",
+    processHandle: "handle-1",
+    phase: "prepared",
+  };
+  const dependencies = makeDependencies(events, {
+    async registerController(value) {
+      events.push(["register", structuredClone(value)]);
+      if (persistedLease === undefined) {
+        persistedLease = structuredClone(value);
+        leaseCapacity += 1;
+      } else {
+        assert.deepEqual(value, persistedLease);
+      }
+      throw new Error("synthetic lost prepared response");
+    },
+    async retainRecovery(value) {
+      events.push(["retain", structuredClone(value)]);
+      retainedRecovery = structuredClone(value);
+      return { status: "retained" };
+    },
+  });
+  await assert.rejects(
+    runReportControllerPreparation(makeInput(), dependencies),
+    (error) => error instanceof AcpReportControllerPreparationError &&
+      error.code === "report_controller_registration_recovery_pending",
+  );
+
+  const registrationCalls = events.filter(([name]) => name === "register");
+  assert.equal(registrationCalls.length, 2);
+  assert.deepEqual(registrationCalls[0][1], registrationCalls[1][1]);
+  assert.equal(JSON.stringify(registrationCalls[0][1]), JSON.stringify(registrationCalls[1][1]));
+  assert.equal(leaseCapacity, 1);
+  assert.deepEqual(retainedRecovery, {
+    schemaVersion: "acp-report-controller-recovery.v1",
+    type: "registration_pending",
+    registration: persistedLease,
+  });
+  assert.equal(jobPresent, true);
+  assert.equal(transport.phase, "prepared");
+  assert.equal(events.some(([name]) => ["remove", "abort", "abort-transport", "activate", "commit"]
+    .includes(name)), false);
+
+  const schedulerCalls = [];
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const runShippedController = new AsyncFunction(
+    "acp_report_controller", "message", "automations", ARMED_SCRIPT,
+  );
+  const scheduledExecution = async () => {
+    const result = await runShippedController(
+      async (params) => {
+        schedulerCalls.push(["controller", structuredClone(params)]);
+        assert.deepEqual(params, { action: "tick", leaseToken: TOKEN });
+        return { status: "error", code: "acp_lifecycle_guard.controller.lease_prepared" };
+      },
+      async (params) => { schedulerCalls.push(["message", structuredClone(params)]); },
+      async (params) => {
+        schedulerCalls.push(["automations", structuredClone(params)]);
+        jobPresent = false;
+        return { removed: true };
+      },
+    );
+    assert.deepEqual(result, {});
+    assert.equal(Object.getPrototypeOf(result), Object.prototype);
+  };
+
+  await scheduledExecution();
+  assert.deepEqual(schedulerCalls.map(([tool]) => tool), ["controller"]);
+  for (let execution = 0; execution < 3; execution += 1) await scheduledExecution();
+  assert.deepEqual(schedulerCalls.map(([tool]) => tool), [
+    "controller", "controller", "controller", "controller",
+  ]);
+  assert.equal(jobPresent, true);
+  assert.equal(transport.phase, "prepared");
+  assert.deepEqual(retainedRecovery.registration, persistedLease);
+  assert.equal(leaseCapacity, 1);
+
+  const recoveryCalls = [];
+  const recovered = await retryReportControllerRegistration(retainedRecovery, {
+    async registerController(value) {
+      recoveryCalls.push(["register", structuredClone(value)]);
+      assert.deepEqual(value, persistedLease);
+      return { details: { status: "prepared" } };
+    },
+    async activate(value) {
+      recoveryCalls.push(["activate", structuredClone(value)]);
+      assert.deepEqual(value, {
+        transportFile: transport.transportFile,
+        processHandle: transport.processHandle,
+      });
+      transport.phase = "active";
+      return { type: "host_transport_activated" };
+    },
+    async commitController(value) {
+      recoveryCalls.push(["commit", structuredClone(value)]);
+      return { details: { status: "active" } };
+    },
+    async removeAutomation(value) { recoveryCalls.push(["remove", value]); return { removed: true }; },
+    async abortController(value) { recoveryCalls.push(["abort", value]); return { status: "aborted" }; },
+    async retainRecovery(value) { recoveryCalls.push(["retain", value]); return { status: "retained" }; },
+  });
+  assert.deepEqual(recoveryCalls.map(([name]) => name), ["register", "activate", "commit"]);
+  assert.equal(leaseCapacity, 1);
+  assert.equal(jobPresent, true);
+  assert.equal(transport.phase, "active");
+  assert.equal(recovered.status, "active");
+  assert.equal(recovered.jobId, JOB_ID);
 });
 
 test("failure before activation confirmation removes the current job before aborting preactivation", async () => {
@@ -910,4 +1068,58 @@ test("fresh same-session recovery retries only commit_activation", async () => {
   });
   assert.deepEqual(calls, [{ action: "commit_activation", leaseToken: TOKEN }]);
   assert.deepEqual(result, { status: "active", jobId: JOB_ID });
+});
+
+test("fresh same-session registration recovery replays only the retained input before activate and commit", async () => {
+  const registration = buildReportControllerRegistration(makeInput(), TOKEN, JOB_ID, {
+    transportFile: "/private/transport.json",
+    processHandle: "handle-1",
+  });
+  const calls = [];
+  const result = await retryReportControllerRegistration({
+    schemaVersion: "acp-report-controller-recovery.v1",
+    type: "registration_pending",
+    registration,
+  }, {
+    async registerController(value) { calls.push(["register", value]); return { details: { status: "prepared" } }; },
+    async activate(value) { calls.push(["activate", value]); return { type: "host_transport_activated" }; },
+    async commitController(value) { calls.push(["commit", value]); return { details: { status: "active" } }; },
+    async removeAutomation(value) { calls.push(["remove", value]); return { removed: true }; },
+    async abortController(value) { calls.push(["abort", value]); return { status: "aborted" }; },
+    async retainRecovery(value) { calls.push(["retain", value]); return { status: "retained" }; },
+  });
+  assert.deepEqual(calls, [
+    ["register", registration],
+    ["activate", { transportFile: "/private/transport.json", processHandle: "handle-1" }],
+    ["commit", { action: "commit_activation", leaseToken: TOKEN }],
+  ]);
+  assert.equal(result.status, "active");
+  assert.equal(result.jobId, JOB_ID);
+});
+
+test("fresh registration recovery never activates on a negative or mismatched replay", async () => {
+  const registration = buildReportControllerRegistration(makeInput(), TOKEN, JOB_ID, {
+    transportFile: "/private/transport.json",
+    processHandle: "handle-1",
+  });
+  for (const answer of [
+    { details: { status: "error", code: "acp_lifecycle_guard.controller.duplicate" } },
+    { status: "prepared", details: { status: "prepared" } },
+  ]) {
+    const calls = [];
+    await assert.rejects(retryReportControllerRegistration({
+      schemaVersion: "acp-report-controller-recovery.v1",
+      type: "registration_pending",
+      registration,
+    }, {
+      async registerController(value) { calls.push(["register", value]); return answer; },
+      async activate(value) { calls.push(["activate", value]); return { type: "host_transport_activated" }; },
+      async commitController(value) { calls.push(["commit", value]); return { status: "active" }; },
+      async removeAutomation(value) { calls.push(["remove", value]); return { removed: true }; },
+      async abortController(value) { calls.push(["abort", value]); return { status: "aborted" }; },
+      async retainRecovery(value) { calls.push(["retain", value]); return { status: "retained" }; },
+    }), (error) => error instanceof AcpReportControllerPreparationError &&
+      error.code === "report_controller_registration_recovery_pending");
+    assert.deepEqual(calls, [["register", registration]]);
+  }
 });

@@ -701,7 +701,7 @@ test("substituted public template loads through the real supervisor loader", () 
   assert.deepEqual(loaded.reporting.reportPump.payload, {
     kind: "script",
     scriptVersion: "acp-report-controller-script.v1",
-    scriptSha256: "cea9764f3abf95a064caeebc50640d8a9cc5167c1eb244388845a1287a547662",
+    scriptSha256: "1dd0ccd2d2bd25ef25c002672a2b6ac4ccf7721b2b9e6304bdf4ddd8ce8ca6f2",
     timeoutSeconds: 60,
     toolBudget: 5,
     toolsAllow: ["acp_report_controller", "message", "automations"]
