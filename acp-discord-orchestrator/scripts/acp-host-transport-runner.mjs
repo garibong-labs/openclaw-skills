@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { loadHostTransportRecord } from "./acp-host-transport.mjs";
+import { isCliEntry } from "./acp-private-json-input.mjs";
 
 function runnerFail(code) {
   const error = new Error(code);
@@ -117,17 +117,6 @@ export async function main(argv = process.argv.slice(2)) {
     if (Number.isInteger(stderrFd)) {
       fs.closeSync(stderrFd);
     }
-  }
-}
-
-function isCliEntry(argvPath, moduleUrl) {
-  if (typeof argvPath !== "string" || argvPath.length === 0) {
-    return false;
-  }
-  try {
-    return fs.realpathSync(path.resolve(argvPath)) === fs.realpathSync(fileURLToPath(moduleUrl));
-  } catch {
-    return false;
   }
 }
 

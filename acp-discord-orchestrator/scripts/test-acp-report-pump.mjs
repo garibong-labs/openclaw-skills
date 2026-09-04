@@ -169,6 +169,24 @@ test("pump claims a due intermediate and derives the canonical fresh report", ()
     next: "테스트 실행"
   });
   assert.equal(result.message, expected);
+  assert.deepEqual(result.report, {
+    agent: "codex",
+    model: "test-model[medium]",
+    roundIndex: 1,
+    repository: "openclaw-skills",
+    branch: "fix/acp-automated-report-pump",
+    timeKst: "09:10",
+    phaseIndex: 2,
+    totalMinutes: 10,
+    phaseMinutes: 10,
+    lastAcpActivityMinutesAgo: 2,
+    newResultDelta: 1,
+    newResult: "구현 1건 완료",
+    executionState: "구현 진행 중",
+    inProgress: "수정 작업 진행",
+    verification: "테스트 준비",
+    next: "테스트 실행"
+  });
   assert.equal(
     result.messageDigest,
     crypto.createHash("sha256").update(expected, "utf8").digest("hex")
@@ -401,17 +419,50 @@ test("snapshot private-file failures preserve their distinct bounded codes", () 
   assert.throws(() => runReportPump(pumpInput(fixture, {
     snapshotFile: path.join(root, "missing.json"),
   }), ACTIVE_TMUX), /invalid_input_file_missing/u);
+  const empty = path.join(root, "empty.json");
+  fs.writeFileSync(empty, "", { mode: 0o600 });
+  assert.throws(() => runReportPump(pumpInput(fixture, { snapshotFile: empty }), ACTIVE_TMUX),
+    /invalid_input_file_empty/u);
   const oversized = path.join(root, "oversized.json");
   fs.writeFileSync(oversized, "x".repeat(8193), { mode: 0o600 });
   assert.throws(() => runReportPump(pumpInput(fixture, { snapshotFile: oversized }), ACTIVE_TMUX),
     /invalid_input_file_too_large/u);
+  const invalidJson = path.join(root, "invalid-json.json");
+  fs.writeFileSync(invalidJson, "{", { mode: 0o600 });
+  assert.throws(() => runReportPump(pumpInput(fixture, { snapshotFile: invalidJson }), ACTIVE_TMUX),
+    /invalid_input_json/u);
+  const directory = path.join(root, "directory.json");
+  fs.mkdirSync(directory, { mode: 0o700 });
+  assert.throws(() => runReportPump(pumpInput(fixture, { snapshotFile: directory }), ACTIVE_TMUX),
+    /invalid_input_file_not_regular/u);
   if (process.platform !== "win32") {
     const exposed = writeSnapshot(root, { schemaVersion: ACP_REPORT_PUMP_SNAPSHOT_SCHEMA_VERSION },
       "exposed.json");
     fs.chmodSync(exposed, 0o644);
     assert.throws(() => runReportPump(pumpInput(fixture, { snapshotFile: exposed }), ACTIVE_TMUX),
       /invalid_input_file_permissions/u);
+    const symlink = path.join(root, "snapshot-link.json");
+    fs.symlinkSync(invalidJson, symlink);
+    assert.throws(() => runReportPump(pumpInput(fixture, { snapshotFile: symlink }), ACTIVE_TMUX),
+      /invalid_input_file_symlink/u);
   }
+  const unreadable = writeSnapshot(root, { schemaVersion: ACP_REPORT_PUMP_SNAPSHOT_SCHEMA_VERSION },
+    "unreadable.json");
+  const unreadableFs = {
+    lstatSync: fs.lstatSync,
+    readFileSync(candidate, encoding) {
+      if (candidate === unreadable) {
+        const error = new Error("denied");
+        error.code = "EACCES";
+        throw error;
+      }
+      return fs.readFileSync(candidate, encoding);
+    },
+  };
+  assert.throws(() => runReportPump(pumpInput(fixture, { snapshotFile: unreadable }), {
+    ...ACTIVE_TMUX,
+    fileSystem: unreadableFs,
+  }), /invalid_input_file_unreadable/u);
 });
 
 test("pump boundary rejects malformed required fields before transport access", () => {
@@ -421,14 +472,18 @@ test("pump boundary rejects malformed required fields before transport access", 
     handle: "acp-pump-input-fields",
     events: [event(1, "started", 0)],
   });
-  for (const overrides of [
-    { transportFile: "relative.json" },
-    { processHandle: {} },
-    { jobId: 42 },
-    { destination: { conversationId: CONTROL_CONVERSATION_ID } },
+  for (const [overrides, code] of [
+    [{ transportFile: "relative.json" }, "report_pump_transport_file_invalid"],
+    [{ transportFile: undefined }, "report_pump_transport_file_invalid"],
+    [{ processHandle: {} }, "report_pump_process_handle_invalid"],
+    [{ processHandle: undefined }, "report_pump_process_handle_invalid"],
+    [{ jobId: 42 }, "report_pump_job_id_invalid"],
+    [{ jobId: undefined }, "report_pump_job_id_invalid"],
+    [{ destination: { conversationId: CONTROL_CONVERSATION_ID } }, "report_pump_destination_invalid"],
+    [{ destination: undefined }, "report_pump_destination_invalid"],
   ]) {
     assert.throws(() => runReportPump(pumpInput(fixture, overrides), ACTIVE_TMUX),
-      /report_pump_input_invalid/u);
+      (error) => error?.code === code);
   }
   assert.equal(JSON.parse(fs.readFileSync(fixture.transportFile, "utf8")).publication.attemptCount, 0);
 });
@@ -473,4 +528,18 @@ test("pump CLI emits one bounded result event and one bounded error event", asyn
   assert.equal(events[0].type, "report_pump_error");
   assert.equal(events[0].code, "report_pump_input_invalid");
   assert.equal(JSON.stringify(events[0]).includes(root), false);
+
+  const badJobFile = path.join(root, "pump-bad-job.json");
+  fs.writeFileSync(badJobFile, JSON.stringify({ ...pumpInput(fixture), jobId: 42 }), { mode: 0o600 });
+  const badJobEvents = [];
+  const badJobExit = await reportPumpMain(["--input", badJobFile], {
+    ...ACTIVE_TMUX,
+    writeResult: (value) => results.push(value),
+    writeEvent: (value) => badJobEvents.push(value),
+  });
+  assert.equal(badJobExit, 64);
+  assert.deepEqual(badJobEvents.map(({ type, code }) => ({ type, code })), [{
+    type: "report_pump_error",
+    code: "report_pump_job_id_invalid",
+  }]);
 });

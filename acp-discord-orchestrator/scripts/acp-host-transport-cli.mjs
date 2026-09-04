@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import {
   ACP_HOST_TRANSPORT_SCHEMA_VERSION,
@@ -14,6 +13,11 @@ import {
   reconcileHostTransport,
   statusHostTransport
 } from "./acp-host-transport.mjs";
+import {
+  assertExactKeys as assertGenericExactKeys,
+  isCliEntry,
+  safeCode
+} from "./acp-private-json-input.mjs";
 
 const INVALID_INPUT_EXIT = 64;
 const TRANSPORT_ERROR_EXIT = 22;
@@ -23,12 +27,6 @@ function cliFail(code) {
   const error = new Error(code);
   error.code = code;
   throw error;
-}
-
-function safeCode(value) {
-  return typeof value === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value)
-    ? value
-    : "host_transport_failed";
 }
 
 function exitCodeFor(code) {
@@ -93,11 +91,7 @@ function readPrivateInput(filePath) {
 }
 
 function assertExactKeys(input, required, optional = []) {
-  const allowed = new Set([...required, ...optional]);
-  const keys = Object.keys(input);
-  if (!required.every((key) => keys.includes(key)) || keys.some((key) => !allowed.has(key))) {
-    cliFail("host_transport_input_shape");
-  }
+  assertGenericExactKeys(input, required, optional, cliFail, "host_transport_input_shape");
 }
 
 async function dispatch(input) {
@@ -175,24 +169,13 @@ export async function main(argv = process.argv.slice(2)) {
     process.stdout.write(JSON.stringify(result) + "\n");
     return 0;
   } catch (error) {
-    const code = safeCode(error && error.code);
+    const code = safeCode(error && error.code, "host_transport_failed");
     process.stderr.write(JSON.stringify({
       schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
       type: "host_transport_error",
       code
     }) + "\n");
     return exitCodeFor(code);
-  }
-}
-
-function isCliEntry(argvPath, moduleUrl) {
-  if (typeof argvPath !== "string" || argvPath.length === 0) {
-    return false;
-  }
-  try {
-    return fs.realpathSync(path.resolve(argvPath)) === fs.realpathSync(fileURLToPath(moduleUrl));
-  } catch {
-    return false;
   }
 }
 

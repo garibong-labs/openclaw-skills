@@ -82,20 +82,28 @@ function validateReportPumpInput(parsed) {
   }
   assertExactKeys(
     parsed,
-    ["schemaVersion", "transportFile", "processHandle", "jobId", "destination"],
-    ["snapshotFile", "runToken"],
+    ["schemaVersion"],
+    ["transportFile", "processHandle", "jobId", "destination", "snapshotFile", "runToken"],
     pumpFail,
     "report_pump_input_invalid"
   );
   if (parsed.schemaVersion !== ACP_REPORT_PUMP_SCHEMA_VERSION) {
     pumpFail("report_pump_input_schema");
   }
-  if (typeof parsed.transportFile !== "string" || !path.isAbsolute(parsed.transportFile) ||
-      typeof parsed.processHandle !== "string" || !SAFE_TOKEN.test(parsed.processHandle) ||
-      !isReportPumpId(parsed.jobId) || typeof parsed.destination !== "string" ||
-      !DECIMAL_ID.test(parsed.destination) ||
-      (parsed.snapshotFile !== undefined &&
-        (typeof parsed.snapshotFile !== "string" || !path.isAbsolute(parsed.snapshotFile)))) {
+  if (typeof parsed.transportFile !== "string" || !path.isAbsolute(parsed.transportFile)) {
+    pumpFail("report_pump_transport_file_invalid");
+  }
+  if (typeof parsed.processHandle !== "string" || !SAFE_TOKEN.test(parsed.processHandle)) {
+    pumpFail("report_pump_process_handle_invalid");
+  }
+  if (!isReportPumpId(parsed.jobId)) {
+    pumpFail("report_pump_job_id_invalid");
+  }
+  if (typeof parsed.destination !== "string" || !DECIMAL_ID.test(parsed.destination)) {
+    pumpFail("report_pump_destination_invalid");
+  }
+  if (parsed.snapshotFile !== undefined &&
+      (typeof parsed.snapshotFile !== "string" || !path.isAbsolute(parsed.snapshotFile))) {
     pumpFail("report_pump_input_invalid");
   }
   if (parsed.runToken !== undefined &&
@@ -326,6 +334,12 @@ function exitCodeFor(code) {
   return code === "usage" ||
     code.startsWith("invalid_") ||
     code.startsWith("report_pump_input_") ||
+    [
+      "report_pump_transport_file_invalid",
+      "report_pump_process_handle_invalid",
+      "report_pump_job_id_invalid",
+      "report_pump_destination_invalid"
+    ].includes(code) ||
     code === "report_pump_snapshot_invalid" ||
     code.startsWith("host_transport_pump_") ||
     code === "host_transport_handle_invalid" ||

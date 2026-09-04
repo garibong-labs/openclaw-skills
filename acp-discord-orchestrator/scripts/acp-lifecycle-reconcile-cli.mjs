@@ -1,11 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import {
   ACP_LIFECYCLE_LEDGER_SCHEMA_VERSION,
   reconcileLifecycleLedger
 } from "./acp-lifecycle-ledger.mjs";
+import { isCliEntry, safeCode } from "./acp-private-json-input.mjs";
 
 const INVALID_CONFIG_EXIT = 64;
 const MAX_INPUT_BYTES = 8192;
@@ -14,24 +14,6 @@ function cliFail(code) {
   const error = new Error(code);
   error.code = code;
   throw error;
-}
-
-function isCliEntry(argvPath, moduleUrl) {
-  if (typeof argvPath !== "string" || argvPath.length === 0) {
-    return false;
-  }
-  try {
-    return fs.realpathSync(path.resolve(argvPath)) ===
-      fs.realpathSync(fileURLToPath(moduleUrl));
-  } catch {
-    return false;
-  }
-}
-
-function safeCode(value) {
-  return typeof value === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value)
-    ? value
-    : "lifecycle_reconcile_failed";
 }
 
 function parseArgs(argv) {
@@ -119,7 +101,7 @@ export function main(argv = process.argv.slice(2)) {
     process.stderr.write(JSON.stringify({
       schemaVersion: ACP_LIFECYCLE_LEDGER_SCHEMA_VERSION,
       type: "lifecycle_reconcile_error",
-      code: safeCode(error && error.code)
+      code: safeCode(error && error.code, "lifecycle_reconcile_failed")
     }) + "\n");
     return INVALID_CONFIG_EXIT;
   }

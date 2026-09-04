@@ -20,12 +20,40 @@ import {
 import { validateAcpReportingContract } from "./acp-reporting-contract.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 
-const PINNED_PLUGIN_COMMIT = "0acb0dc271212afebbd68dee03b2ef3389058af1";
+const PINNED_PLUGIN_COMMIT = "1a3eea2a5d225549f7b8c6f7f8733c1b6689c956";
+const TEMPLATE_SHA256 = "f23e4523986ab12d39c2485ac3deaa217d02b6f1ec07d229e9b3362b21294bf5";
 const PINNED_SCRIPT = `const leaseToken = "LEASE_TOKEN";
 const jobId = "JOB_ID";
+const isPlainObject = (value) => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+};
+const removalProven = (response) => {
+  if (!isPlainObject(response)) return false;
+  if (Object.hasOwn(response, "details") && !isPlainObject(response.details)) return false;
+  const evidence = Object.hasOwn(response, "details") ? [response, response.details] : [response];
+  let positive = false;
+  for (const value of evidence) {
+    if (Object.hasOwn(value, "removed")) {
+      if (value.removed !== true) return false;
+      positive = true;
+    }
+    if (Object.hasOwn(value, "status")) {
+      if (value.status !== "removed") return false;
+      positive = true;
+    }
+    if (Object.hasOwn(value, "error") || Object.hasOwn(value, "failure")) return false;
+    if (Object.hasOwn(value, "success") && value.success !== true) return false;
+  }
+  return positive;
+};
+const removeCurrentJob = async () => removalProven(
+  await automations({ action: "remove", jobId }),
+);
 const cleanup = async (result) => {
   if (result.status !== "terminal_acked" && result.status !== "tracking_lost") return;
-  await automations({ action: "remove", jobId });
+  if (!await removeCurrentJob()) return;
   await acp_report_controller({ action: "release", leaseToken });
 };
 const first = await acp_report_controller({ action: "tick", leaseToken });
@@ -33,15 +61,16 @@ if (first.status === "delivery_pending") {
   await message({ action: "send", message: first.publicationToken, final: false });
   const afterSend = await acp_report_controller({ action: "tick", leaseToken });
   await cleanup(afterSend);
-  return;
+  return {};
 }
 if (first.status === "error" && first.code === "acp_lifecycle_guard.controller.lease_prepared") {
-  await automations({ action: "remove", jobId });
+  if (!await removeCurrentJob()) return {};
   await acp_report_controller({ action: "abort_preactivation", leaseToken });
-  return;
+  return {};
 }
-await cleanup(first);`;
-const SCRIPT_SHA256 = "dad87e9f3b11f74d7a541c3b0c5ac0cdaca2ffd4fd49161ec2b4b333c4b6c65c";
+await cleanup(first);
+return {};`;
+const SCRIPT_SHA256 = "cea9764f3abf95a064caeebc50640d8a9cc5167c1eb244388845a1287a547662";
 // The scheduler owns job identity: the returned id is deliberately unrelated to
 // the caller-chosen declaration key so every binding must use the returned one.
 const UUID = "11111111-2222-3333-4444-555555555555";
@@ -53,10 +82,12 @@ const ARMED_SCRIPT = PINNED_SCRIPT
   .replace('"LEASE_TOKEN"', JSON.stringify(TOKEN));
 
 test(`automation template is byte-for-byte script-compatible with plugin ${PINNED_PLUGIN_COMMIT}`, () => {
+  const rawTemplate = fs.readFileSync(REPORT_CONTROLLER_AUTOMATION_TEMPLATE);
   const template = loadReportControllerAutomationTemplate();
   assert.equal(template.payload.script, PINNED_SCRIPT);
   assert.equal(crypto.createHash("sha256").update(PINNED_SCRIPT, "utf8").digest("hex"), SCRIPT_SHA256);
-  assert.deepEqual(template, JSON.parse(fs.readFileSync(REPORT_CONTROLLER_AUTOMATION_TEMPLATE, "utf8")));
+  assert.equal(crypto.createHash("sha256").update(rawTemplate).digest("hex"), TEMPLATE_SHA256);
+  assert.deepEqual(template, JSON.parse(rawTemplate.toString("utf8")));
   assert.equal(template.payload.kind, "script");
   assert.equal(template.payload.timeoutSeconds, 60);
   assert.equal(template.payload.toolBudget, 5);
@@ -64,10 +95,80 @@ test(`automation template is byte-for-byte script-compatible with plugin ${PINNE
   assert.deepEqual(template.delivery, { mode: "none" });
 });
 
+async function executePinnedController(results, removalResult = { removed: true }) {
+  const calls = [];
+  const controller = async (params) => {
+    calls.push(["controller", structuredClone(params)]);
+    if (params.action === "release") return { status: "released" };
+    if (params.action === "abort_preactivation") return { status: "aborted" };
+    return results.shift() ?? { status: "none_due" };
+  };
+  const message = async (params) => {
+    calls.push(["message", structuredClone(params)]);
+    return { ok: true };
+  };
+  const automations = async (params) => {
+    calls.push(["automations", structuredClone(params)]);
+    return removalResult;
+  };
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const run = new AsyncFunction("acp_report_controller", "message", "automations", PINNED_SCRIPT);
+  const result = await run(controller, message, automations);
+  assert.deepEqual(result, {});
+  assert.equal(Object.getPrototypeOf(result), Object.prototype);
+  return calls;
+}
+
+test("every non-throwing controller-script path returns the scheduler-safe plain object", async () => {
+  const cases = [
+    [[{ status: "none_due" }], { removed: true }],
+    [[{ status: "delivery_pending", publicationToken: "opaque-publication-token" },
+      { status: "none_due" }], { removed: true }],
+    [[{ status: "terminal_acked" }], { details: { removed: true } }],
+    [[{ status: "terminal_acked" }], { removed: false }],
+    [[{ status: "error", code: "acp_lifecycle_guard.controller.lease_prepared" }],
+      { status: "removed" }],
+    [[{ status: "error", code: "acp_lifecycle_guard.controller.lease_prepared" }], {}],
+  ];
+  for (const [results, removal] of cases) {
+    await executePinnedController(structuredClone(results), structuredClone(removal));
+  }
+});
+
+test("controller-script cleanup accepts only consistent top-level/details removal proof", async () => {
+  const accepted = [
+    { removed: true },
+    { status: "removed" },
+    { details: { removed: true } },
+    { removed: true, success: true, details: { status: "removed", success: true } },
+  ];
+  for (const evidence of accepted) {
+    const calls = await executePinnedController([{ status: "terminal_acked" }], evidence);
+    assert.equal(calls.some(([tool, params]) => tool === "controller" && params.action === "release"), true);
+  }
+  const rejected = [
+    {},
+    { success: true },
+    { removed: "true" },
+    { removed: true, failure: true },
+    { removed: true, success: false },
+    { details: { status: "removed", error: true } },
+    { removed: true, details: { removed: false } },
+  ];
+  for (const evidence of rejected) {
+    const calls = await executePinnedController([{ status: "terminal_acked" }], evidence);
+    assert.equal(calls.some(([tool, params]) => tool === "controller" && params.action === "release"), false);
+  }
+});
+
 test("the model-callable add creates exactly one disabled inert job with no private data", () => {
   assert.equal(generateReportControllerLeaseToken(() => Buffer.alloc(32, 0xab)), TOKEN);
-  assert.equal(generateReportControllerLeaseToken(() => Buffer.from([0xf8, ...Buffer.alloc(31)]))
-    .startsWith("acplease-"), true);
+  for (const [firstByte, encodedPrefix] of [[0xf8, "-"], [0xfc, "_"]]) {
+    const encoded = Buffer.from([firstByte, ...Buffer.alloc(31)]).toString("base64url");
+    assert.equal(encoded.startsWith(encodedPrefix), true);
+    assert.match(generateReportControllerLeaseToken(
+      () => Buffer.from([firstByte, ...Buffer.alloc(31)])), /^acplease[A-Za-z0-9_-]{43}$/u);
+  }
   assert.equal(generateReportControllerDeclarationKey(() => UUID), DECLARATION_KEY);
   const call = buildReportControllerPlaceholderAddCall(DECLARATION_KEY);
   assert.deepEqual(Object.keys(call), ["action", "job"]);
@@ -564,7 +665,7 @@ test("malformed registration after transport preparation removes the job then ab
   });
 });
 
-test("non-prepared registration removes the job before controller-proven abort", async () => {
+test("non-prepared registration removes the job before exact transport abort", async () => {
   const events = [];
   await assert.rejects(
     runReportControllerPreparation(makeInput(), makeDependencies(events, {
@@ -574,7 +675,24 @@ test("non-prepared registration removes the job before controller-proven abort",
       error.code === "report_controller_registration_failed",
   );
   assert.deepEqual(events.map(([name]) => name), [
-    "create", "arm", "bind", "start", "assemble", "prepare", "register", "remove", "abort",
+    "create", "arm", "bind", "start", "assemble", "prepare", "register", "remove", "abort-transport",
+  ]);
+});
+
+test("thrown registration removes the job before exact transport abort", async () => {
+  const events = [];
+  await assert.rejects(
+    runReportControllerPreparation(makeInput(), makeDependencies(events, {
+      async registerController(value) {
+        events.push(["register", value]);
+        throw new Error("synthetic registration failure");
+      },
+    })),
+    (error) => error instanceof AcpReportControllerPreparationError &&
+      error.code === "report_controller_preparation_failed",
+  );
+  assert.deepEqual(events.map(([name]) => name), [
+    "create", "arm", "bind", "start", "assemble", "prepare", "register", "remove", "abort-transport",
   ]);
 });
 
@@ -622,6 +740,8 @@ const PROVEN_REMOVALS = [
   ["coexisting top-level positives", { removed: true, status: "removed" }],
   ["coexisting cross-level positives",
     { removed: true, details: { removed: true, status: "removed" } }],
+  ["coexisting success attestations",
+    { removed: true, success: true, details: { status: "removed", success: true } }],
 ];
 
 const CONTRADICTORY_REMOVALS = [
@@ -631,6 +751,10 @@ const CONTRADICTORY_REMOVALS = [
   ["cross-level status contradiction", { status: "removed", details: { status: "error" } }],
   ["explicit top-level error", { removed: true, error: "bounded-private-error" }],
   ["explicit nested error", { details: { status: "removed", error: true } }],
+  ["explicit top-level failure", { removed: true, failure: true }],
+  ["explicit nested failure", { details: { status: "removed", failure: true } }],
+  ["false top-level success", { removed: true, success: false }],
+  ["non-boolean nested success", { details: { status: "removed", success: "true" } }],
 ];
 
 test("a proven removal in any real envelope aborts the exact unregistered prepared transport", async () => {
@@ -687,6 +811,7 @@ test("an unproven removal envelope never aborts or releases anything", async () 
     ["truthy string instead of boolean", () => ({ removed: "true" })],
     ["nested truthy string", () => ({ details: { removed: "true" } })],
     ["truthy number instead of boolean", () => ({ details: { removed: 1 } })],
+    ["success without removal proof", () => ({ success: true })],
     ["unrelated top-level status", () => ({ status: "error" })],
     ["unrelated nested status", () => ({ details: { status: "not_found" } })],
     ["removed-looking status value", () => ({ details: { status: "Removed" } })],

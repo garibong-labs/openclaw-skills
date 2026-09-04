@@ -48,7 +48,7 @@
       "payload": {
         "kind": "script",
         "scriptVersion": "acp-report-controller-script.v1",
-        "scriptSha256": "dad87e9f3b11f74d7a541c3b0c5ac0cdaca2ffd4fd49161ec2b4b333c4b6c65c",
+        "scriptSha256": "cea9764f3abf95a064caeebc50640d8a9cc5167c1eb244388845a1287a547662",
         "timeoutSeconds": 60,
         "toolBudget": 5,
         "toolsAllow": [

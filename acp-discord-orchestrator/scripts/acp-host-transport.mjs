@@ -27,6 +27,10 @@ import {
   buildAcpTerminalReport,
   isReportPumpId
 } from "./acp-reporting-contract.mjs";
+import {
+  hasExactKeys as exactKeys,
+  isPlainObject
+} from "./acp-private-json-input.mjs";
 
 // v2 is an incompatible bump over acp-host-transport.v1: the private record
 // gains the fenced publication-attempt state, `ack-report` requires the
@@ -103,14 +107,6 @@ function transportFail(code) {
   const error = new Error(code);
   error.code = code;
   throw error;
-}
-
-function isPlainObject(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
 }
 
 function isPrivateMode(stat) {
@@ -229,11 +225,13 @@ export function acquireTransportLock(recordFile, action, dependencies = {}) {
   const lockFile = `${recordFile}.lock`;
   const waitMs = dependencies.lockWaitMs ?? TRANSPORT_LOCK_WAIT_MS;
   const sleep = dependencies.sleepMs ?? sleepSyncMs;
+  const clockNowMs = dependencies.lockNowMs ?? Date.now;
   const fileSystem = dependencies.fileSystem ?? fs;
   const ownerToken = crypto.randomUUID();
-  const deadlineMs = Date.now() + waitMs;
+  const deadlineMs = clockNowMs() + waitMs;
+  let backoffMs = 25;
   for (;;) {
-    if (Date.now() >= deadlineMs) {
+    if (clockNowMs() >= deadlineMs) {
       transportFail("host_transport_lock_timeout");
     }
     try {
@@ -250,16 +248,11 @@ export function acquireTransportLock(recordFile, action, dependencies = {}) {
         transportFail("host_transport_lock_failed");
       }
     }
-    try {
-      fileSystem.lstatSync(lockFile);
-    } catch (error) {
-      if (error && error.code === "ENOENT") {
-        sleep(25);
-        continue;
-      }
-      transportFail("host_transport_lock_failed");
-    }
-    sleep(25);
+    // EEXIST is complete contention evidence. Never inspect, rewrite, or unlink
+    // the pathname: it may already denote a fresh holder. Every contention
+    // path waits with bounded backoff and rechecks the same deadline.
+    sleep(Math.min(backoffMs, Math.max(0, deadlineMs - clockNowMs())));
+    backoffMs = Math.min(backoffMs * 2, 250);
   }
   return function releaseTransportLock() {
     try {
@@ -285,12 +278,6 @@ function withTransportRecord(transportFile, action, dependencies, fn) {
   } finally {
     release();
   }
-}
-
-function exactKeys(value, required) {
-  return isPlainObject(value) &&
-    Object.keys(value).length === required.length &&
-    required.every((key) => Object.hasOwn(value, key));
 }
 
 function validInstant(value) {
@@ -585,6 +572,9 @@ function parseTransportRecord(value) {
   ) {
     transportFail("host_transport_record_invalid");
   }
+  // Mandatory on every v2 record and validated before any caller can
+  // dereference its phase.
+  validateControllerLease(value.controllerLease);
   for (const key of [
     "configFile",
     "entryFile",
@@ -597,7 +587,6 @@ function parseTransportRecord(value) {
   }
   validateReportingContext(value.reportingContext);
   validatePublication(value.publication);
-  validateControllerLease(value.controllerLease);
   return value;
 }
 
@@ -1250,7 +1239,9 @@ export function statusHostTransport(input, dependencies = {}) {
     return {
       schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
       type: "host_transport_status",
-      status: terminalPending
+      status: publication.halted === "tracking_lost"
+        ? "tracking_lost"
+        : terminalPending
         ? "terminal_publication_pending"
         : active ? "active" : exitCode === null ? "unavailable" : "exited",
       processHandle: handle,
@@ -1615,6 +1606,24 @@ function reconcileLockedTransport(loaded, handle) {
   }
   const events = parseEvents(loaded.record.eventsFile);
   const exitCode = exitCodeFromFile(loaded.record.exitFile);
+  if (loaded.record.publication.halted === "tracking_lost") {
+    const runId = events.at(0)?.runId;
+    if (!runId) {
+      transportFail("host_transport_run_missing");
+    }
+    const ledgerFile = lifecycleLedgerPath(path.dirname(loaded.record.eventsFile), runId);
+    const ledger = loadLifecycleLedger(ledgerFile).document;
+    const reconciled = reconcileLifecycleLedger({
+      ledgerFile,
+      processHandle: ledger.processHandle,
+      outcome: "tracking_lost"
+    });
+    return {
+      schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+      type: "host_transport_reconciled",
+      status: reconciled.state
+    };
+  }
   if (exitCode === null) {
     transportFail("host_transport_exit_pending");
   }

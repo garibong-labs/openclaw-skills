@@ -20,6 +20,7 @@ import {
   beginHostTransportReportDelivery,
   claimHostTransportReport,
   confirmHostTransportActivation,
+  loadHostTransportRecord,
   prepareHostTransport,
   probeHostTransport,
   requireReport,
@@ -208,13 +209,18 @@ test("v2 records require controllerLease and fail with the bounded record code",
     handle: "acp-controller-lease-required",
     events: [event(1, "started", 0)],
   });
-  const record = readRecord(fixture);
-  delete record.controllerLease;
-  fs.writeFileSync(fixture.transportFile, JSON.stringify(record), { mode: 0o600 });
-  assert.throws(
-    () => confirmHostTransportActivation(fixture),
-    (error) => error?.code === "host_transport_record_invalid",
-  );
+  for (const controllerLease of [undefined, null, {}, { phase: "active" }, { phase: 1 }]) {
+    const record = readRecord(fixture);
+    if (controllerLease === undefined) delete record.controllerLease;
+    else record.controllerLease = controllerLease;
+    fs.writeFileSync(fixture.transportFile, JSON.stringify(record), { mode: 0o600 });
+    assert.throws(
+      () => loadHostTransportRecord(fixture.transportFile),
+      (error) => error?.code === "host_transport_record_invalid",
+    );
+    record.controllerLease = { phase: "activation_confirmed" };
+    fs.writeFileSync(fixture.transportFile, JSON.stringify(record), { mode: 0o600 });
+  }
 });
 
 function writeStaticTransport({ root, handle, events, publication = publicationFixture(), exitCode = null,
@@ -1427,16 +1433,14 @@ test("stale-lock replacement race never unlinks the fresh owner or admits a writ
   let sleeps = 0;
   let unlinkCalls = 0;
   let freshOwnerWasUnlinked = false;
-  let observedOldLease = false;
-  const startedAt = Date.now();
+  let statCalls = 0;
+  let virtualNow = 1000;
   assert.throws(() => acquireTransportLock("/private/fake-record.json", "status", {
     fileSystem: {
       writeFileSync: exists,
       lstatSync: () => {
-        observedOldLease = true;
-        // This is the old takeover boundary: the pathname now denotes a fresh
-        // holder. The implementation must not perform any pathname deletion.
-        return { mtimeMs: Date.now() };
+        statCalls += 1;
+        return { mtimeMs: 0 };
       },
       unlinkSync() {
         unlinkCalls += 1;
@@ -1445,16 +1449,17 @@ test("stale-lock replacement race never unlinks the fresh owner or admits a writ
     },
     lockWaitMs: 35,
     lockStaleMs: 1,
+    lockNowMs: () => virtualNow,
     sleepMs(ms) {
       sleeps += 1;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+      virtualNow += ms;
     },
   }), /host_transport_lock_timeout/u);
-  assert.equal(observedOldLease, true);
+  assert.equal(statCalls, 0);
   assert.equal(unlinkCalls, 0);
   assert.equal(freshOwnerWasUnlinked, false);
-  assert.ok(sleeps >= 1);
-  assert.ok(Date.now() - startedAt < 500);
+  assert.equal(sleeps, 2);
+  assert.equal(virtualNow, 1035);
 });
 
 test("two concurrent claimers yield exactly one live claim", {
@@ -1764,7 +1769,7 @@ test("a dead session without exit or terminal evidence halts publication as trac
     nowMs: dueAt + 3,
     randomUUID: () => "lost-status"
   });
-  assert.equal(status.status, "unavailable");
+  assert.equal(status.status, "tracking_lost");
   assert.equal(status.publicationHalted, "tracking_lost");
 });
 
@@ -1777,12 +1782,26 @@ test("a dead session with mapped exit but no terminal evidence also halts as tra
     exitCode: 22,
     publication: publicationFixture({ nextDueAt: new Date(REPORT_CADENCE_MS).toISOString() }),
   });
+  const writer = createLifecycleLedger({
+    stateDir: root,
+    runId: "run-publication-test",
+    requestId: "request-publication-test",
+    nowMs: 0,
+  });
+  activateLifecycleLedger(writer, fixture.processHandle, 1);
   const result = claimHostTransportReport(claimInput(fixture), {
     ...DEAD_TMUX,
     nowMs: REPORT_CADENCE_MS,
   });
   assert.equal(result.status, "tracking_lost");
   assert.equal(readRecord(fixture).publication.halted, "tracking_lost");
+  assert.deepEqual(reconcileHostTransport(fixture), {
+    schemaVersion: ACP_HOST_TRANSPORT_SCHEMA_VERSION,
+    type: "host_transport_reconciled",
+    status: "tracking_lost",
+  });
+  assert.equal(loadLifecycleLedger(writer.filePath).document.state, "tracking_lost");
+  assert.equal(reconcileHostTransport(fixture).status, "tracking_lost");
 });
 
 test("control service cursor prevents starvation and accepts only fresh exact-conversation attestation", () => {
@@ -2150,43 +2169,19 @@ test("tmux host transport returns a handle before activation and reconciles exac
   });
 });
 
-test("normative contract documents every report-pump correction error code", () => {
+test("normative contract stays synchronized with every explicit host/pump/preparation code", () => {
   const skillRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const contract = fs.readFileSync(path.join(skillRoot, "references/runtime-contract.md"), "utf8");
-  const sources = [
+  const sourceTexts = [
     "scripts/acp-host-transport.mjs",
     "scripts/acp-report-pump.mjs",
     "scripts/acp-report-controller-preparation.mjs",
-  ].map((relative) => fs.readFileSync(path.join(skillRoot, relative), "utf8")).join("\n");
-  const stableCodes = [
-    "host_transport_report_claim_held",
-    "host_transport_report_attempts_exhausted",
-    "host_transport_report_fencing_stale",
-    "host_transport_lock_timeout",
-    "host_transport_pump_destination_mismatch",
-    "host_transport_pump_job_mismatch",
-    "host_transport_report_attempt_expired",
-    "host_transport_report_delivery_already_pending",
-    "host_transport_publication_halted",
-    "host_transport_pump_job_invalid",
-    "host_transport_pump_run_token_invalid",
-    "host_transport_lock_failed",
-    "host_transport_activation_state_invalid",
-    "host_transport_activation_not_confirmed",
-    "report_pump_input_invalid",
-    "report_pump_input_schema",
-    "report_controller_lease_token_invalid",
-    "report_controller_declaration_key_invalid",
-    "report_controller_round_invalid",
-    "report_controller_job_create_invalid",
-    "report_controller_job_create_unresolved",
-    "report_controller_job_id_invalid",
-    "report_controller_job_arm_invalid",
-    "report_controller_registration_invalid",
-    "report_controller_commit_recovery_invalid",
-  ];
+  ].map((relative) => fs.readFileSync(path.join(skillRoot, relative), "utf8"));
+  const stableCodes = [...new Set(sourceTexts.flatMap((source) =>
+    [...source.matchAll(/(?:transportFail|pumpFail|fail)\(\s*["']((?:host_transport|report_pump|report_controller)_[a-z0-9_]+)["']/gu)]
+      .map((match) => match[1])))].sort();
+  assert.ok(stableCodes.length >= 77, "the sync guard must cover the full stable code surface");
   for (const code of stableCodes) {
-    assert.equal(sources.includes(`"${code}"`), true, `${code} must remain implemented`);
     assert.equal(contract.includes(`\`${code}\``), true, `${code} must remain documented`);
   }
 });

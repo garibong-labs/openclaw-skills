@@ -328,10 +328,12 @@ function readRemovalSignal(level) {
   const signals = [];
   if (Object.hasOwn(level, "removed")) signals.push(level.removed === true);
   if (Object.hasOwn(level, "status")) signals.push(level.status === REMOVED_STATUS);
-  // An explicit error cannot coexist with proof of successful removal. The
-  // value is deliberately not inspected or surfaced: its presence alone makes
-  // the bounded envelope ambiguous.
+  // Error/failure evidence cannot coexist with successful removal. A success
+  // field is only a consistency attestation: true is neutral and any other
+  // value denies proof; it cannot prove removal without removed/status.
   if (Object.hasOwn(level, "error")) signals.push(false);
+  if (Object.hasOwn(level, "failure")) signals.push(false);
+  if (Object.hasOwn(level, "success") && level.success !== true) signals.push(false);
   if (signals.length === 0) return undefined;
   return signals.every((signal) => signal === true);
 }
@@ -384,7 +386,7 @@ export function buildReportControllerRegistration(input, leaseToken, jobId, prep
   return registration;
 }
 
-async function rollbackBeforeActivation(jobId, leaseToken, prepared, registrationSubmitted, dependencies) {
+async function rollbackBeforeActivation(jobId, leaseToken, prepared, registrationConfirmed, dependencies) {
   if (jobId !== undefined) {
     try {
       if (!isProvenRemoval(await dependencies.removeAutomation({ action: "remove", jobId }))) {
@@ -396,13 +398,13 @@ async function rollbackBeforeActivation(jobId, leaseToken, prepared, registratio
   }
   if (prepared !== undefined) {
     try {
-      const aborted = registrationSubmitted
+      const aborted = registrationConfirmed
         ? await dependencies.abortController({ action: "abort_preactivation", leaseToken })
         : await (dependencies.abortTransport ?? abortHostTransportPreactivation)({
             transportFile: prepared.transportFile,
             processHandle: prepared.processHandle,
           });
-      const abortedStatus = registrationSubmitted ? resultStatus(aborted) :
+      const abortedStatus = registrationConfirmed ? resultStatus(aborted) :
         aborted?.type === "host_transport_preactivation_aborted" ? "aborted" : undefined;
       if (abortedStatus !== "aborted") {
         fail("report_controller_pre_activation_cleanup_failed");
@@ -472,7 +474,7 @@ export async function runReportControllerPreparation(input, dependencies) {
   const declarationKey = generateReportControllerDeclarationKey(dependencies.randomUUID);
   let jobId;
   let prepared;
-  let registrationSubmitted = false;
+  let registrationConfirmed = false;
   let activationConfirmed = false;
   try {
     const created = await createControllerPlaceholderJob(
@@ -498,11 +500,11 @@ export async function runReportControllerPreparation(input, dependencies) {
     prepared = await dependencies.prepare({ jobId, reportPump, assembled });
     assertPrepared(prepared);
     const registration = buildReportControllerRegistration(input, leaseToken, jobId, prepared);
-    registrationSubmitted = true;
     const registrationResult = await dependencies.registerController(registration);
     if (resultStatus(registrationResult) !== "prepared") {
       fail("report_controller_registration_failed");
     }
+    registrationConfirmed = true;
     const activation = await dependencies.activate({
       transportFile: prepared.transportFile,
       processHandle: prepared.processHandle,
@@ -537,7 +539,7 @@ export async function runReportControllerPreparation(input, dependencies) {
         jobId,
         leaseToken,
         prepared,
-        registrationSubmitted,
+        registrationConfirmed,
         dependencies,
       );
     }
