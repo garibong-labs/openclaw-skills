@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+- **Daum Trends 발행 탭 누적 방지**
+  - `daum-trends` preset 실행 전과 종료 시 같은 블로그의 정확한 `/manage/posts/`, `/manage/statistics/entry/<id>` 페이지만 정리하고 종류별 마지막 관측 페이지 1개를 유지
+  - 현재 실행 페이지는 성공/실패 모두 보호하며, 실패 시 editor/login/다른 블로그/일반 공개 페이지와 기존 debug artifact는 닫거나 삭제하지 않음
+  - success/failure context cleanup과 반복 실행 시 페이지 수가 누적되지 않는 regression 테스트 추가
 - **확정 500/40009 Daum 다음 기사 폴백** (뉴스 OG 카드 지속 scrap 실패 대응)
   - 뉴스 OG placeholder가 같은 트렌드 항목의 ordered 후보를 `data-og-fallback-urls`(공백 구분)로 실어 오면, 원본 1회 + 같은 URL 재시도 1회가 **둘 다 안전 연관된 HTTP 500 + payload `code=40009`로 확정**된 경우에만 첫 적격 v.daum.net 기사 후보를 정확히 1회 시도 (같은 URL 재시도 없음, 2차 후보 없음)
   - 후보 적격성은 보수적 v.daum.net 기사 계약(`/v/<id>`, query/fragment 금지)으로 재검증 — 검색 페이지·다른 Daum 서비스·커뮤니티 URL·외부 언론사·현재 URL·중복은 제외. 후보가 없으면 기존 fail-closed abort 유지

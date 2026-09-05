@@ -143,6 +143,7 @@ bash scripts/login.sh \
 8. 대표이미지 설정 (`daum-trends`는 첫 non-comic 본문 첨부를 결정적으로 선택 — 대상 미발견 시 발행 중단, 다른 템플릿은 첫 이미지)
 9. 태그 등록
 10. 발행 (공개/비공개)
+11. `daum-trends` 실행은 종료 상태와 무관하게 같은 블로그의 중복 글 관리/통계 탭만 정리 (종류별 1개 유지, 현재 실행 페이지·editor·login·다른 사이트 제외)
 
 ## 본문 HTML 작성 규칙
 
@@ -214,6 +215,7 @@ templates/my-template/
 - 사진 업로드는 transient file chooser 이벤트를 먼저 포착하고 동적 DOM input을 fallback으로 사용하며, 3회 지수 백오프 재시도 후에도 둘 다 없으면 DOM/스크린샷을 기록하고 중단
 - 카테고리가 ARIA combobox → Playwright click 필요
 - 대표이미지 셀렉터가 Tistory 업데이트마다 변경 가능
+- `daum-trends` 탭 정리는 같은 블로그의 정확한 `/manage/posts/`, `/manage/statistics/entry/<id>` 페이지만 대상으로 하며 editor/login/다른 블로그 페이지는 보존
 
 ## 변경 이력
 

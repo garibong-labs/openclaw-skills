@@ -252,6 +252,143 @@ def cleanup_newpost_targets(reason):
             log(f"  ⚠️ failed to close stale newpost target id={target_id}: {type(e).__name__}: {e}")
     return closed
 
+def daum_trends_management_page_kind(url, blog):
+    """Classify only the same-blog management pages this workflow owns."""
+    if not url or not blog:
+        return None
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return None
+    expected_host = (blog or '').strip().lower().rstrip('.')
+    actual_host = (parts.hostname or '').lower().rstrip('.')
+    try:
+        has_authority_override = bool(parts.username or parts.password or parts.port)
+    except ValueError:
+        return None
+    if parts.scheme != 'https' or actual_host != expected_host:
+        return None
+    if has_authority_override or parts.query or parts.fragment:
+        return None
+    path = parts.path.rstrip('/') or '/'
+    if path == '/manage/posts':
+        return 'posts'
+    if re.fullmatch(r'/manage/statistics/entry/[0-9]+', path):
+        return 'statistics-entry'
+    return None
+
+def select_daum_trends_management_pages_to_close(pages, blog, protected_pages=()):
+    """Keep one last-observed page per owned kind, unless a protected run page exists."""
+    protected_ids = {id(page) for page in (protected_pages or ()) if page is not None}
+    protected_kinds = set()
+    pages_by_kind = {'posts': [], 'statistics-entry': []}
+
+    for page in list(pages or ()):
+        try:
+            if callable(getattr(page, 'is_closed', None)) and page.is_closed():
+                continue
+            kind = daum_trends_management_page_kind(page.url, blog)
+        except Exception:
+            continue
+        if not kind:
+            continue
+        if id(page) in protected_ids:
+            protected_kinds.add(kind)
+        else:
+            pages_by_kind[kind].append(page)
+
+    selected = []
+    for kind in ('posts', 'statistics-entry'):
+        candidates = pages_by_kind[kind]
+        # browser_context.pages is observed in creation order. Preserve its last page
+        # unless the current run already protects a page of this exact kind.
+        if kind not in protected_kinds and candidates:
+            candidates = candidates[:-1]
+        selected.extend(candidates)
+    return selected
+
+def cleanup_daum_trends_management_pages(browser, template, blog, protected_pages=(), reason='cleanup'):
+    """Close duplicate owned pages without touching editors, login, or other sites."""
+    if template != 'daum-trends' or not blog or browser is None:
+        return {'enabled': False, 'closed': 0, 'failed': 0}
+
+    pages = []
+    try:
+        for context in list(browser.contexts):
+            pages.extend(list(context.pages))
+    except Exception as e:
+        log(f"  ⚠️ Daum Trends tab cleanup ({reason}) could not list pages: {type(e).__name__}: {e}")
+        return {'enabled': True, 'closed': 0, 'failed': 1}
+
+    selected = select_daum_trends_management_pages_to_close(
+        pages,
+        blog,
+        protected_pages=protected_pages,
+    )
+    closed = 0
+    failed = 0
+    for page in selected:
+        try:
+            page.close()
+            closed += 1
+        except Exception as e:
+            failed += 1
+            log(f"  ⚠️ Daum Trends tab cleanup ({reason}) close failed: {type(e).__name__}: {e}")
+    retained = 0
+    for page in pages:
+        try:
+            if callable(getattr(page, 'is_closed', None)) and page.is_closed():
+                continue
+            if daum_trends_management_page_kind(page.url, blog):
+                retained += 1
+        except Exception:
+            continue
+    log(f"  - Daum Trends tab cleanup ({reason}): closed={closed}, failed={failed}, retained={retained}")
+    return {'enabled': True, 'closed': closed, 'failed': failed, 'retained': retained}
+
+class DaumTrendsTabCleanup:
+    """Run cleanup while the CDP connection is alive on success and failure."""
+    def __init__(self, template, blog):
+        self.template = template
+        self.blog = blog
+        self.browser = None
+        self.protected_pages = []
+        self.finished = False
+
+    def __enter__(self):
+        return self
+
+    def attach(self, browser):
+        self.browser = browser
+
+    def protect(self, page):
+        if page is not None and all(id(page) != id(existing) for existing in self.protected_pages):
+            self.protected_pages.append(page)
+
+    def cleanup(self, reason):
+        return cleanup_daum_trends_management_pages(
+            self.browser,
+            self.template,
+            self.blog,
+            protected_pages=self.protected_pages,
+            reason=reason,
+        )
+
+    def finish(self, reason):
+        if self.finished:
+            return None
+        result = self.cleanup(reason)
+        self.finished = True
+        return result
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            self.finish('success' if exc_type is None else 'failure')
+        except Exception as e:
+            # Cleanup must never replace the publish result or its diagnostic exception.
+            log(f"  ⚠️ Daum Trends tab cleanup exit failed: {type(e).__name__}: {e}")
+        return False
+
 OG_GATE_ENABLED = os.environ.get('TISTORY_OG_MATCH_GATE', '1').lower() not in ('0', 'false', 'no')
 OG_VALIDATOR = os.environ.get('TISTORY_OG_VALIDATOR', '').strip()
 
@@ -1490,10 +1627,15 @@ log('Preflight: stale newpost target cleanup')
 closed_targets = cleanup_newpost_targets('stale newpost target cleanup')
 log(f"Preflight: stale newpost target cleanup OK (closed={closed_targets})")
 
-with sync_playwright() as p:
+tab_cleanup = DaumTrendsTabCleanup(TEMPLATE, BLOG)
+with sync_playwright() as p, tab_cleanup:
     log('Preflight: Playwright CDP attach')
     browser = p.chromium.connect_over_cdp(CDP_URL)
+    tab_cleanup.attach(browser)
     log('Preflight: attach OK')
+
+    log('Preflight: Daum Trends management tab cleanup')
+    tab_cleanup.cleanup('preflight')
 
     # ── Step 1: 새 글 페이지 열기 ──
     log("Step 1: 새 글 페이지 열기")
@@ -1513,6 +1655,7 @@ with sync_playwright() as p:
 
     ctx0 = browser.contexts[0] if browser.contexts else browser.new_context()
     page = ctx0.new_page()
+    tab_cleanup.protect(page)
     page.on('dialog', handle_dialog)
     log(f"  - target newpost url: {NEWPOST_URL}")
     try:
@@ -2273,6 +2416,7 @@ with sync_playwright() as p:
     print(json.dumps(result))
     if result.get("postUrl"):
         print(f"TISTORY_POST_URL={result['postUrl']}", file=sys.stderr)
+    tab_cleanup.finish('success')
     browser.close()
     publish_lock.release()
 
