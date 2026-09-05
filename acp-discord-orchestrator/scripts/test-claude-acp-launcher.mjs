@@ -697,7 +697,7 @@ test("substituted public template loads through the real supervisor loader", () 
   // carrying the substituted script, lease token, or a static report.
   assert.equal(loaded.reporting.reportPump.enabled, true);
   assert.equal(loaded.reporting.reportPump.sessionTarget, "isolated");
-  assert.deepEqual(loaded.reporting.reportPump.schedule, { kind: "every", everyMs: 600000 });
+  assert.deepEqual(loaded.reporting.reportPump.schedule, { kind: "every", everyMs: 60000 });
   assert.deepEqual(loaded.reporting.reportPump.payload, {
     kind: "script",
     scriptVersion: "acp-report-controller-script.v1",

@@ -30,6 +30,7 @@ import {
 import { REMOTE_PROVIDER_CLOCK_SKEW_MS } from "./acpx-foreground-supervisor.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 import {
+  ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS,
   buildAcpIntermediateReport,
   buildAcpTerminalReport
 } from "./acp-reporting-contract.mjs";
@@ -449,7 +450,7 @@ test("coordinator rollback releases a registered lease after exact supervisor pr
         enabled: true,
         sessionTarget: "isolated",
         deleteAfterRun: false,
-        schedule: { kind: "every", everyMs: 600000, anchorMs: 1756900000000 },
+        schedule: { kind: "every", everyMs: 60000, anchorMs: 1756900000000 },
         payload: call.job.payload,
         delivery: { mode: "none" },
       };
@@ -867,6 +868,13 @@ test("first cadence is claimable at exactly 600 seconds and freezes later eviden
     events: [event(1, "started", 0), event(2, "activity", dueAt)],
     publication: publicationFixture({ nextDueAt: new Date(dueAt).toISOString() })
   });
+  const firstPoll = claimHostTransportReport(claimInput(fixture), {
+    ...ACTIVE_TMUX,
+    nowMs: ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS,
+    randomUUID: () => "first-poll"
+  });
+  assert.equal(firstPoll.status, "none_due",
+    "one-minute controller polling must not advance ten-minute report eligibility");
   const early = claimHostTransportReport(claimInput(fixture), {
     ...ACTIVE_TMUX,
     nowMs: dueAt - 1,

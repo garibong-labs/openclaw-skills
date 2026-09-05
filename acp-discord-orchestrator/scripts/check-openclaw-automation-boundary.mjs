@@ -355,7 +355,7 @@ check("the real stored read view arms and reaches bind and start", async () => {
     payload: { ...arm.job.payload, toolsAllow: stored },
     createdAtMs: 1756890000000,
     updatedAtMs: 1756900000000,
-    state: { nextRunAtMs: 1756900600000 },
+    state: { nextRunAtMs: 1756900060000 },
   };
   const installedReadView = cronJobReadView(persisted);
   const events = [];
@@ -532,13 +532,13 @@ function armedReadView(script, toolsAllow) {
       enabled: true,
       sessionTarget: "isolated",
       deleteAfterRun: false,
-      schedule: { kind: "every", everyMs: 600000, anchorMs: 1756900000000 },
+      schedule: { kind: "every", everyMs: 60000, anchorMs: 1756900000000 },
       payload: { kind: "script", script, timeoutSeconds: 60, toolBudget: 5, toolsAllow: [...toolsAllow] },
       delivery: { mode: "none" },
       createdAtMs: 1756890000000,
       updatedAtMs: 1756900000000,
       configRevision: "rev-1",
-      nextRunAtMs: 1756900600000,
+      nextRunAtMs: 1756900060000,
       state: {},
     },
   };

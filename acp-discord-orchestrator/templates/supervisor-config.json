@@ -43,7 +43,7 @@
       "sessionTarget": "isolated",
       "schedule": {
         "kind": "every",
-        "everyMs": 600000
+        "everyMs": 60000
       },
       "payload": {
         "kind": "script",

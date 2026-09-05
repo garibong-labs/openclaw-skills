@@ -21,8 +21,8 @@ import {
 import { validateAcpReportingContract } from "./acp-reporting-contract.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 
-const PINNED_PLUGIN_COMMIT = "fedec3441129e7e6fa1246f1611749d0c6041a4b";
-const TEMPLATE_SHA256 = "4306cabcb709e2ae52d3567a98792b78a1bfa1479dfae36d703fa6cef9d8c451";
+const PINNED_PLUGIN_COMMIT = "47778f319b033f14c56b121ac7094ff003be09bd";
+const TEMPLATE_SHA256 = "5a75b6eea2b4b190ea42eaab22d7c99252a5aeb1431c99052e7881c7b63581b3";
 const PINNED_SCRIPT = `const leaseToken = "LEASE_TOKEN";
 const jobId = "JOB_ID";
 const isPlainObject = (value) => {
@@ -314,7 +314,7 @@ function armedJob(overrides = {}) {
       enabled: true,
       sessionTarget: "isolated",
       deleteAfterRun: false,
-      schedule: { kind: "every", everyMs: 600000, anchorMs: 1756900000000 },
+      schedule: { kind: "every", everyMs: 60000, anchorMs: 1756900000000 },
       payload: {
         kind: "script",
         script: ARMED_SCRIPT,
@@ -326,7 +326,7 @@ function armedJob(overrides = {}) {
       createdAtMs: 1756890000000,
       updatedAtMs: 1756900000000,
       configRevision: "rev-1",
-      nextRunAtMs: 1756900600000,
+      nextRunAtMs: 1756900060000,
       state: {},
       ...overrides,
     },
@@ -389,7 +389,7 @@ test("preparation creates disabled, arms the exact returned id, then binds, regi
     enabled: true,
     sessionTarget: "isolated",
     deleteAfterRun: false,
-    schedule: { kind: "every", everyMs: 600000, anchorMs: 1756900000000 },
+    schedule: { kind: "every", everyMs: 60000, anchorMs: 1756900000000 },
     payload: {
       kind: "script",
       script: ARMED_SCRIPT,
@@ -403,7 +403,7 @@ test("preparation creates disabled, arms the exact returned id, then binds, regi
     createdAtMs: 1756890000000,
     updatedAtMs: 1756900000000,
     configRevision: "rev-1",
-    nextRunAtMs: 1756900600000,
+    nextRunAtMs: 1756900060000,
     state: {},
   });
   // Nothing private, and nothing enabled, exists before the exact id is known.
@@ -548,7 +548,7 @@ test("an unproven arm removes the exact created job and never binds or starts", 
     ["wrong schedule interval", "report_controller_job_arm_invalid",
       () => armedJob({ schedule: { kind: "every", everyMs: 1000 } })],
     ["extra schedule field", "report_controller_job_arm_invalid",
-      () => armedJob({ schedule: { kind: "every", everyMs: 600000, staggerMs: 5000 } })],
+      () => armedJob({ schedule: { kind: "every", everyMs: 60000, staggerMs: 5000 } })],
     ["missing schedule", "report_controller_job_arm_invalid",
       () => armedJobVariant({ dropJobKeys: ["schedule"] })],
     ["wrong delivery mode", "report_controller_job_arm_invalid",

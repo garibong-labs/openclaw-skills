@@ -1,5 +1,5 @@
 // Skill-side report pump imported in-process by the durable controller plugin.
-// One enabled every-600000-ms OpenClaw script automation per exact ACP handle
+// One enabled every-60000-ms OpenClaw script automation per exact ACP handle
 // invokes the controller; each controller tick calls this entry point to claim a
 // fresh report obligation from the host transport's closed `claim-report`
 // action, derives the canonical public message from that live claim (never

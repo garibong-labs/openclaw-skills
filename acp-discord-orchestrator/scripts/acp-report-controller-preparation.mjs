@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import {
   ACP_REPORT_CONTROLLER_SCRIPT_SHA256,
   ACP_REPORT_CONTROLLER_SCRIPT_VERSION,
+  ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS,
   ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS,
   ACP_REPORT_CONTROLLER_TOOL_BUDGET,
   ACP_REPORT_CONTROLLER_TOOLS_ALLOW,
@@ -54,12 +55,11 @@ const MAX_REGISTRATION_ATTEMPTS = 2;
 const CONTROLLER_JOB_NAME = "ACP report controller";
 const CONTROLLER_SESSION_TARGET = "isolated";
 const CONTROLLER_SCHEDULE_KIND = "every";
-const CONTROLLER_INTERVAL_MS = 600000;
 const CONTROLLER_DELIVERY_MODE = "none";
 const CONTROLLER_PAYLOAD_KIND = "script";
 const CONTROLLER_PAYLOAD_KEYS = ["kind", "script", "timeoutSeconds", "toolBudget", "toolsAllow"];
 // `anchorMs` is the scheduler-owned phase anchor stamped onto every `every`
-// schedule at create time. It shifts only when the fixed 600000-ms period starts,
+// schedule at create time. It shifts only when the fixed 60000-ms period starts,
 // never what the job runs, which tools it may call, or where output is routed, so
 // it is the one dynamic key accepted inside the attested schedule.
 const CONTROLLER_SCHEDULE_DYNAMIC_KEYS = ["anchorMs"];
@@ -124,7 +124,7 @@ export function loadReportControllerAutomationTemplate(fileSystem = fs) {
       template.enabled !== true || template.deleteAfterRun !== false ||
       !hasExactKeys(template.schedule, ["kind", "everyMs"]) ||
       template.schedule.kind !== CONTROLLER_SCHEDULE_KIND ||
-      template.schedule.everyMs !== CONTROLLER_INTERVAL_MS ||
+      template.schedule.everyMs !== ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS ||
       !hasExactKeys(template.delivery, ["mode"]) || template.delivery.mode !== CONTROLLER_DELIVERY_MODE ||
       !hasExactKeys(template.payload, CONTROLLER_PAYLOAD_KEYS) ||
       template.payload.kind !== CONTROLLER_PAYLOAD_KIND ||
@@ -205,7 +205,7 @@ export function buildReportPumpStructuralAttestation(jobId, roundIndex) {
     roundIndex,
     enabled: true,
     sessionTarget: "isolated",
-    schedule: { kind: "every", everyMs: 600000 },
+    schedule: { kind: "every", everyMs: ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS },
     payload: {
       kind: "script",
       scriptVersion: ACP_REPORT_CONTROLLER_SCRIPT_VERSION,
@@ -300,7 +300,7 @@ function assertArmedControllerJob(result, jobId, declarationKey, expectedScript)
       FORBIDDEN_ARMED_JOB_KEYS.some((key) => job[key] !== undefined) ||
       !hasExactKeys(job.schedule, ["kind", "everyMs"], CONTROLLER_SCHEDULE_DYNAMIC_KEYS) ||
       job.schedule.kind !== CONTROLLER_SCHEDULE_KIND ||
-      job.schedule.everyMs !== CONTROLLER_INTERVAL_MS ||
+      job.schedule.everyMs !== ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS ||
       !hasExactKeys(job.delivery, ["mode"]) || job.delivery.mode !== CONTROLLER_DELIVERY_MODE ||
       !hasExactKeys(job.payload, CONTROLLER_PAYLOAD_KEYS) ||
       job.payload.kind !== CONTROLLER_PAYLOAD_KIND ||
