@@ -3,17 +3,14 @@ import re
 import unittest
 import warnings
 from pathlib import Path
-from urllib.parse import urlsplit
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "publish-post.sh"
 FUNCTION_NAMES = {
-    "daum_trends_management_page_kind",
-    "select_daum_trends_management_pages_to_close",
-    "cleanup_daum_trends_management_pages",
+    "log_best_effort",
+    "capture_page_target_id",
+    "close_daum_trends_run_target",
 }
-CLASS_NAME = "DaumTrendsTabCleanup"
-BLOG = "trends.example.tistory.com"
 
 
 def load_cleanup_helpers():
@@ -28,163 +25,127 @@ def load_cleanup_helpers():
     selected = [
         node
         for node in tree.body
-        if (
-            isinstance(node, ast.FunctionDef)
-            and node.name in FUNCTION_NAMES
-        ) or (
-            isinstance(node, ast.ClassDef)
-            and node.name == CLASS_NAME
-        )
+        if isinstance(node, ast.FunctionDef) and node.name in FUNCTION_NAMES
     ]
-    found_functions = {node.name for node in selected if isinstance(node, ast.FunctionDef)}
-    found_classes = {node.name for node in selected if isinstance(node, ast.ClassDef)}
-    if found_functions != FUNCTION_NAMES or found_classes != {CLASS_NAME}:
+    if {node.name for node in selected} != FUNCTION_NAMES:
         raise AssertionError("Daum Trends tab cleanup helpers not found in embedded Python")
 
     logs = []
-    namespace = {"re": re, "urlsplit": urlsplit, "log": logs.append}
+    closes = []
+
+    def close_target(target_id, timeout=5):
+        closes.append((target_id, timeout))
+
+    namespace = {
+        "log": logs.append,
+        "cdp_close_target": close_target,
+    }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(SCRIPT_PATH), "exec"), namespace)
     namespace["logs"] = logs
+    namespace["closes"] = closes
     return namespace
 
 
-class FakePage:
-    def __init__(self, url):
-        self.url = url
-        self.closed = False
+class FakeSession:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.commands = []
+        self.detached = False
 
-    def is_closed(self):
-        return self.closed
+    def send(self, command):
+        self.commands.append(command)
+        if self.error:
+            raise self.error
+        return self.response
 
-    def close(self):
-        self.closed = True
+    def detach(self):
+        self.detached = True
 
 
 class FakeContext:
-    def __init__(self, pages):
-        self._pages = pages
+    def __init__(self, session):
+        self.session = session
+        self.pages = []
 
-    @property
-    def pages(self):
-        return [page for page in self._pages if not page.closed]
+    def new_cdp_session(self, page):
+        self.pages.append(page)
+        return self.session
 
 
-class FakeBrowser:
-    def __init__(self, pages):
-        self.contexts = [FakeContext(pages)]
+class FakePage:
+    def __init__(self, session):
+        self.context = FakeContext(session)
 
 
 class DaumTrendsTabCleanupTests(unittest.TestCase):
     def setUp(self):
         self.ns = load_cleanup_helpers()
-        self.kind = self.ns["daum_trends_management_page_kind"]
-        self.select = self.ns["select_daum_trends_management_pages_to_close"]
-        self.cleanup = self.ns["cleanup_daum_trends_management_pages"]
-        self.manager_type = self.ns[CLASS_NAME]
+        self.capture = self.ns["capture_page_target_id"]
+        self.close = self.ns["close_daum_trends_run_target"]
 
-    def test_target_selection_is_limited_to_exact_same_blog_management_pages(self):
-        self.assertEqual(self.kind(f"https://{BLOG}/manage/posts/", BLOG), "posts")
-        self.assertEqual(
-            self.kind(f"https://{BLOG}/manage/statistics/entry/12345", BLOG),
-            "statistics-entry",
-        )
+    def test_captures_only_the_newly_created_page_target(self):
+        session = FakeSession({"targetInfo": {"targetId": "run-page-123"}})
+        page = FakePage(session)
 
-        excluded = [
-            f"https://{BLOG}/manage/newpost/?type=post",
-            f"https://{BLOG}/manage/posts/?page=2",
-            f"https://{BLOG}/manage/statistics/entry/12345?from=posts",
-            f"https://{BLOG}/entry/public-post",
-            f"https://other.example.tistory.com/manage/posts/",
-            "https://accounts.kakao.com/login",
-            "about:blank",
-        ]
-        for url in excluded:
-            with self.subTest(url=url):
-                self.assertIsNone(self.kind(url, BLOG))
+        self.assertEqual(self.capture(page), "run-page-123")
+        self.assertEqual(session.commands, ["Target.getTargetInfo"])
+        self.assertTrue(session.detached)
+        self.assertEqual(page.context.pages, [page])
 
-    def test_selection_preserves_last_page_per_kind_and_protected_run_page(self):
-        old_posts = FakePage(f"https://{BLOG}/manage/posts/")
-        new_posts = FakePage(f"https://{BLOG}/manage/posts/")
-        old_stats = FakePage(f"https://{BLOG}/manage/statistics/entry/100")
-        new_stats = FakePage(f"https://{BLOG}/manage/statistics/entry/101")
-        editor = FakePage(f"https://{BLOG}/manage/newpost/?type=post")
-        login = FakePage("https://accounts.kakao.com/login")
+    def test_unidentified_created_page_is_left_open(self):
+        session = FakeSession({"targetInfo": {}})
 
-        selected = self.select(
-            [old_posts, old_stats, editor, new_posts, new_stats, login],
-            BLOG,
-        )
-        self.assertEqual(selected, [old_posts, old_stats])
+        self.assertIsNone(self.capture(FakePage(session)))
+        self.assertTrue(session.detached)
+        self.assertEqual(self.ns["closes"], [])
+        self.assertTrue(any("target id unavailable" in message for message in self.ns["logs"]))
 
-        selected_with_protection = self.select(
-            [old_posts, old_stats, new_posts, new_stats],
-            BLOG,
-            protected_pages=[old_posts],
-        )
-        self.assertEqual(selected_with_protection, [new_posts, old_stats])
+    def test_target_capture_failure_is_nonfatal(self):
+        session = FakeSession(error=RuntimeError("CDP unavailable"))
 
-    def test_repeated_success_cleanup_does_not_accumulate_owned_pages(self):
-        editor = FakePage(f"https://{BLOG}/manage/newpost/?type=post")
-        login = FakePage("https://accounts.kakao.com/login")
-        other_blog = FakePage("https://other.example.tistory.com/manage/posts/")
-        pages = [editor, login, other_blog]
-        browser = FakeBrowser(pages)
+        self.assertIsNone(self.capture(FakePage(session)))
+        self.assertTrue(session.detached)
 
-        for post_id in range(1, 4):
-            current_posts = FakePage(f"https://{BLOG}/manage/posts/")
-            current_stats = FakePage(f"https://{BLOG}/manage/statistics/entry/{post_id}")
-            pages.extend([current_posts, current_stats])
+    def test_operator_interrupt_during_target_capture_is_not_swallowed(self):
+        session = FakeSession(error=KeyboardInterrupt("operator stop"))
 
-            result = self.cleanup(
-                browser,
-                "daum-trends",
-                BLOG,
-                protected_pages=[current_posts],
-                reason=f"run-{post_id}",
-            )
+        with self.assertRaises(KeyboardInterrupt):
+            self.capture(FakePage(session))
+        self.assertTrue(session.detached)
 
-            open_owned = [
-                page
-                for page in browser.contexts[0].pages
-                if self.kind(page.url, BLOG)
-            ]
-            self.assertEqual(open_owned, [current_posts, current_stats])
-            self.assertEqual(result["failed"], 0)
+    def test_close_is_limited_to_daum_trends_and_exact_target(self):
+        self.assertTrue(self.close("daum-trends", "run-page-123"))
+        self.assertEqual(self.ns["closes"], [("run-page-123", 5)])
+        self.assertFalse(self.close("simple-post", "run-page-456"))
+        self.assertFalse(self.close("daum-trends", None))
+        self.assertEqual(self.ns["closes"], [("run-page-123", 5)])
 
-        self.assertFalse(editor.closed)
-        self.assertFalse(login.closed)
-        self.assertFalse(other_blog.closed)
+    def test_cleanup_failures_cannot_replace_success(self):
+        def failing_close(target_id, timeout=5):
+            raise KeyboardInterrupt("operator interruption after verified publish")
 
-    def test_failure_exit_cleans_duplicates_but_preserves_diagnostic_editor(self):
-        old_posts = FakePage(f"https://{BLOG}/manage/posts/")
-        old_stats = FakePage(f"https://{BLOG}/manage/statistics/entry/200")
-        editor = FakePage(f"https://{BLOG}/manage/newpost/?type=post")
-        pages = [old_posts, old_stats, editor]
-        browser = FakeBrowser(pages)
+        def failing_log(message):
+            raise BrokenPipeError("stderr unavailable")
 
-        with self.assertRaisesRegex(RuntimeError, "publish failed"):
-            with self.manager_type("daum-trends", BLOG) as manager:
-                manager.attach(browser)
-                manager.protect(editor)
-                pages.extend([
-                    FakePage(f"https://{BLOG}/manage/posts/"),
-                    FakePage(f"https://{BLOG}/manage/statistics/entry/201"),
-                ])
-                raise RuntimeError("publish failed")
+        self.ns["cdp_close_target"] = failing_close
+        self.ns["log"] = failing_log
 
-        self.assertTrue(old_posts.closed)
-        self.assertTrue(old_stats.closed)
-        self.assertFalse(editor.closed)
-        self.assertEqual(len(browser.contexts[0].pages), 3)
+        self.assertFalse(self.close("daum-trends", "run-page-123"))
 
-    def test_other_templates_do_not_close_pages(self):
-        pages = [
-            FakePage(f"https://{BLOG}/manage/posts/"),
-            FakePage(f"https://{BLOG}/manage/posts/"),
-        ]
-        result = self.cleanup(FakeBrowser(pages), "simple-post", BLOG)
-        self.assertEqual(result, {"enabled": False, "closed": 0, "failed": 0})
-        self.assertTrue(all(not page.closed for page in pages))
+    def test_source_has_no_url_heuristic_or_failure_path_cleanup(self):
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("DaumTrendsTabCleanup", source)
+        self.assertNotIn("cleanup_daum_trends_management_pages", source)
+        self.assertNotIn("daum_trends_management_page_kind", source)
+        self.assertNotIn("select_daum_trends_management_pages_to_close", source)
+        self.assertNotIn("Preflight: Daum Trends management tab cleanup", source)
+        self.assertEqual(source.count("close_daum_trends_run_target(TEMPLATE, run_page_target_id)"), 1)
+        self.assertIsNotNone(re.search(
+            r"if HARD_FAIL:.*?fail\(HARD_FAIL\).*?print\(json\.dumps\(result\)\).*?close_daum_trends_run_target\(TEMPLATE, run_page_target_id\)",
+            source,
+            re.DOTALL,
+        ))
 
 
 if __name__ == "__main__":
