@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+- **Daum Trends 발행 탭 누적 방지**
+  - `daum-trends`가 발행과 기존 post-publish 검증을 모두 성공한 뒤, 그 실행이 생성한 정확한 CDP page target만 최대 5초로 best-effort 종료
+  - 다른 탭을 URL로 추측하거나 실패 경로에서 정리하지 않으며, target 식별·종료 실패는 성공 결과를 바꾸지 않음
+  - exact target 식별, 대상 한정, cleanup 예외 격리 regression 테스트 추가
 - **확정 500/40009 Daum 다음 기사 폴백** (뉴스 OG 카드 지속 scrap 실패 대응)
   - 뉴스 OG placeholder가 같은 트렌드 항목의 ordered 후보를 `data-og-fallback-urls`(공백 구분)로 실어 오면, 원본 1회 + 같은 URL 재시도 1회가 **둘 다 안전 연관된 HTTP 500 + payload `code=40009`로 확정**된 경우에만 첫 적격 v.daum.net 기사 후보를 정확히 1회 시도 (같은 URL 재시도 없음, 2차 후보 없음)
   - 후보 적격성은 보수적 v.daum.net 기사 계약(`/v/<id>`, query/fragment 금지)으로 재검증 — 검색 페이지·다른 Daum 서비스·커뮤니티 URL·외부 언론사·현재 URL·중복은 제외. 후보가 없으면 기존 fail-closed abort 유지

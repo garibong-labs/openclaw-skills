@@ -252,6 +252,45 @@ def cleanup_newpost_targets(reason):
             log(f"  ⚠️ failed to close stale newpost target id={target_id}: {type(e).__name__}: {e}")
     return closed
 
+def log_best_effort(message):
+    try:
+        log(message)
+    except BaseException:
+        pass
+
+def capture_page_target_id(page):
+    """Return the exact CDP target created for this run page, or leave it open."""
+    session = None
+    try:
+        session = page.context.new_cdp_session(page)
+        info = session.send('Target.getTargetInfo')
+        target_id = (info.get('targetInfo') or {}).get('targetId')
+        if isinstance(target_id, str) and target_id:
+            return target_id
+        log_best_effort('  ⚠️ Daum Trends tab cleanup skipped: created page target id unavailable')
+    except Exception as e:
+        log_best_effort(f"  ⚠️ Daum Trends tab cleanup skipped: cannot identify created page: {type(e).__name__}: {e}")
+    finally:
+        if session is not None:
+            try:
+                session.detach()
+            except Exception:
+                pass
+    return None
+
+def close_daum_trends_run_target(template, target_id):
+    """Best-effort, bounded close of this run's exact CDP target after success."""
+    if template != 'daum-trends' or not target_id:
+        return False
+    try:
+        cdp_close_target(target_id, timeout=5)
+    except BaseException as e:
+        # Publication is already verified; even an interrupt here must not report it as failed.
+        log_best_effort(f"  ⚠️ Daum Trends tab cleanup skipped: close failed: {type(e).__name__}: {e}")
+        return False
+    log_best_effort('  - Daum Trends tab cleanup: closed this run page')
+    return True
+
 OG_GATE_ENABLED = os.environ.get('TISTORY_OG_MATCH_GATE', '1').lower() not in ('0', 'false', 'no')
 OG_VALIDATOR = os.environ.get('TISTORY_OG_VALIDATOR', '').strip()
 
@@ -1513,6 +1552,7 @@ with sync_playwright() as p:
 
     ctx0 = browser.contexts[0] if browser.contexts else browser.new_context()
     page = ctx0.new_page()
+    run_page_target_id = capture_page_target_id(page)
     page.on('dialog', handle_dialog)
     log(f"  - target newpost url: {NEWPOST_URL}")
     try:
@@ -2273,6 +2313,7 @@ with sync_playwright() as p:
     print(json.dumps(result))
     if result.get("postUrl"):
         print(f"TISTORY_POST_URL={result['postUrl']}", file=sys.stderr)
+    close_daum_trends_run_target(TEMPLATE, run_page_target_id)
     browser.close()
     publish_lock.release()
 

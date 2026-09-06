@@ -143,6 +143,7 @@ bash scripts/login.sh \
 8. 대표이미지 설정 (`daum-trends`는 첫 non-comic 본문 첨부를 결정적으로 선택 — 대상 미발견 시 발행 중단, 다른 템플릿은 첫 이미지)
 9. 태그 등록
 10. 발행 (공개/비공개)
+11. `daum-trends`는 발행 및 기존 post-publish 검증이 성공한 경우에만, 해당 실행이 만든 정확한 page target을 최대 5초 best-effort로 닫음 (다른 탭·실패 경로는 건드리지 않으며 종료 실패가 발행 결과를 바꾸지 않음)
 
 ## 본문 HTML 작성 규칙
 
