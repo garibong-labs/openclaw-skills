@@ -432,6 +432,21 @@ test("coordinator rollback releases a registered lease after exact supervisor pr
   }, {
     randomBytes: () => Buffer.alloc(32, 0xab),
     randomUUID: () => "coordinator-job",
+    async inspectLifecycleGuard() {
+      return {
+        plugin: {
+          id: "acp-lifecycle-guard",
+          version: "0.6.4",
+          enabled: true,
+          activated: true,
+          status: "loaded",
+          contracts: {
+            tools: ["acp_report_controller"],
+            trustedToolPolicies: ["acp-report-controller-lifecycle-v1"],
+          },
+        },
+      };
+    },
     async createAutomation(call) {
       calls.push("create");
       assert.equal(Object.hasOwn(call.job, "id"), false);

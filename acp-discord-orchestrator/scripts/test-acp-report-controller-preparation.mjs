@@ -5,8 +5,11 @@ import test from "node:test";
 
 import {
   AcpReportControllerPreparationError,
+  ACP_LIFECYCLE_GUARD_MINIMUM_VERSION,
+  ACP_LIFECYCLE_GUARD_PLUGIN_ID,
   REPORT_CONTROLLER_AUTOMATION_TEMPLATE,
   REPORT_CONTROLLER_PLACEHOLDER_SCRIPT,
+  assertLifecycleGuardReady,
   buildReportControllerArmUpdateCall,
   buildReportControllerPlaceholderAddCall,
   buildReportControllerRegistration,
@@ -20,12 +23,12 @@ import {
 } from "./acp-report-controller-preparation.mjs";
 import {
   ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS,
+  ACP_REPORT_CONTROLLER_SCRIPT_SHA256,
+  ACP_REPORT_CONTROLLER_TEMPLATE_SHA256,
   validateAcpReportingContract,
 } from "./acp-reporting-contract.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 
-const PINNED_PLUGIN_COMMIT = "ee75f2585c1add63ff15e08a2de810e80fd9f910";
-const TEMPLATE_SHA256 = "5a75b6eea2b4b190ea42eaab22d7c99252a5aeb1431c99052e7881c7b63581b3";
 const PINNED_SCRIPT = `const leaseToken = "LEASE_TOKEN";
 const jobId = "JOB_ID";
 const isPlainObject = (value) => {
@@ -69,7 +72,6 @@ if (first.status === "delivery_pending") {
 }
 await cleanup(first);
 return {};`;
-const SCRIPT_SHA256 = "1dd0ccd2d2bd25ef25c002672a2b6ac4ccf7721b2b9e6304bdf4ddd8ce8ca6f2";
 // The scheduler owns job identity: the returned id is deliberately unrelated to
 // the caller-chosen declaration key so every binding must use the returned one.
 const UUID = "11111111-2222-3333-4444-555555555555";
@@ -80,12 +82,31 @@ const ARMED_SCRIPT = PINNED_SCRIPT
   .replace('"JOB_ID"', JSON.stringify(JOB_ID))
   .replace('"LEASE_TOKEN"', JSON.stringify(TOKEN));
 
-test(`automation template is byte-for-byte script-compatible with plugin ${PINNED_PLUGIN_COMMIT}`, () => {
+function lifecycleGuardInfo(overrides = {}) {
+  return {
+    plugin: {
+      id: ACP_LIFECYCLE_GUARD_PLUGIN_ID,
+      version: ACP_LIFECYCLE_GUARD_MINIMUM_VERSION,
+      enabled: true,
+      activated: true,
+      status: "loaded",
+      contracts: {
+        tools: ["acp_report_controller"],
+        trustedToolPolicies: ["acp-report-controller-lifecycle-v1"],
+      },
+      ...overrides,
+    },
+  };
+}
+
+test("automation template matches the production SHA-256 attestations", () => {
   const rawTemplate = fs.readFileSync(REPORT_CONTROLLER_AUTOMATION_TEMPLATE);
   const template = loadReportControllerAutomationTemplate();
   assert.equal(template.payload.script, PINNED_SCRIPT);
-  assert.equal(crypto.createHash("sha256").update(PINNED_SCRIPT, "utf8").digest("hex"), SCRIPT_SHA256);
-  assert.equal(crypto.createHash("sha256").update(rawTemplate).digest("hex"), TEMPLATE_SHA256);
+  assert.equal(crypto.createHash("sha256").update(PINNED_SCRIPT, "utf8").digest("hex"),
+    ACP_REPORT_CONTROLLER_SCRIPT_SHA256);
+  assert.equal(crypto.createHash("sha256").update(rawTemplate).digest("hex"),
+    ACP_REPORT_CONTROLLER_TEMPLATE_SHA256);
   assert.deepEqual(template, JSON.parse(rawTemplate.toString("utf8")));
   assert.equal(template.payload.kind, "script");
   assert.equal(template.payload.timeoutSeconds, 60);
@@ -99,6 +120,14 @@ test("template loader rejects the former 600000-ms schedule through the injected
   stale.schedule = { kind: "every", everyMs: 600000 };
   assert.throws(
     () => loadReportControllerAutomationTemplate({ readFileSync: () => JSON.stringify(stale) }),
+    new AcpReportControllerPreparationError("report_controller_automation_template_invalid"),
+  );
+});
+
+test("template loader rejects byte drift even when parsed behavior is unchanged", () => {
+  const raw = fs.readFileSync(REPORT_CONTROLLER_AUTOMATION_TEMPLATE, "utf8");
+  assert.throws(
+    () => loadReportControllerAutomationTemplate({ readFileSync: () => `${raw}\n` }),
     new AcpReportControllerPreparationError("report_controller_automation_template_invalid"),
   );
 });
@@ -128,13 +157,19 @@ async function executePinnedController(results, removalResult = { removed: true 
 }
 
 test("every non-throwing controller-script path returns the scheduler-safe plain object", async () => {
+  const cleanup = "remove_current_job_then_release_lease";
   const cases = [
     [[{ status: "none_due" }], { removed: true }],
+    [[{ status: "delivery_missing" }], { removed: true }],
+    [[{ status: "delivery_uncertain" }], { removed: true }],
     [[{ status: "delivery_pending", publicationToken: "opaque-publication-token" },
       { status: "none_due" }], { removed: true }],
-    [[{ status: "terminal_acked" }], { details: { removed: true } }],
-    [[{ status: "terminal_acked" }], { removed: false }],
+    [[{ status: "terminal_acked", cleanup }], { details: { removed: true } }],
+    [[{ status: "terminal_acked", cleanup }], { removed: false }],
+    [[{ status: "tracking_lost", cleanup }], { details: { removed: true } }],
     [[{ status: "error", code: "acp_lifecycle_guard.controller.lease_prepared" }],
+      { status: "removed" }],
+    [[{ status: "error", code: "acp_lifecycle_guard.controller.caller_invalid" }],
       { status: "removed" }],
   ];
   for (const [results, removal] of cases) {
@@ -150,7 +185,9 @@ test("controller-script cleanup accepts only consistent top-level/details remova
     { removed: true, success: true, details: { status: "removed", success: true } },
   ];
   for (const evidence of accepted) {
-    const calls = await executePinnedController([{ status: "terminal_acked" }], evidence);
+    const calls = await executePinnedController([{
+      status: "terminal_acked", cleanup: "remove_current_job_then_release_lease",
+    }], evidence);
     assert.equal(calls.some(([tool, params]) => tool === "controller" && params.action === "release"), true);
   }
   const rejected = [
@@ -163,7 +200,9 @@ test("controller-script cleanup accepts only consistent top-level/details remova
     { removed: true, details: { removed: false } },
   ];
   for (const evidence of rejected) {
-    const calls = await executePinnedController([{ status: "terminal_acked" }], evidence);
+    const calls = await executePinnedController([{
+      status: "terminal_acked", cleanup: "remove_current_job_then_release_lease",
+    }], evidence);
     assert.equal(calls.some(([tool, params]) => tool === "controller" && params.action === "release"), false);
   }
 });
@@ -284,7 +323,7 @@ test("v3 structural attestation validates without disclosing token, executable s
   assert.equal(serialized.includes(PINNED_SCRIPT), false);
   assert.equal(serialized.includes("leaseToken"), false);
   assert.equal(normalized.reportPump.id, JOB_ID);
-  assert.equal(normalized.reportPump.payload.scriptSha256, SCRIPT_SHA256);
+  assert.equal(normalized.reportPump.payload.scriptSha256, ACP_REPORT_CONTROLLER_SCRIPT_SHA256);
 });
 
 function makeInput() {
@@ -362,6 +401,7 @@ function makeDependencies(events, overrides = {}) {
   return {
     randomBytes: () => Buffer.alloc(32, 0xab),
     randomUUID: () => UUID,
+    async inspectLifecycleGuard() { return lifecycleGuardInfo(); },
     async createAutomation(call) { events.push(["create", call]); return createdJob(); },
     async armAutomation(call) { events.push(["arm", call]); return armedJob(); },
     async bindReporting(value) { events.push(["bind", value]); return { config: "bound" }; },
@@ -378,6 +418,59 @@ function makeDependencies(events, overrides = {}) {
     ...overrides,
   };
 }
+
+test("lifecycle guard readiness requires the loaded minimum-version tool and owner-fence policy", () => {
+  assert.deepEqual(assertLifecycleGuardReady(lifecycleGuardInfo()), {
+    pluginId: ACP_LIFECYCLE_GUARD_PLUGIN_ID,
+    version: ACP_LIFECYCLE_GUARD_MINIMUM_VERSION,
+    tool: "acp_report_controller",
+    policy: "acp-report-controller-lifecycle-v1",
+  });
+  assert.equal(assertLifecycleGuardReady(lifecycleGuardInfo({ version: "0.7.0" })).version, "0.7.0");
+  const cases = [
+    [lifecycleGuardInfo({ version: "0.6.3" }), "report_controller_plugin_version_unsupported"],
+    [lifecycleGuardInfo({ version: "0.6.4-beta.1" }), "report_controller_plugin_info_invalid"],
+    [lifecycleGuardInfo({ version: `0.6.${"9".repeat(80)}` }),
+      "report_controller_plugin_info_invalid"],
+    [lifecycleGuardInfo({ enabled: false }), "report_controller_plugin_not_loaded"],
+    [lifecycleGuardInfo({ activated: false }), "report_controller_plugin_not_loaded"],
+    [lifecycleGuardInfo({ status: "disabled" }), "report_controller_plugin_not_loaded"],
+    [lifecycleGuardInfo({ contracts: { tools: [], trustedToolPolicies: [] } }),
+      "report_controller_plugin_contract_unavailable"],
+  ];
+  for (const [value, code] of cases) {
+    assert.throws(() => assertLifecycleGuardReady(value),
+      (error) => error instanceof AcpReportControllerPreparationError && error.code === code,
+      code);
+  }
+});
+
+test("preparation attests lifecycle readiness before randomness or scheduler mutation", async () => {
+  for (const [label, inspect, code] of [
+    ["old version", async () => lifecycleGuardInfo({ version: "0.6.3" }),
+      "report_controller_plugin_version_unsupported"],
+    ["missing tool", async () => lifecycleGuardInfo({
+      contracts: { tools: [], trustedToolPolicies: ["acp-report-controller-lifecycle-v1"] },
+    }), "report_controller_plugin_contract_unavailable"],
+    ["inspection failure", async () => { throw new Error("private plugin detail"); },
+      "report_controller_plugin_preflight_failed"],
+  ]) {
+    const events = [];
+    await assert.rejects(runReportControllerPreparation(makeInput(), makeDependencies(events, {
+      inspectLifecycleGuard: inspect,
+      randomBytes: () => { events.push(["random"]); return Buffer.alloc(32, 0xab); },
+      async createAutomation(call) { events.push(["create", call]); return createdJob(); },
+    })), (error) => error instanceof AcpReportControllerPreparationError && error.code === code &&
+      !error.message.includes("private"), label);
+    assert.deepEqual(events, [], label);
+  }
+  const events = [];
+  await runReportControllerPreparation(makeInput(), makeDependencies(events, {
+    async inspectLifecycleGuard() { events.push(["preflight"]); return lifecycleGuardInfo(); },
+  }));
+  assert.equal(events[0][0], "preflight");
+  assert.equal(events[1][0], "create");
+});
 
 test("preparation creates disabled, arms the exact returned id, then binds, registers, and commits", async () => {
   const events = [];

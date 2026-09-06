@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import {
   ACP_REPORT_CONTROLLER_SCRIPT_SHA256,
   ACP_REPORT_CONTROLLER_SCRIPT_VERSION,
+  ACP_REPORT_CONTROLLER_TEMPLATE_SHA256,
   ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS,
   ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS,
   ACP_REPORT_CONTROLLER_TOOL_BUDGET,
@@ -34,6 +35,10 @@ import { hasExactKeys, isPlainObject } from "./acp-private-json-input.mjs";
 export const REPORT_CONTROLLER_AUTOMATION_TEMPLATE = fileURLToPath(
   new URL("../templates/report-controller-automation.json", import.meta.url),
 );
+export const ACP_LIFECYCLE_GUARD_PLUGIN_ID = "acp-lifecycle-guard";
+export const ACP_LIFECYCLE_GUARD_MINIMUM_VERSION = "0.6.4";
+const ACP_LIFECYCLE_GUARD_TOOL = "acp_report_controller";
+const ACP_LIFECYCLE_GUARD_POLICY = "acp-report-controller-lifecycle-v1";
 
 // Inert body of the disabled placeholder job. It carries no lease token, no job
 // identity, and no tool call, so a placeholder that is never armed — or one left
@@ -45,7 +50,7 @@ export const REPORT_CONTROLLER_PLACEHOLDER_SCRIPT =
 // first attempt may have created; a second unresolved response fails closed.
 const MAX_CREATE_ATTEMPTS = 2;
 // Registration has the same lost-response ambiguity as creation, but the
-// merged controller plugin makes only an exact replay idempotent. The first
+// pinned controller plugin makes only an exact replay idempotent. The first
 // unresolved answer therefore gets one identical replay; no third attempt is
 // made inside one preparation run.
 const MAX_REGISTRATION_ATTEMPTS = 2;
@@ -77,6 +82,7 @@ const SAFE_DECLARATION_KEY = /^[A-Za-z0-9][A-Za-z0-9_-]{15,199}$/u;
 const SAFE_HANDLE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
 const SAFE_ACCOUNT = /^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$/u;
 const DECIMAL_ID = /^[0-9]{1,30}$/u;
+const RELEASE_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
 // The model-callable add boundary forwards the whole job object to the closed
 // `cron.add` schema, which rejects any unknown key. A reserved identity is not
 // reachable there, so neither spelling may ever reappear on an add job.
@@ -98,6 +104,58 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function compareReleaseVersions(left, right) {
+  const leftParts = RELEASE_VERSION.exec(left)?.slice(1).map(Number);
+  const rightParts = RELEASE_VERSION.exec(right)?.slice(1).map(Number);
+  if (leftParts === undefined || rightParts === undefined ||
+      leftParts.some((part) => !Number.isSafeInteger(part)) ||
+      rightParts.some((part) => !Number.isSafeInteger(part))) {
+    fail("report_controller_plugin_info_invalid");
+  }
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] !== rightParts[index]) {
+      return leftParts[index] < rightParts[index] ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+// Fail before scheduler mutation when the Gateway has not loaded the exact
+// lifecycle surface this preparation depends on. The caller supplies the raw
+// parsed document from `openclaw plugins info acp-lifecycle-guard --json`;
+// only bounded stable codes escape this validator.
+export function assertLifecycleGuardReady(pluginInfo) {
+  if (!isPlainObject(pluginInfo) || !isPlainObject(pluginInfo.plugin) ||
+      pluginInfo.plugin.id !== ACP_LIFECYCLE_GUARD_PLUGIN_ID ||
+      typeof pluginInfo.plugin.version !== "string" ||
+      pluginInfo.plugin.version.length > 64 ||
+      !RELEASE_VERSION.test(pluginInfo.plugin.version)) {
+    fail("report_controller_plugin_info_invalid");
+  }
+  if (compareReleaseVersions(pluginInfo.plugin.version, ACP_LIFECYCLE_GUARD_MINIMUM_VERSION) < 0) {
+    fail("report_controller_plugin_version_unsupported");
+  }
+  if (pluginInfo.plugin.enabled !== true || pluginInfo.plugin.activated !== true ||
+      pluginInfo.plugin.status !== "loaded") {
+    fail("report_controller_plugin_not_loaded");
+  }
+  const contracts = pluginInfo.plugin.contracts;
+  if (!isPlainObject(contracts) || !Array.isArray(contracts.tools) ||
+      contracts.tools.some((tool) => typeof tool !== "string") ||
+      !contracts.tools.includes(ACP_LIFECYCLE_GUARD_TOOL) ||
+      !Array.isArray(contracts.trustedToolPolicies) ||
+      contracts.trustedToolPolicies.some((policy) => typeof policy !== "string") ||
+      !contracts.trustedToolPolicies.includes(ACP_LIFECYCLE_GUARD_POLICY)) {
+    fail("report_controller_plugin_contract_unavailable");
+  }
+  return {
+    pluginId: ACP_LIFECYCLE_GUARD_PLUGIN_ID,
+    version: pluginInfo.plugin.version,
+    tool: ACP_LIFECYCLE_GUARD_TOOL,
+    policy: ACP_LIFECYCLE_GUARD_POLICY,
+  };
+}
+
 export function generateReportControllerLeaseToken(randomBytes = crypto.randomBytes) {
   const token = `acplease${randomBytes(32).toString("base64url")}`;
   if (!SAFE_LEASE_TOKEN.test(token)) fail("report_controller_lease_token_invalid");
@@ -114,13 +172,17 @@ export function generateReportControllerDeclarationKey(randomUUID = crypto.rando
 }
 
 export function loadReportControllerAutomationTemplate(fileSystem = fs) {
+  let templateBytes;
   let template;
   try {
-    template = JSON.parse(fileSystem.readFileSync(REPORT_CONTROLLER_AUTOMATION_TEMPLATE, "utf8"));
+    templateBytes = fileSystem.readFileSync(REPORT_CONTROLLER_AUTOMATION_TEMPLATE);
+    template = JSON.parse(templateBytes.toString("utf8"));
   } catch {
     fail("report_controller_automation_template_invalid");
   }
-  if (!hasExactKeys(template, ["name", "sessionTarget", "schedule", "payload", "delivery", "enabled", "deleteAfterRun"]) ||
+  if (crypto.createHash("sha256").update(templateBytes).digest("hex") !==
+        ACP_REPORT_CONTROLLER_TEMPLATE_SHA256 ||
+      !hasExactKeys(template, ["name", "sessionTarget", "schedule", "payload", "delivery", "enabled", "deleteAfterRun"]) ||
       template.name !== CONTROLLER_JOB_NAME || template.sessionTarget !== CONTROLLER_SESSION_TARGET ||
       template.enabled !== true || template.deleteAfterRun !== false ||
       !hasExactKeys(template.schedule, ["kind", "everyMs"]) ||
@@ -392,7 +454,7 @@ export function buildReportControllerRegistration(input, leaseToken, jobId, prep
   return registration;
 }
 
-// These are the merged plugin's bounded registration failures that occur
+// These are the pinned plugin's bounded registration failures that occur
 // before a new lease can be durably persisted. Only an exact structured error
 // carrying one of these codes proves non-persistence and permits the existing
 // remove-before-abort rollback. A throw, missing/malformed response, generic
@@ -622,6 +684,7 @@ export async function retryReportControllerRegistration(recovery, dependencies) 
 // shells out, polls, launches a background task, or returns the lease token.
 export async function runReportControllerPreparation(input, dependencies) {
   const required = [
+    "inspectLifecycleGuard",
     "createAutomation", "armAutomation", "bindReporting", "sendStartReceipt", "assemble",
     "prepare", "registerController", "activate", "removeAutomation",
     "commitController", "abortController", "retainRecovery",
@@ -630,6 +693,13 @@ export async function runReportControllerPreparation(input, dependencies) {
       required.some((name) => typeof dependencies[name] !== "function")) {
     fail("report_controller_preparation_input_invalid");
   }
+  let pluginInfo;
+  try {
+    pluginInfo = await dependencies.inspectLifecycleGuard();
+  } catch {
+    fail("report_controller_plugin_preflight_failed");
+  }
+  assertLifecycleGuardReady(pluginInfo);
   const leaseToken = generateReportControllerLeaseToken(dependencies.randomBytes);
   const declarationKey = generateReportControllerDeclarationKey(dependencies.randomUUID);
   let jobId;
