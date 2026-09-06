@@ -133,7 +133,7 @@ When the message does explicitly cancel or replace the turn, follow the document
 
 ## Interpret events
 
-The temporary compatibility pin is plugin candidate `ee75f2585c1add63ff15e08a2de810e80fd9f910`; replace it with the companion plugin's merge commit before merging this branch. The loader enforces the exported template SHA-256 `5a75b6eea2b4b190ea42eaab22d7c99252a5aeb1431c99052e7881c7b63581b3` and placeholder-script SHA-256 `1dd0ccd2d2bd25ef25c002672a2b6ac4ccf7721b2b9e6304bdf4ddd8ce8ca6f2`. The final pin must preserve structured tick/send/ack, exact prepared replay, fail-closed mismatches, inert prepared ticks, and `{}` from every non-throwing script path.
+The compatibility pin is merged plugin commit `aa1d6c66d999140eca8bffb4312d950018f8ca1f`. The loader enforces the exported template SHA-256 `5a75b6eea2b4b190ea42eaab22d7c99252a5aeb1431c99052e7881c7b63581b3` and placeholder-script SHA-256 `1dd0ccd2d2bd25ef25c002672a2b6ac4ccf7721b2b9e6304bdf4ddd8ce8ca6f2`. That pin preserves structured tick/send/ack, exact prepared replay, fail-closed mismatches, inert prepared ticks, and `{}` from every non-throwing script path.
 
 Treat `activity` and `progress` as observational evidence only. The progress snapshot includes evidence age; it does not independently prove that ACP is still doing useful work.
 
