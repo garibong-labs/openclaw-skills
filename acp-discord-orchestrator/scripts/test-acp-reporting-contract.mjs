@@ -420,6 +420,10 @@ test('watchdog invariants are enforced exactly', () => {
   const badSchedule = buildReporting();
   badSchedule.watchdog.schedule.everyMs = 300000;
   expectRejected(badSchedule, 'invalid_reporting_watchdog_schedule');
+  // The v3 controller poll interval is never a valid legacy watchdog period.
+  const pollSchedule = buildReporting();
+  pollSchedule.watchdog.schedule.everyMs = 60000;
+  expectRejected(pollSchedule, 'invalid_reporting_watchdog_schedule');
 
   const badChannel = buildReporting();
   badChannel.watchdog.delivery.channel = 'slack';

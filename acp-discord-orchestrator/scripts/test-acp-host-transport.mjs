@@ -450,7 +450,7 @@ test("coordinator rollback releases a registered lease after exact supervisor pr
         enabled: true,
         sessionTarget: "isolated",
         deleteAfterRun: false,
-        schedule: { kind: "every", everyMs: 60000, anchorMs: 1756900000000 },
+        schedule: { kind: "every", everyMs: ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS, anchorMs: 1756900000000 },
         payload: call.job.payload,
         delivery: { mode: "none" },
       };
@@ -859,6 +859,13 @@ test("truncated status advances its cursor only through returned events", () => 
   assert.equal(second.lastSequence, 66);
 });
 
+test("controller poll interval is strictly finer than, and divides, the report cadence", () => {
+  assert.ok(ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS < REPORT_CADENCE_MS,
+    "polling must be finer than report eligibility or every claim lags a full cadence");
+  assert.equal(REPORT_CADENCE_MS % ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS, 0,
+    "report cadence must be a whole number of controller polls");
+});
+
 test("first cadence is claimable at exactly 600 seconds and freezes later evidence", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "acp-publication-cadence-"));
   const dueAt = REPORT_CADENCE_MS;
@@ -868,13 +875,24 @@ test("first cadence is claimable at exactly 600 seconds and freezes later eviden
     events: [event(1, "started", 0), event(2, "activity", dueAt)],
     publication: publicationFixture({ nextDueAt: new Date(dueAt).toISOString() })
   });
-  const firstPoll = claimHostTransportReport(claimInput(fixture), {
-    ...ACTIVE_TMUX,
-    nowMs: ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS,
-    randomUUID: () => "first-poll"
-  });
-  assert.equal(firstPoll.status, "none_due",
-    "one-minute controller polling must not advance ten-minute report eligibility");
+  const beforePolls = readRecord(fixture).publication;
+  for (let poll = 1; poll * ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS < dueAt; poll += 1) {
+    const early = claimHostTransportReport(claimInput(fixture), {
+      ...ACTIVE_TMUX,
+      nowMs: poll * ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS,
+      randomUUID: () => `poll-${poll}`
+    });
+    assert.equal(early.status, "none_due",
+      "controller polling must not advance report eligibility");
+  }
+  // Polling binds the pump job identity but leaves the publication boundary,
+  // fence, and attempt budget untouched until the cadence instant.
+  const afterPolls = readRecord(fixture).publication;
+  assert.deepEqual(afterPolls, { ...beforePolls, pumpJobId: afterPolls.pumpJobId });
+  assert.equal(afterPolls.nextDueAt, beforePolls.nextDueAt);
+  assert.equal(afterPolls.nextCadence, beforePolls.nextCadence);
+  assert.equal(afterPolls.fence, beforePolls.fence);
+  assert.equal(afterPolls.attemptCount, beforePolls.attemptCount);
   const early = claimHostTransportReport(claimInput(fixture), {
     ...ACTIVE_TMUX,
     nowMs: dueAt - 1,

@@ -59,7 +59,8 @@ const CONTROLLER_DELIVERY_MODE = "none";
 const CONTROLLER_PAYLOAD_KIND = "script";
 const CONTROLLER_PAYLOAD_KEYS = ["kind", "script", "timeoutSeconds", "toolBudget", "toolsAllow"];
 // `anchorMs` is the scheduler-owned phase anchor stamped onto every `every`
-// schedule at create time. It shifts only when the fixed 60000-ms period starts,
+// schedule at create time. It shifts only when the fixed
+// ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS period starts,
 // never what the job runs, which tools it may call, or where output is routed, so
 // it is the one dynamic key accepted inside the attested schedule.
 const CONTROLLER_SCHEDULE_DYNAMIC_KEYS = ["anchorMs"];

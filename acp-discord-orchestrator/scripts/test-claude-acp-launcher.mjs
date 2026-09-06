@@ -11,7 +11,10 @@ import {
   main,
   runLauncherEnvironmentPreflight
 } from "./claude-acp-launcher.mjs";
-import { ACP_REPORTING_ERROR_CODES } from "./acp-reporting-contract.mjs";
+import {
+  ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS,
+  ACP_REPORTING_ERROR_CODES
+} from "./acp-reporting-contract.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 import {
   CLAUDE_AUTH_KIND,
@@ -697,7 +700,10 @@ test("substituted public template loads through the real supervisor loader", () 
   // carrying the substituted script, lease token, or a static report.
   assert.equal(loaded.reporting.reportPump.enabled, true);
   assert.equal(loaded.reporting.reportPump.sessionTarget, "isolated");
-  assert.deepEqual(loaded.reporting.reportPump.schedule, { kind: "every", everyMs: 60000 });
+  assert.deepEqual(loaded.reporting.reportPump.schedule, {
+    kind: "every",
+    everyMs: ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS
+  });
   assert.deepEqual(loaded.reporting.reportPump.payload, {
     kind: "script",
     scriptVersion: "acp-report-controller-script.v1",

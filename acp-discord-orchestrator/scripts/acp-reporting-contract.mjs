@@ -37,6 +37,10 @@ const MAX_ROUND_INDEX = 1000;
 // invalid_model bound, and deliveredAt the 40-character lifecycle bound.
 const MAX_MODEL_LENGTH = 256;
 const MAX_DELIVERED_AT_LENGTH = 40;
+// Legacy v1/v2 disabled-watchdog schedule, retained only so validateWatchdog
+// still recognizes already-prepared v1/v2 bundles. It mirrors the transport's
+// REPORT_CADENCE_MS (acp-host-transport.mjs) and is unrelated to the v3
+// report pump, which polls on ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS below.
 const WATCHDOG_EVERY_MS = 600000;
 const MAX_WATCHDOG_TIMEOUT_SECONDS = 60;
 
@@ -1044,8 +1048,9 @@ function validateWatchdog(watchdog, expected) {
 // Validates the acp-reporting-v3 report-pump attestation and returns the
 // validated variable part ({ id }) captured at validation time. The pump
 // supersedes the v1/v2 disabled-snapshot watchdog: it is one ENABLED
-// 60-second polling automation bound to the round and control conversation,
-// while the host transport keeps report eligibility on its 600-second cadence.
+// ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS polling automation bound to the round
+// and control conversation, while the host transport keeps report eligibility
+// on its own REPORT_CADENCE_MS (acp-host-transport.mjs).
 // It attests only the non-secret structural identity of the deterministic
 // script payload — never its token-substituted script or a static report. The
 // public report content is machine-derived per claim from current normalized
