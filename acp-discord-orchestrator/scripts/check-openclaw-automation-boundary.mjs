@@ -2,7 +2,7 @@
 // Installed-boundary evidence probe for the ACP report controller.
 //
 // The checked-in node:test suites run anywhere and therefore mock the
-// model-callable `automations` boundary. Two real behaviours of installed
+// model-callable `automations` boundary. Three real behaviours of installed
 // OpenClaw are invisible to those mocks unless something reads the real thing:
 //
 //   1. `capCronJobToolsAllow` does not persist the requested allowlist order.
@@ -11,12 +11,14 @@
 //      stored array comes back in the creator's final executable tool-surface
 //      order, where core `automations` precedes core `message` and plugin tools
 //      are appended last.
-//   2. `cron.remove` answers with the cron store's own `{ removed: true }`
+//   2. Headless script jobs run as `agent:main:cron:<jobId>:trigger`, not the
+//      agent-turn `cron:<jobId>[:run:<runId>]` shape.
+//   3. `cron.remove` answers with the cron store's own `{ removed: true }`
 //      result, and the cron tool wraps it with `jsonResult(...)`. The
 //      model-visible envelope is therefore `{ content, details: { removed } }`
 //      and carries no top-level `removed` at all.
 //
-// This probe executes both against the installed bundles — not against a
+// This probe executes all three against the installed bundles — not against a
 // transcription of them — and then drives the shipped preparation helper with
 // exactly what they produce. It is deliberately not a node:test file: it needs
 // a local OpenClaw install, so it is run and reported separately from the
@@ -124,6 +126,7 @@ const cronGatewayBundle = findBundle('"cron.remove": async (');
 const cronParamsBundle = findBundle("const CronAddParamsSchema = closedObject({");
 const pacingBundle = findBundle("function normalizeCronJobInput(");
 const readViewBundle = findBundle("function cronJobReadView(");
+const serverCronBundle = findBundle("async function prepareTriggerRuntime(");
 
 function readBundle(file) {
   try {
@@ -138,6 +141,21 @@ const toolsSource = readBundle(toolsBundle);
 const cronGatewaySource = readBundle(cronGatewayBundle);
 const cronParamsSource = readBundle(cronParamsBundle);
 const readViewSource = readBundle(readViewBundle);
+const serverCronSource = readBundle(serverCronBundle);
+
+const cronSessionKeyImport = /import \{ ([A-Za-z_$][\w$]*) as resolveCronAgentSessionKey \} from "(\.\/[^"]+)";/u
+  .exec(serverCronSource);
+if (cronSessionKeyImport === null) failProbe("cron_session_key_import_missing");
+const cronSessionKeyModule = path.join(dist, cronSessionKeyImport[2].slice(2));
+if (!fs.existsSync(cronSessionKeyModule)) failProbe("cron_session_key_module_missing");
+let resolveCronAgentSessionKey;
+try {
+  const imported = await import(pathToFileURL(cronSessionKeyModule).href);
+  resolveCronAgentSessionKey = imported[cronSessionKeyImport[1]];
+  if (typeof resolveCronAgentSessionKey !== "function") failProbe("cron_session_key_export_invalid");
+} catch {
+  failProbe("cron_session_key_import_failed");
+}
 
 function liftUniqueFunction(source, name) {
   const marker = `function ${name}(`;
@@ -342,6 +360,18 @@ check("the shipped arm request still carries the canonical pinned order", () => 
   const call = buildReportControllerArmUpdateCall(JOB_ID, TOKEN);
   assert.deepEqual(call.job.payload.toolsAllow, [...ACP_REPORT_CONTROLLER_TOOLS_ALLOW]);
   return `request order ${call.job.payload.toolsAllow.join(",")}`;
+});
+
+check("installed script jobs run under the :trigger cron session shape", () => {
+  assert.equal(serverCronSource.includes('sessionKey: `cron:${params.jobId}:trigger`,'), true);
+  const sessionKey = resolveCronAgentSessionKey({
+    sessionKey: `cron:${JOB_ID}:trigger`,
+    agentId: "main",
+    mainKey: "main",
+    cfg: {},
+  });
+  assert.equal(sessionKey, `agent:main:cron:${JOB_ID}:trigger`);
+  return sessionKey;
 });
 
 check("the real stored read view arms and reaches bind and start", async () => {
@@ -551,6 +581,21 @@ function makeDependencies(events, overrides = {}) {
   return {
     randomBytes: () => Buffer.alloc(32, 0xab),
     randomUUID: () => UUID,
+    async inspectLifecycleGuard() {
+      return {
+        plugin: {
+          id: "acp-lifecycle-guard",
+          version: "0.6.4",
+          enabled: true,
+          activated: true,
+          status: "loaded",
+          contracts: {
+            tools: ["acp_report_controller"],
+            trustedToolPolicies: ["acp-report-controller-lifecycle-v1"],
+          },
+        },
+      };
+    },
     async createAutomation(call) {
       events.push(["create", call]);
       return { details: { created: true, job: { id: JOB_ID, declarationKey: DECLARATION_KEY, enabled: false } } };

@@ -50,6 +50,7 @@ const MAX_WATCHDOG_TIMEOUT_SECONDS = 60;
 // job. The actual lease token and the substituted scheduler-returned job id
 // exist only in scheduler-private job state.
 export const ACP_REPORT_CONTROLLER_SCRIPT_VERSION = 'acp-report-controller-script.v1';
+export const ACP_REPORT_CONTROLLER_TEMPLATE_SHA256 = '5a75b6eea2b4b190ea42eaab22d7c99252a5aeb1431c99052e7881c7b63581b3';
 export const ACP_REPORT_CONTROLLER_SCRIPT_SHA256 = '1dd0ccd2d2bd25ef25c002672a2b6ac4ccf7721b2b9e6304bdf4ddd8ce8ca6f2';
 export const ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS = 60000;
 export const ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS = 60;
