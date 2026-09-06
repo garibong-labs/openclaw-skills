@@ -1,5 +1,6 @@
 // Skill-side report pump imported in-process by the durable controller plugin.
-// One enabled every-600000-ms OpenClaw script automation per exact ACP handle
+// One enabled OpenClaw script automation per exact ACP handle, polling every
+// ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS (acp-reporting-contract.mjs),
 // invokes the controller; each controller tick calls this entry point to claim a
 // fresh report obligation from the host transport's closed `claim-report`
 // action, derives the canonical public message from that live claim (never
@@ -50,7 +51,10 @@ const PUMP_ERROR_EXIT = 22;
 const SAFE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const DECIMAL_ID = /^[0-9]{1,32}$/;
 const KST_OFFSET_MS = 9 * 3600000;
-const CADENCE_MINUTES = REPORT_CADENCE_MS / 60000;
+// Milliseconds per rendered minute; unrelated to the controller poll interval,
+// which happens to share the same numeric value.
+const MS_PER_MINUTE = 60000;
+const CADENCE_MINUTES = REPORT_CADENCE_MS / MS_PER_MINUTE;
 
 // Canonical bounded fallback slot content used when the owner-maintained
 // structured snapshot omits a slot. These are fixed neutral values, not a
@@ -243,7 +247,7 @@ function buildClaimedReport(claim, snapshot, nowMs) {
       status: claim.terminalStatus,
       elapsed: claim.elapsedMs === null
         ? "측정 불가"
-        : `${Math.floor(claim.elapsedMs / 60000)}분`,
+        : `${Math.floor(claim.elapsedMs / MS_PER_MINUTE)}분`,
       summary: slots.summary,
       verification: slots.verification,
       result: slots.result,
@@ -269,7 +273,7 @@ function buildClaimedReport(claim, snapshot, nowMs) {
     // maximum (the whole elapsed run), never a fabricated fresh instant.
     lastAcpActivityMinutesAgo: activityMs === null
       ? totalMinutes
-      : clampMinutes(Math.floor((nowMs - activityMs) / 60000), totalMinutes),
+      : clampMinutes(Math.floor((nowMs - activityMs) / MS_PER_MINUTE), totalMinutes),
     newResultDelta,
     ...(newResultDelta > 0 ? { newResult: snapshot.newResult } : {}),
     executionState: snapshot.executionState ?? DEFAULT_INTERMEDIATE_SLOTS.executionState,

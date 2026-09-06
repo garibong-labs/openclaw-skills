@@ -420,6 +420,10 @@ test('watchdog invariants are enforced exactly', () => {
   const badSchedule = buildReporting();
   badSchedule.watchdog.schedule.everyMs = 300000;
   expectRejected(badSchedule, 'invalid_reporting_watchdog_schedule');
+  // The v3 controller poll interval is never a valid legacy watchdog period.
+  const pollSchedule = buildReporting();
+  pollSchedule.watchdog.schedule.everyMs = 60000;
+  expectRejected(pollSchedule, 'invalid_reporting_watchdog_schedule');
 
   const badChannel = buildReporting();
   badChannel.watchdog.delivery.channel = 'slack';
@@ -1536,7 +1540,7 @@ function buildReportingV3({
       roundIndex,
       enabled: true,
       sessionTarget: 'isolated',
-      schedule: { kind: 'every', everyMs: 600000 },
+      schedule: { kind: 'every', everyMs: 60000 },
       payload: {
         kind: 'script',
         scriptVersion: 'acp-report-controller-script.v1',
@@ -1567,7 +1571,7 @@ test('valid acp-reporting-v3 bundle passes for claude and codex and normalizes t
   const codex = buildReportingV3({ agent: 'codex', model: CODEX_CONTEXT.model });
   const codexNormalized = validateAcpReportingContract(codex, CODEX_CONTEXT);
   assert.equal(codexNormalized.agent, 'codex');
-  assert.equal(codexNormalized.reportPump.schedule.everyMs, 600000);
+  assert.equal(codexNormalized.reportPump.schedule.everyMs, 60000);
 });
 
 test('acp-reporting-v3 requires the agent attestation to equal the canonical config agent', () => {
@@ -1589,7 +1593,7 @@ test('acp-reporting-v3 rejects a disabled, mis-scheduled, fallback-delivered, or
     'invalid_reporting_report_pump_round'
   );
   expectRejected(
-    buildReportingV3({ pump: { schedule: { kind: 'every', everyMs: 300000 } } }),
+    buildReportingV3({ pump: { schedule: { kind: 'every', everyMs: 600000 } } }),
     'invalid_reporting_report_pump_schedule'
   );
   expectRejected(

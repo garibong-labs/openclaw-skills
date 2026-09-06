@@ -11,6 +11,7 @@
 
 import {
   ACP_AGENT_PRESENTATIONS,
+  ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS,
   ACP_REPORTING_SCHEMA_VERSION_V2,
   ACP_REPORTING_SCHEMA_VERSION_V3,
   ACP_REPORT_BEGIN_DELIMITER,
@@ -202,7 +203,7 @@ export function buildValidReporting({
         roundIndex,
         enabled: true,
         sessionTarget: "isolated",
-        schedule: { kind: "every", everyMs: 600000 },
+        schedule: { kind: "every", everyMs: ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS },
         payload: {
           kind: "script",
           scriptVersion: "acp-report-controller-script.v1",

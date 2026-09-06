@@ -37,6 +37,10 @@ const MAX_ROUND_INDEX = 1000;
 // invalid_model bound, and deliveredAt the 40-character lifecycle bound.
 const MAX_MODEL_LENGTH = 256;
 const MAX_DELIVERED_AT_LENGTH = 40;
+// Legacy v1/v2 disabled-watchdog schedule, retained only so validateWatchdog
+// still recognizes already-prepared v1/v2 bundles. It mirrors the transport's
+// REPORT_CADENCE_MS (acp-host-transport.mjs) and is unrelated to the v3
+// report pump, which polls on ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS below.
 const WATCHDOG_EVERY_MS = 600000;
 const MAX_WATCHDOG_TIMEOUT_SECONDS = 60;
 
@@ -47,6 +51,7 @@ const MAX_WATCHDOG_TIMEOUT_SECONDS = 60;
 // exist only in scheduler-private job state.
 export const ACP_REPORT_CONTROLLER_SCRIPT_VERSION = 'acp-report-controller-script.v1';
 export const ACP_REPORT_CONTROLLER_SCRIPT_SHA256 = '1dd0ccd2d2bd25ef25c002672a2b6ac4ccf7721b2b9e6304bdf4ddd8ce8ca6f2';
+export const ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS = 60000;
 export const ACP_REPORT_CONTROLLER_TIMEOUT_SECONDS = 60;
 export const ACP_REPORT_CONTROLLER_TOOL_BUDGET = 5;
 export const ACP_REPORT_CONTROLLER_TOOLS_ALLOW = Object.freeze([
@@ -1043,8 +1048,10 @@ function validateWatchdog(watchdog, expected) {
 // Validates the acp-reporting-v3 report-pump attestation and returns the
 // validated variable part ({ id }) captured at validation time. The pump
 // supersedes the v1/v2 disabled-snapshot watchdog: it is one ENABLED
-// 600-second automation bound to the round and the control conversation, and
-// it attests only the non-secret structural identity of the deterministic
+// ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS polling automation bound to the round
+// and control conversation, while the host transport keeps report eligibility
+// on its own REPORT_CADENCE_MS (acp-host-transport.mjs).
+// It attests only the non-secret structural identity of the deterministic
 // script payload — never its token-substituted script or a static report. The
 // public report content is machine-derived per claim from current normalized
 // evidence at the host transport's closed claim-report action. The attested
@@ -1082,8 +1089,8 @@ function validateReportPump(reportPump, expected) {
     fail('invalid_reporting_report_pump_schedule', 'reportPump.schedule must be a plain object');
   }
   assertExactKeys(schedule, ['kind', 'everyMs'], 'invalid_reporting_report_pump_schedule', 'reportPump.schedule');
-  if (schedule.kind !== 'every' || schedule.everyMs !== WATCHDOG_EVERY_MS) {
-    fail('invalid_reporting_report_pump_schedule', `reportPump.schedule must be exactly { kind: "every", everyMs: ${WATCHDOG_EVERY_MS} }`);
+  if (schedule.kind !== 'every' || schedule.everyMs !== ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS) {
+    fail('invalid_reporting_report_pump_schedule', `reportPump.schedule must be exactly { kind: "every", everyMs: ${ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS} }`);
   }
   const { delivery } = reportPump;
   if (!isPlainObject(delivery)) {
@@ -1291,7 +1298,7 @@ export function validateAcpReportingContract(reporting, context) {
         roundIndex,
         enabled: true,
         sessionTarget: 'isolated',
-        schedule: { kind: 'every', everyMs: WATCHDOG_EVERY_MS },
+        schedule: { kind: 'every', everyMs: ACP_REPORT_CONTROLLER_POLL_INTERVAL_MS },
         payload: {
           kind: 'script',
           scriptVersion: ACP_REPORT_CONTROLLER_SCRIPT_VERSION,
