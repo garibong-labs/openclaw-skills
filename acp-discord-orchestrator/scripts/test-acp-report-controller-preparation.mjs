@@ -24,7 +24,7 @@ import {
 } from "./acp-reporting-contract.mjs";
 import { buildValidReporting } from "./acp-reporting-test-fixture.mjs";
 
-const PINNED_PLUGIN_COMMIT = "0fd07ca001d9258db1d8dcb594daf04762f11cfe";
+const PINNED_PLUGIN_COMMIT = "ee75f2585c1add63ff15e08a2de810e80fd9f910";
 const TEMPLATE_SHA256 = "5a75b6eea2b4b190ea42eaab22d7c99252a5aeb1431c99052e7881c7b63581b3";
 const PINNED_SCRIPT = `const leaseToken = "LEASE_TOKEN";
 const jobId = "JOB_ID";
