@@ -40,13 +40,13 @@ Handles TinyMCE body insertion, category and tag setting, inline image and banne
 
 #### 🛰️ [acp-discord-orchestrator](./acp-discord-orchestrator) — strict profile, parked
 
-Implements the **Guarded foreground acpx** strict profile: one direct ACPX turn under an owned foreground supervisor, exact tmux process tracking, owner-bound controller leases, receipt-gated Discord progress, and terminal reconciliation. It supports canonical `claude` (`Claude Code`) and `codex` (`Codex`) identities and rejects spoofed agent/model/reporting inputs.
+Implements the **Guarded foreground ACPX** strict profile: one direct `acpx` turn under an owned foreground supervisor, exact tmux process tracking, owner-bound controller leases, receipt-gated Discord progress, and terminal reconciliation. It supports canonical `claude` (`Claude Code`) and `codex` (`Codex`) identities and rejects spoofed agent/model/reporting inputs.
 
-This skill is **not required** for OpenClaw-managed ACP sessions (`sessions_spawn` with `runtime: "acp"`) or for ordinary Direct acpx CLI fallback. Those routes should not load `acp-lifecycle-guard`, create controller jobs, or use this skill's tmux transport. The strict profile remains preserved for tasks that explicitly require exact delivery receipts, restart recovery, and process-ownership proof.
+This skill is **not required** for OpenClaw-managed ACP sessions (`sessions_spawn` with `runtime: "acp"`) or for ordinary Direct `acpx` CLI fallback. Those routes should not load `acp-lifecycle-guard`, create controller jobs, or use this skill's tmux transport. The strict profile remains preserved for tasks that explicitly require exact delivery receipts, restart recovery, and process-ownership proof.
 
 **Current status:** Parked/experimental. The controller registration path is not production-ready on the current OpenClaw host integration because owner admission can fail with `acp_lifecycle_guard.controller.caller_invalid`. Do not use it as an automatic fallback.
 
-**Use when:** The operator explicitly requests the strict Guarded foreground acpx contract and its known blocker has been resolved and verified. The normative behavior remains in [references/runtime-contract.md](./acp-discord-orchestrator/references/runtime-contract.md).
+**Use when:** The operator explicitly requests the strict Guarded foreground ACPX contract and its known blocker has been resolved and verified. The normative behavior remains in [references/runtime-contract.md](./acp-discord-orchestrator/references/runtime-contract.md).
 
 ---
 
