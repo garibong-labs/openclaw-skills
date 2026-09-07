@@ -38,13 +38,15 @@ Handles TinyMCE body insertion, category and tag setting, inline image and banne
 
 ---
 
-#### 🛰️ [acp-discord-orchestrator](./acp-discord-orchestrator)
+#### 🛰️ [acp-discord-orchestrator](./acp-discord-orchestrator) — strict profile, parked
 
-Runs each agent-started ACP task as a single foreground ACPX turn under a supervisor that emits newline-delimited JSON events (`started`, `activity`, `progress`, `terminal`) back to the current Discord conversation. Agent-neutral within a closed supported set: ACP agent `claude` (presented publicly as `Claude Code`, with a canonical setup-token launcher) and ACP agent `codex` (presented publicly as `Codex`); the public harness label is bound to the canonical config agent and cannot be chosen or spoofed by the caller.
+Implements the **Guarded foreground acpx** strict profile: one direct ACPX turn under an owned foreground supervisor, exact tmux process tracking, owner-bound controller leases, receipt-gated Discord progress, and terminal reconciliation. It supports canonical `claude` (`Claude Code`) and `codex` (`Codex`) identities and rejects spoofed agent/model/reporting inputs.
 
-Fails closed on a missing or stale start receipt, an unsupported or non-canonical agent (rejected first, before any unrelated file access), a reporting bundle that does not match the exact public templates, unmet environment contracts — including an implicit agent-neutral process-integrity baseline that forbids `NODE_OPTIONS`-style injection, dynamic-linker preload, and proxy selectors for every supported agent — incompatible ACPX capabilities, detached/background execution, or tool kinds outside the allowlist. Keeps `completed`, `cancelled`, and `failed` as distinct exit codes and never collapses them into success. The normative behavior is spelled out in [references/runtime-contract.md](./acp-discord-orchestrator/references/runtime-contract.md).
+This skill is **not required** for OpenClaw-managed ACP sessions (`sessions_spawn` with `runtime: "acp"`) or for ordinary Direct acpx CLI fallback. Those routes should not load `acp-lifecycle-guard`, create controller jobs, or use this skill's tmux transport. The strict profile remains preserved for tasks that explicitly require exact delivery receipts, restart recovery, and process-ownership proof.
 
-**Use when:** An agent needs to delegate work to ACP from Discord with observable, bounded completion instead of an untracked spawn or child thread.
+**Current status:** Parked/experimental. The controller registration path is not production-ready on the current OpenClaw host integration because owner admission can fail with `acp_lifecycle_guard.controller.caller_invalid`. Do not use it as an automatic fallback.
+
+**Use when:** The operator explicitly requests the strict Guarded foreground acpx contract and its known blocker has been resolved and verified. The normative behavior remains in [references/runtime-contract.md](./acp-discord-orchestrator/references/runtime-contract.md).
 
 ---
 
