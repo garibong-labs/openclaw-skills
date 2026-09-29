@@ -1,6 +1,14 @@
 # Changelog
 
 ## Unreleased
+- **daum-trends 확정 500/40009 plain-link 폴백** (2026-09-29 발행 abort 대응)
+  - 두 원본 OG 시도가 **모두 안전 연관된 HTTP 500 + payload `code=40009`로 확정**되고, 적격 v.daum.net 다음 기사 후보가 전혀 없고, caller가 명시적으로 켠 경우(`--template daum-trends`이고 custom OG validator 미설정)에만, 실패한 placeholder의 출처를 카드 대신 명시적 일반 하이퍼링크로 유지 (원본 인코딩 URL 그대로 `href`+앵커 텍스트, `_blank`, `noopener noreferrer`, `data-og-plain-link` 내구 마킹)
+  - 원본 URL은 보수적 safe external http(s) 계약을 통과해야 함 — 빈/비정상 값, 비 http(s) 스킴, userinfo, localhost/`.local`/dotless 내부 이름, loopback/private/link-local/reserved/multicast literal IP는 폴백 금지 (fail-closed 유지)
+  - **깨진 OG는 절대 카드로 계산하지 않음**: `render_og_cards()` 카드 수 게이트는 실제 카드 수를 `placeholder 수 − plain link 수`와 비교하고, 에디터에 실제 마킹된 plain link 수가 폴백 수와 일치하는지도 검증. plain link는 `found`를 만족시키거나 `ogCards`를 올리지 않음
+  - **strict custom OG validator(`TISTORY_OG_VALIDATOR`)가 켜져 있으면 이 폴백은 비활성화** — draft/public 카드 검증의 엄격한 의미론 유지. 적격 후보가 있으면 기존대로 후보 1회 시도 후 실패 시 fail-closed(silent 다운그레이드 금지). generic `found=false`, 미관측/미파싱 응답, 500 아닌 상태, 40009 아닌 코드, 1회 확정+1회 불명, 확정 40002 DCInside 짝 폴백, 비 daum-trends 템플릿은 전부 기존 동작 그대로
+  - JS helper에 `convertPendingToPlainLink(url)`/`verifyOGPlainLink(url)` 추가 (`tistory-editor-helpers.js`/`tistory-publish.js` 양쪽 동일 소스, parity 테스트로 고정). 변환/검증 실패 시 발행 전 abort. helper preflight(`ensure_og_helpers`)는 이 두 함수를 폴백 opt-in일 때만 요구 — 비 opt-in 경로(mk-review, custom validator 등)는 구버전 helper 표면으로도 기존대로 동작하고, opt-in인데 주입 후에도 두 함수가 없으면 발행 전 abort. `cleanupOGResiduals()`는 마킹된 plain link를 (mk.co.kr 호스트 포함) 보존하고 `plainLinks` 수를 별도 보고하며, 마킹 없는 pending/naked 잔여물은 기존대로 제거
+  - 관측성: `confirmed 500/code=40009 -> degraded to plain source link` 로그(원본 URL/phase 포함)와 최종 발행 결과 JSON의 `ogPlainLinkFallbacks`(`url`/`reason`/`phase`) — OG 카드로 라벨링하지 않음. Step 5와 unexpected-navigation 복구 경로는 같은 helper/적격성/집계 경로 공유
+  - 보존된 2026-09-29 incident payload(인코딩 Wikipedia URL + 두 시도 기록)에서 파생한 repo 내 fixture와 replay/negative regression 테스트 추가
 - **Daum Trends 발행 탭 누적 방지**
   - `daum-trends`가 발행과 기존 post-publish 검증을 모두 성공한 뒤, 그 실행이 생성한 정확한 CDP page target만 최대 5초로 best-effort 종료
   - 다른 탭을 URL로 추측하거나 실패 경로에서 정리하지 않으며, target 식별·종료 실패는 성공 결과를 바꾸지 않음

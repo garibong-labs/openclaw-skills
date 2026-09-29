@@ -152,7 +152,7 @@ TMP_STDERR="$(mktemp -t tistory-publish-stderr.XXXXXX)"
 
 set +e
 PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" "$REQUIRE_PUBLIC_IMAGE_FIGURES" "$TEMPLATE" "$BANNER_ALT" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
-import sys, json, time, os, re, subprocess, urllib.request, urllib.error
+import sys, json, time, os, re, subprocess, urllib.request, urllib.error, ipaddress
 import html as htmlmod
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
@@ -335,6 +335,14 @@ def run_og_gate(mode, *args):
 # 500/40009로 확정된 경우에만 정확히 1회 시도한다. 후보가 없거나 그 1회가
 # 실패하면 기존 fail-closed abort를 유지한다. 확정 40002 DCInside 짝 폴백은
 # 그대로이며 Daum이나 다른 호스트로 넓히지 않는다.
+#
+# 2026-09-29 추가: daum-trends 전용 plain-link 폴백. 두 원본 시도가 모두
+# HTTP 500 + payload code=40009로 확정되고, 적격 Daum 다음 기사 후보가 전혀
+# 없고, caller가 allow_plain_link_fallback=True로 명시적으로 켠 경우에만
+# (TEMPLATE == daum-trends 이고 custom OG validator가 꺼진 경우), 보수적으로
+# 안전한 외부 http(s) 원본 URL을 카드 대신 일반 출처 하이퍼링크로 유지한다.
+# 후보가 있으면 기존대로 후보 1회 시도 후 실패 시 fail-closed. plain link는
+# 절대 카드 성공으로 계산하지 않으며, generic/미확정 실패 게이트는 그대로다.
 
 def dcinside_paired_og_url(url):
     """Strict DCInside mobile<->desktop post-URL pair; None for anything else.
@@ -481,6 +489,50 @@ def select_daum_fallback_url(current_url, candidate_urls):
     return None
 
 
+def safe_plain_link_source_url(url):
+    """Conservative safe external http(s) URL gate for the daum-trends
+    plain-link fallback. Returns the stripped verbatim URL (normalized/encoded
+    form preserved, never rewritten) or None (fail-closed).
+
+    Rejected: empty/malformed values, non-http(s) schemes, userinfo,
+    localhost/.localhost/.local/dotless internal names, and literal IPs that
+    are not global (loopback/private/link-local/reserved/multicast/etc.)."""
+    text = str(url or '').strip()
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return None
+    if parts.scheme not in ('http', 'https'):
+        return None
+    if '@' in parts.netloc:
+        return None
+    try:
+        hostname = parts.hostname
+    except ValueError:
+        return None
+    host = (hostname or '').strip('.').lower()
+    if not host:
+        return None
+    if host == 'localhost' or host.endswith('.localhost'):
+        return None
+    if host == 'local' or host.endswith('.local'):
+        return None
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        # is_global이 loopback/private/link-local/reserved/unspecified를 거르고,
+        # multicast는 일부 범위가 global로 분류되므로 별도로 거른다.
+        if not ip.is_global or ip.is_multicast:
+            return None
+    elif '.' not in host:
+        return None
+    return text
+
+
 def normalize_og_entries(raw_entries):
     """Fail-closed placeholder entries for render_og_cards: each entry keeps
     its placeholder URL (even when unusable, so the mandatory-card gate still
@@ -510,13 +562,22 @@ def og_backoff_delay_s(attempt):
     return max(0.0, min(base * (2 ** max(0, attempt - 1)), cap))
 
 
-def ensure_og_helpers(page):
+def ensure_og_helpers(page, require_plain_link_helpers=False):
+    # 기본 계약은 기존 카드 플로우가 쓰는 4개 함수만 요구한다. plain-link
+    # 폴백 함수 2개는 caller가 폴백을 켠 경우에만 필수 — 그렇지 않은
+    # (mk-review, custom validator, 비 opt-in) 경로는 구버전 helper 표면도
+    # 그대로 통과해야 한다.
     check = (
         "typeof prepareOGPlaceholder === 'function'"
         " && typeof prepareOGRetry === 'function'"
         " && typeof getOGCardStatus === 'function'"
         " && typeof cleanupOGResiduals === 'function'"
     )
+    if require_plain_link_helpers:
+        check += (
+            " && typeof convertPendingToPlainLink === 'function'"
+            " && typeof verifyOGPlainLink === 'function'"
+        )
     try:
         ready = page.evaluate(check)
     except Exception:
@@ -570,7 +631,7 @@ def attempt_og_render(page, target_url, min_card_count):
     }
 
 
-def render_og_card_with_fallback(page, url, index, phase, fallback_urls=None):
+def render_og_card_with_fallback(page, url, index, phase, fallback_urls=None, allow_plain_link_fallback=False):
     prefix = '' if phase == 'step5' else f'{phase} '
     attempts = []
 
@@ -658,32 +719,84 @@ def render_og_card_with_fallback(page, url, index, phase, fallback_urls=None):
             log(f"  - {prefix}OG [{url[:40]}...] next-source fallback: {json.dumps(attempts[-1], ensure_ascii=False)}")
             if outcome['found']:
                 return next_daum_url
+        elif allow_plain_link_fallback and safe_plain_link_source_url(url):
+            # plain-link 폴백: 확정 500/40009 + 적격 Daum 후보 없음 + caller의
+            # 명시적 opt-in + 보수적 safe external URL일 때만. 실패한 pending
+            # 문단을 일반 출처 링크로 변환하고 검증까지 성공해야 계속 진행한다.
+            # 카드 성공(URL 반환)과 절대 섞이지 않는 별도 구조화 결과를 반환.
+            convert_result = page.evaluate(
+                "(url) => typeof convertPendingToPlainLink === 'function' ? convertPendingToPlainLink(url) : {success: false, error: 'convertPendingToPlainLink unavailable'}",
+                url,
+            )
+            if not (isinstance(convert_result, dict) and convert_result.get('success')):
+                fail(f"{prefix}OG plain-link conversion failed before publish: {json.dumps({'url': url, 'result': convert_result, 'attempts': attempts}, ensure_ascii=False)}")
+            verify_result = page.evaluate(
+                "(url) => typeof verifyOGPlainLink === 'function' ? verifyOGPlainLink(url) : {found: false, error: 'verifyOGPlainLink unavailable'}",
+                url,
+            )
+            if not (isinstance(verify_result, dict) and verify_result.get('found')):
+                fail(f"{prefix}OG plain-link verification failed before publish: {json.dumps({'url': url, 'result': verify_result, 'attempts': attempts}, ensure_ascii=False)}")
+            log(f"  - {prefix}OG [{url[:40]}...] confirmed 500/code=40009 -> degraded to plain source link (phase={phase}, url={url})")
+            return {
+                'plainLinkFallback': True,
+                'url': url,
+                'reason': 'confirmed scrap 500/code=40009 twice, no eligible Daum candidate',
+                'phase': phase,
+            }
         else:
             log(f"  - {prefix}OG [{url[:40]}...] scrap 500/code=40009 confirmed twice but no eligible next Daum candidate; failing closed")
 
     fail(f"{prefix}OG card render failed before publish: {json.dumps({'url': url, 'attempts': attempts}, ensure_ascii=False)}")
 
 
-def render_og_cards(page, og_entries, phase):
+def render_og_cards(page, og_entries, phase, allow_plain_link_fallback=False):
     """Shared OG-card flow for Step 5 and the unexpected-navigation recovery
     path so the two cannot drift. Entries carry each placeholder's own ordered
-    Daum fallback candidates; plain URL strings mean no candidates."""
+    Daum fallback candidates; plain URL strings mean no candidates.
+
+    Returns a summary dict: real card count plus any plain-link fallbacks.
+    A plain link is never counted as a card: the cleanup gate compares the
+    real OG-card count with len(entries) minus the plain-link count, and the
+    marked plain-link count in the editor must equal the fallback count."""
+    summary = {'phase': phase, 'ogCards': 0, 'plainLinkFallbacks': []}
     if not og_entries:
-        return
+        return summary
     prefix = '' if phase == 'step5' else f'{phase} '
-    ensure_og_helpers(page)
-    for index, entry in enumerate(og_entries, start=1):
+    ensure_og_helpers(page, require_plain_link_helpers=allow_plain_link_fallback)
+    card_count = 0
+    for entry in og_entries:
         if isinstance(entry, dict):
             url = entry.get('url') or ''
             fallback_urls = entry.get('fallbackUrls') or []
         else:
             url = entry
             fallback_urls = []
-        render_og_card_with_fallback(page, url, index, phase, fallback_urls)
+        outcome = render_og_card_with_fallback(
+            page, url, card_count + 1, phase, fallback_urls,
+            allow_plain_link_fallback=allow_plain_link_fallback,
+        )
+        if isinstance(outcome, dict) and outcome.get('plainLinkFallback'):
+            summary['plainLinkFallbacks'].append({
+                'url': outcome.get('url'),
+                'reason': outcome.get('reason'),
+                'phase': phase,
+            })
+        else:
+            card_count += 1
+    plain_link_count = len(summary['plainLinkFallbacks'])
+    expected_cards = len(og_entries) - plain_link_count
     cleanup_result = page.evaluate("typeof cleanupOGResiduals === 'function' ? cleanupOGResiduals() : null")
     log(f"  - {prefix}OG cleanup result: {cleanup_result}")
-    if isinstance(cleanup_result, dict) and cleanup_result.get('ogCards') != len(og_entries):
-        fail(f"{prefix}OG card count mismatch before publish: expected {len(og_entries)}, got {cleanup_result.get('ogCards')}")
+    if isinstance(cleanup_result, dict):
+        if cleanup_result.get('ogCards') != expected_cards:
+            fail(f"{prefix}OG card count mismatch before publish: expected {expected_cards}, got {cleanup_result.get('ogCards')}")
+        marked_plain_links = cleanup_result.get('plainLinks') or 0
+        if marked_plain_links != plain_link_count:
+            fail(f"{prefix}OG plain-link count mismatch before publish: expected {plain_link_count}, got {marked_plain_links}")
+    elif plain_link_count:
+        fail(f"{prefix}OG plain-link count unverifiable before publish: cleanup result {cleanup_result}")
+    summary['ogCards'] = expected_cards
+    return summary
 
 
 def write_debug_artifacts(page, prefix):
@@ -1845,7 +1958,9 @@ with sync_playwright() as p:
         " : (typeof getOGPlaceholders === 'function' ? getOGPlaceholders() : [])"
     ))
     log(f"  - OG URLs: {len(og_entries)}")
-    render_og_cards(page, og_entries, 'step5')
+    # plain-link 폴백은 daum-trends가 명시적으로 켤 때만, 그리고 strict custom
+    # OG validator(should_run_og_gate)가 꺼진 경우에만 허용한다.
+    og_render_summary = render_og_cards(page, og_entries, 'step5', allow_plain_link_fallback=(TEMPLATE == 'daum-trends' and not should_run_og_gate()))
     log("Step 5: 완료")
 
     # ── Step 6: 대표이미지 ──
@@ -1937,9 +2052,10 @@ with sync_playwright() as p:
         }}""", body_html)
         time.sleep(1)
         # 복구 경로도 Step 5와 동일한 candidate-aware render_og_cards 헬퍼와
-        # 같은 per-placeholder 후보를 사용한다 (드리프트 금지).
+        # 같은 per-placeholder 후보, 같은 plain-link 폴백 게이트를 사용한다
+        # (드리프트 금지). 최신 summary가 최종 결과 JSON에 반영되도록 덮어쓴다.
         # goto로 helper JS가 사라졌을 수 있으므로 헬퍼가 재주입을 보장한다.
-        render_og_cards(page, og_entries, 'recovery')
+        og_render_summary = render_og_cards(page, og_entries, 'recovery', allow_plain_link_fallback=(TEMPLATE == 'daum-trends' and not should_run_og_gate()))
 
     log("Step 7.5: 중복 제목 preflight")
     assert_no_duplicate_title_before_publish(ctx0, final_title)
@@ -2299,6 +2415,9 @@ with sync_playwright() as p:
         result["publicBaseUrl"] = PUBLIC_BASE_URL
     if gap_check:
         result["gapCheck"] = gap_check
+    # plain-link 폴백은 OG 카드로 라벨링하지 않고 별도 키로 정확한 URL/사유/phase를 노출한다.
+    if og_render_summary and og_render_summary.get('plainLinkFallbacks'):
+        result["ogPlainLinkFallbacks"] = og_render_summary['plainLinkFallbacks']
     if draft_og_gate:
         result["draftOgValidation"] = {"success": True, "count": draft_og_gate.get('count')}
     if public_og_gate:

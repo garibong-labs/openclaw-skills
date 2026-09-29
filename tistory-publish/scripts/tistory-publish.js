@@ -582,6 +582,80 @@ function prepareOGRetry(fromUrl, toUrl) {
   return { success: true, fromUrl, toUrl, editorFocused: true };
 }
 
+/**
+ * convertPendingToPlainLink(url) — 확정 실패(두 시도 모두 HTTP 500 + scrap
+ * code 40009, 적격 Daum 후보 없음)한 OG pending 문단을 일반 출처 하이퍼링크로
+ * 변환한다. daum-trends bounded 폴백 전용 — publish 엔진이 확정/적격성 판정을
+ * 끝낸 뒤에만 호출한다. 카드가 렌더된 것처럼 위장하지 않는다.
+ *
+ * prepareOGRetry와 같은 규칙으로 텍스트가 남은 pending 문단을 재사용하고 빈
+ * Enter-split 복제는 제거한다. 변환 후 data-og-url-pending을 제거하고 내구성
+ * marker data-og-plain-link를 남겨 cleanupOGResiduals가 보존하게 한다.
+ * (tistory-editor-helpers.js / tistory-publish.js 양쪽 동일 소스 유지)
+ */
+function convertPendingToPlainLink(url) {
+  const editor = (typeof tinymce !== 'undefined' && tinymce && tinymce.activeEditor) ? tinymce.activeEditor : null;
+  if (!editor || !editor.getBody) return { success: false, error: 'tinymce unavailable' };
+  if (!url || typeof url !== 'string') return { success: false, error: 'url required' };
+  const body = editor.getBody();
+  const pendings = Array.from(body.querySelectorAll(`[data-og-url-pending="${url}"]`));
+  const pending = pendings.find(p => (p.textContent || '').trim()) || pendings[0];
+  if (!pending) return { success: false, error: `pending paragraph not found for ${url}` };
+  pendings.forEach(p => { if (p !== pending) p.remove(); });
+
+  // 원본(정규화/인코딩된) URL을 그대로 href와 앵커 텍스트로 사용한다 —
+  // 눈에 보이는 명확한 출처 표기이며 다른 출처로 대체하지 않는다.
+  const anchor = editor.dom.create('a', {
+    href: url,
+    target: '_blank',
+    rel: 'noopener noreferrer',
+  });
+  anchor.textContent = url;
+  pending.textContent = '';
+  pending.appendChild(anchor);
+  pending.removeAttribute('data-og-url-pending');
+  pending.setAttribute('data-og-plain-link', url);
+
+  editor.setDirty(true);
+  editor.save();
+
+  return {
+    success: true,
+    url,
+    href: anchor.getAttribute('href'),
+    marker: 'data-og-plain-link',
+    duplicatesRemoved: pendings.length - 1,
+  };
+}
+
+/**
+ * verifyOGPlainLink(url) — convertPendingToPlainLink 결과를 재조회로 검증.
+ * marker 문단이 정확히 1개이고, 그 안의 앵커가 href === url, target=_blank,
+ * rel에 noopener/noreferrer를 모두 갖고, pending 속성이 사라졌을 때만
+ * found=true. publish 엔진은 found=false면 발행 전에 중단한다.
+ * (tistory-editor-helpers.js / tistory-publish.js 양쪽 동일 소스 유지)
+ */
+function verifyOGPlainLink(url) {
+  const editor = (typeof tinymce !== 'undefined' && tinymce && tinymce.activeEditor) ? tinymce.activeEditor : null;
+  if (!editor || !editor.getBody) return { found: false, error: 'tinymce unavailable' };
+  const nodes = Array.from(editor.getBody().querySelectorAll(`[data-og-plain-link="${url}"]`));
+  const summary = { found: false, markerCount: nodes.length, href: null, target: null, rel: null };
+  if (nodes.length !== 1) return summary;
+  const node = nodes[0];
+  const anchor = node.querySelector && node.querySelector('a[href]');
+  if (!anchor) return summary;
+  summary.href = anchor.getAttribute('href');
+  summary.target = anchor.getAttribute('target');
+  summary.rel = anchor.getAttribute('rel') || '';
+  const pendingGone = !(node.getAttribute && node.getAttribute('data-og-url-pending'));
+  summary.found = summary.href === url
+    && summary.target === '_blank'
+    && summary.rel.includes('noopener')
+    && summary.rel.includes('noreferrer')
+    && pendingGone;
+  return summary;
+}
+
 function normalizeOGUrl(url) {
   if (!url || typeof url !== 'string') return '';
   try {
@@ -779,9 +853,12 @@ function cleanupOGResiduals() {
   });
 
   // 2. 본문에 남은 naked URL 텍스트 제거 (mk.co.kr 패턴)
+  // 단, data-og-plain-link로 마킹된 확정 폴백 출처 링크 문단은 어떤 호스트든
+  // (mk.co.kr 포함) 보존한다 — 마킹 없는 pending/naked 잔여물만 제거 대상.
   let rawUrlsRemoved = 0;
   const allPs = body.querySelectorAll('p');
   allPs.forEach(p => {
+    if (p.getAttribute && p.getAttribute('data-og-plain-link')) return;
     const text = p.textContent.trim();
     if (/^https?:\/\/[^\s]+$/.test(text) && text.includes('mk.co.kr')) {
       p.remove();
@@ -789,13 +866,14 @@ function cleanupOGResiduals() {
     }
   });
 
-  // 3. OG 카드 수 확인
+  // 3. OG 카드 수 확인 + 마킹된 plain-link 출처 문단 수 (카드와 별도 집계)
   const ogCards = getOGCardElements(body).length;
+  const plainLinks = body.querySelectorAll('[data-og-plain-link]').length;
 
   editor.setDirty(true);
   editor.save();
 
-  return { ogCards, pendingRemoved, rawUrlsRemoved };
+  return { ogCards, plainLinks, pendingRemoved, rawUrlsRemoved };
 }
 
 function insertOGCard(url) {
