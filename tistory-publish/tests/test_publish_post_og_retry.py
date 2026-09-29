@@ -429,8 +429,14 @@ class OGRetryFallbackTests(unittest.TestCase):
 
     def test_step5_and_recovery_use_the_same_render_helper(self):
         source = SCRIPT_PATH.read_text(encoding="utf-8")
-        self.assertIn("render_og_cards(page, og_entries, 'step5')", source)
-        self.assertIn("render_og_cards(page, og_entries, 'recovery')", source)
+        self.assertIn(
+            "render_og_cards(page, og_entries, 'step5', allow_plain_link_fallback=(TEMPLATE == 'daum-trends' and not should_run_og_gate()))",
+            source,
+        )
+        self.assertIn(
+            "render_og_cards(page, og_entries, 'recovery', allow_plain_link_fallback=(TEMPLATE == 'daum-trends' and not should_run_og_gate()))",
+            source,
+        )
         embedded = re.search(r"<< 'PYTHON_SCRIPT'\n(.*?)\nPYTHON_SCRIPT\n", source, re.DOTALL).group(1)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", SyntaxWarning)

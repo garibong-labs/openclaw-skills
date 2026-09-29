@@ -532,3 +532,241 @@ function loadRepresentImageHelper(scriptFile) {
   console.error(err);
   process.exitCode = 1;
 });
+
+// ── convertPendingToPlainLink / verifyOGPlainLink / cleanup 보존 ──
+// (확정 500/40009 plain-link 폴백 — 양쪽 helper 파일 동작·소스 동기화 검증)
+
+const PLAIN_LINK_HELPER_SCRIPTS = ['tistory-editor-helpers.js', 'tistory-publish.js'];
+const PLAIN_LINK_URL = 'https://ko.wikipedia.org/wiki/%EC%9E%A5%ED%95%9C%EB%B3%84';
+
+// 1. 소스 parity: 두 helper 파일의 함수 본문이 정확히 같아야 한다 (드리프트 금지).
+function extractFunctionSource(source, name, file) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  assert.ok(start >= 0, `${file}: function ${name} not found`);
+  const open = source.indexOf('{', start);
+  let depth = 0;
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}') {
+      depth--;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  throw new Error(`${file}: unbalanced braces for ${name}`);
+}
+
+{
+  const sources = PLAIN_LINK_HELPER_SCRIPTS.map(file => ({
+    file,
+    source: fs.readFileSync(path.join(__dirname, '..', 'scripts', file), 'utf8'),
+  }));
+  for (const name of ['convertPendingToPlainLink', 'verifyOGPlainLink']) {
+    const [a, b] = sources.map(({ file, source }) => extractFunctionSource(source, name, file));
+    assert.strictEqual(a, b, `${name} must stay byte-identical in both helper files`);
+  }
+  console.log('plain-link helper parity check passed');
+}
+
+// 2. 동작: pending 재사용/복제 제거/marker/anchor 안전 속성/검증.
+function loadPlainLinkHelper(scriptFile) {
+  const scriptPath = path.join(__dirname, '..', 'scripts', scriptFile);
+  const scriptSource = fs.readFileSync(scriptPath, 'utf8');
+  const sandbox = {
+    console,
+    URL,
+    setTimeout: fn => fn(),
+    window: { location: { href: 'https://example.tistory.com/manage/newpost' } },
+    document: { querySelector: () => null, querySelectorAll: () => [] },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(
+    `${scriptSource}\nthis.__plain = { convertPendingToPlainLink, verifyOGPlainLink, cleanupOGResiduals };`,
+    sandbox,
+    { filename: scriptPath },
+  );
+  sandbox.__plain.__sandbox = sandbox;
+  return sandbox.__plain;
+}
+
+function makeAnchorFactory() {
+  return (tag, attrs) => {
+    assert.strictEqual(tag, 'a');
+    return {
+      tagName: 'A',
+      attrs: { ...attrs },
+      textContent: '',
+      getAttribute(name) {
+        return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null;
+      },
+      setAttribute(name, value) { this.attrs[name] = value; },
+    };
+  };
+}
+
+function makePendingParagraph(text, pendingUrl) {
+  return {
+    tagName: 'P',
+    text,
+    attrs: { 'data-og-url-pending': pendingUrl },
+    children: [],
+    removedCount: 0,
+    get textContent() { return this.text; },
+    set textContent(value) { this.text = value; },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null;
+    },
+    setAttribute(name, value) { this.attrs[name] = value; },
+    removeAttribute(name) { delete this.attrs[name]; },
+    appendChild(node) { this.children.push(node); },
+    remove() { this.removedCount += 1; },
+    querySelector(selector) {
+      if (selector === 'a[href]') {
+        return this.children.find(c => c.tagName === 'A' && c.getAttribute('href')) || null;
+      }
+      return null;
+    },
+  };
+}
+
+for (const scriptFile of PLAIN_LINK_HELPER_SCRIPTS) {
+  // 변환 성공 + 검증 성공
+  {
+    const helpers = loadPlainLinkHelper(scriptFile);
+    const pending = makePendingParagraph(PLAIN_LINK_URL, PLAIN_LINK_URL);
+    const emptyClone = makePendingParagraph('', PLAIN_LINK_URL);
+    let dirty = false;
+    let saved = false;
+    helpers.__sandbox.tinymce = {
+      activeEditor: {
+        initialized: true,
+        getBody() {
+          return {
+            querySelectorAll(selector) {
+              if (selector === `[data-og-url-pending="${PLAIN_LINK_URL}"]`) return [emptyClone, pending];
+              if (selector === `[data-og-plain-link="${PLAIN_LINK_URL}"]`) {
+                return pending.getAttribute('data-og-plain-link') ? [pending] : [];
+              }
+              return [];
+            },
+          };
+        },
+        dom: { create: makeAnchorFactory() },
+        setDirty(value) { dirty = value; },
+        save() { saved = true; },
+      },
+    };
+
+    const result = helpers.convertPendingToPlainLink(PLAIN_LINK_URL);
+    assert.strictEqual(result.success, true, `${scriptFile}: ${JSON.stringify(result)}`);
+    assert.strictEqual(result.url, PLAIN_LINK_URL);
+    assert.strictEqual(result.href, PLAIN_LINK_URL);
+    assert.strictEqual(result.marker, 'data-og-plain-link');
+    assert.strictEqual(result.duplicatesRemoved, 1);
+    assert.strictEqual(emptyClone.removedCount, 1, `${scriptFile}: duplicate pending clone must be removed`);
+    assert.strictEqual(pending.removedCount, 0);
+    assert.strictEqual(pending.getAttribute('data-og-url-pending'), null, `${scriptFile}: pending attr must be removed`);
+    assert.strictEqual(pending.getAttribute('data-og-plain-link'), PLAIN_LINK_URL, `${scriptFile}: durable marker required`);
+    const anchor = pending.querySelector('a[href]');
+    assert.ok(anchor, `${scriptFile}: anchor missing`);
+    assert.strictEqual(anchor.getAttribute('href'), PLAIN_LINK_URL);
+    assert.strictEqual(anchor.getAttribute('target'), '_blank');
+    assert.strictEqual(anchor.getAttribute('rel'), 'noopener noreferrer');
+    assert.strictEqual(anchor.textContent, PLAIN_LINK_URL, `${scriptFile}: visible source attribution required`);
+    assert.strictEqual(dirty, true);
+    assert.strictEqual(saved, true);
+
+    const verify = helpers.verifyOGPlainLink(PLAIN_LINK_URL);
+    assert.strictEqual(verify.found, true, `${scriptFile}: ${JSON.stringify(verify)}`);
+    assert.strictEqual(verify.markerCount, 1);
+    assert.strictEqual(verify.href, PLAIN_LINK_URL);
+  }
+
+  // pending 미발견 → 구조화 실패, 검증도 found=false
+  {
+    const helpers = loadPlainLinkHelper(scriptFile);
+    helpers.__sandbox.tinymce = {
+      activeEditor: {
+        initialized: true,
+        getBody() { return { querySelectorAll: () => [] }; },
+        dom: { create: makeAnchorFactory() },
+        setDirty() {},
+        save() {},
+      },
+    };
+    const result = helpers.convertPendingToPlainLink(PLAIN_LINK_URL);
+    assert.strictEqual(result.success, false, scriptFile);
+    assert.ok(result.error.includes('pending paragraph not found'), `${scriptFile}: ${result.error}`);
+    const verify = helpers.verifyOGPlainLink(PLAIN_LINK_URL);
+    assert.strictEqual(verify.found, false, scriptFile);
+    assert.strictEqual(verify.markerCount, 0, scriptFile);
+  }
+
+  // tinymce 불가 → 구조화 실패 (fail-closed)
+  {
+    const helpers = loadPlainLinkHelper(scriptFile);
+    assert.strictEqual(helpers.convertPendingToPlainLink(PLAIN_LINK_URL).success, false, scriptFile);
+    assert.strictEqual(helpers.verifyOGPlainLink(PLAIN_LINK_URL).found, false, scriptFile);
+  }
+
+  // 검증은 anchor 속성 결함을 잡아낸다 (target/rel/href 불일치 → found=false)
+  {
+    const helpers = loadPlainLinkHelper(scriptFile);
+    const pending = makePendingParagraph('', PLAIN_LINK_URL);
+    delete pending.attrs['data-og-url-pending'];
+    pending.setAttribute('data-og-plain-link', PLAIN_LINK_URL);
+    const brokenAnchor = makeAnchorFactory()('a', { href: PLAIN_LINK_URL, target: '_self', rel: '' });
+    pending.appendChild(brokenAnchor);
+    helpers.__sandbox.tinymce = {
+      activeEditor: {
+        initialized: true,
+        getBody() {
+          return {
+            querySelectorAll(selector) {
+              return selector === `[data-og-plain-link="${PLAIN_LINK_URL}"]` ? [pending] : [];
+            },
+          };
+        },
+      },
+    };
+    const verify = helpers.verifyOGPlainLink(PLAIN_LINK_URL);
+    assert.strictEqual(verify.found, false, `${scriptFile}: unsafe anchor must not verify`);
+    assert.strictEqual(verify.target, '_self', scriptFile);
+  }
+
+  // cleanupOGResiduals: 마킹된 plain link는 mk.co.kr여도 보존, 마킹 없는
+  // naked URL 잔여물은 기존대로 제거, plainLinks 수를 별도 보고.
+  {
+    const helpers = loadPlainLinkHelper(scriptFile);
+    const markedMkLink = makePendingParagraph('https://www.mk.co.kr/news/economy/12106887', null);
+    delete markedMkLink.attrs['data-og-url-pending'];
+    markedMkLink.setAttribute('data-og-plain-link', 'https://www.mk.co.kr/news/economy/12106887');
+    const nakedMkResidual = makePendingParagraph('https://www.mk.co.kr/news/society/12106891', null);
+    delete nakedMkResidual.attrs['data-og-url-pending'];
+    helpers.__sandbox.tinymce = {
+      activeEditor: {
+        initialized: true,
+        getBody() {
+          return {
+            querySelectorAll(selector) {
+              if (selector === '[data-og-url-pending]') return [];
+              if (selector === 'p') return [markedMkLink, nakedMkResidual];
+              if (selector === '[data-og-plain-link]') return [markedMkLink];
+              return [];
+            },
+          };
+        },
+        setDirty() {},
+        save() {},
+      },
+    };
+    const cleanup = helpers.cleanupOGResiduals();
+    assert.strictEqual(markedMkLink.removedCount, 0, `${scriptFile}: marked plain link must be preserved`);
+    assert.strictEqual(nakedMkResidual.removedCount, 1, `${scriptFile}: unmarked naked URL must still be removed`);
+    assert.strictEqual(cleanup.rawUrlsRemoved, 1, scriptFile);
+    assert.strictEqual(cleanup.plainLinks, 1, `${scriptFile}: cleanup must report marked plain-link count`);
+    assert.strictEqual(cleanup.ogCards, 0, `${scriptFile}: plain link must never count as an OG card`);
+  }
+}
+
+console.log('convertPendingToPlainLink/verifyOGPlainLink/cleanup preservation tests passed');

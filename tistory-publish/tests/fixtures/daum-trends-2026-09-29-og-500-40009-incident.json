@@ -1,0 +1,28 @@
+{
+  "description": "Minimal replay payload derived from the preserved 2026-09-29 Daum Trends retry run (publish-trace.log line 2, 'OG card render failed before publish'). Both original attempts on the same encoded Wikipedia source URL failed with HTTP 500 and scrap payload code 40009; the profile/source placeholder carried no data-og-fallback-urls candidates, so no Daum next-source fallback was possible and the publisher failed the whole post closed before any post was published.",
+  "template": "daum-trends",
+  "phase": "step5",
+  "error": "OG card render failed before publish",
+  "url": "https://ko.wikipedia.org/wiki/%EC%9E%A5%ED%95%9C%EB%B3%84",
+  "fallbackUrls": [],
+  "attempts": [
+    {
+      "url": "https://ko.wikipedia.org/wiki/%EC%9E%A5%ED%95%9C%EB%B3%84",
+      "kind": "original",
+      "found": false,
+      "ogCardCount": 5,
+      "scrapObserved": true,
+      "scrapStatus": 500,
+      "scrapCode": "40009"
+    },
+    {
+      "url": "https://ko.wikipedia.org/wiki/%EC%9E%A5%ED%95%9C%EB%B3%84",
+      "kind": "original-retry",
+      "found": false,
+      "ogCardCount": 5,
+      "scrapObserved": true,
+      "scrapStatus": 500,
+      "scrapCode": "40009"
+    }
+  ]
+}

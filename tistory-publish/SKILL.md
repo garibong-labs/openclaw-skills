@@ -151,6 +151,7 @@ bash scripts/login.sh \
 - 단락 = 여러 문장 묶음 (`<p>` 하나에 2~4문장)
 - OG 카드 위치: `<p data-og-placeholder="URL">&#8203;</p>`
 - 뉴스 OG 카드 폴백 후보(선택): `<p data-og-placeholder="URL" data-og-fallback-urls="URL1 URL2">&#8203;</p>` — 같은 항목의 v.daum.net 기사 후보를 공백 구분으로 나열. scrap이 두 시도 모두 HTTP 500 + `code=40009`로 확정될 때만 첫 적격 후보를 정확히 1회 시도. 커뮤니티 카드에는 사용 금지
+- **`daum-trends` 한정 plain-link 폴백**: 두 원본 시도가 모두 HTTP 500 + `code=40009`로 확정되고 적격 v.daum.net 후보가 전혀 없을 때만, 실패한 placeholder를 카드 대신 일반 출처 하이퍼링크(`data-og-plain-link` 마킹, `href`=원본 URL, `_blank`, `noopener noreferrer`)로 유지하고 최종 결과 JSON의 `ogPlainLinkFallbacks`에 URL/사유/phase를 보고. **깨진 OG는 절대 카드로 계산하지 않는다** — 카드 수 게이트는 `placeholder 수 − plain link 수`와 비교하고 마킹된 plain link 수도 별도 검증. 후보가 있으면 기존대로 후보 1회 시도 후 실패 시 fail-closed. **strict custom OG validator(`TISTORY_OG_VALIDATOR` 설정 시)가 켜져 있으면 이 폴백은 비활성화**되어 기존 엄격한 카드 의미론이 유지되며, 다른 템플릿(mk-review 등)에는 어떤 영향도 없다
 - 구분선: `<hr contenteditable="false" data-ke-type="horizontalRule" data-ke-style="style1">`
 
 ### SEO 규칙 (검색 노출용 — `--seo-check`가 검사하는 항목)
@@ -199,6 +200,8 @@ templates/my-template/
 - `prepareOGRetry(fromUrl, toUrl)` — 실패한 시도의 pending 문단 재사용 (같은 URL 재시도 / 확정 40002 시 DCInside 짝 폴백 / 확정 500·40009 시 Daum 다음 기사 폴백)
 - `dcinsidePairedOGUrl(url)` — 엄격한 DCInside 모바일↔데스크톱 게시글 짝 계산 (그 외 URL은 null)
 - `verifyOGCard(url)` — 카드 렌더링 확인 (엄격한 DCInside 짝은 같은 글로 인정)
+- `convertPendingToPlainLink(url)` — 확정 500/40009 + 후보 없음일 때 실패한 pending 문단을 일반 출처 링크로 변환 (`data-og-plain-link` 마킹, daum-trends 폴백 전용)
+- `verifyOGPlainLink(url)` — plain-link 변환 결과 검증 (marker/href/`_blank`/`noopener noreferrer` 확인, 실패 시 발행 중단)
 
 ### 메타데이터
 - `setTags(tags[])` — 태그 등록
