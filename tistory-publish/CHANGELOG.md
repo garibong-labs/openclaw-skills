@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- **daum-trends 짝 소진(exhausted-pair) 확정 500/40002 plain-link 폴백** (2026-10-01 발행 abort 대응)
+  - 배경: DCInside 마이너 갤러리 모바일 게시글(`m.dcinside.com/board/<g>/<no>`)은 짝 helper가 regular 데스크톱 경로(`gall.dcinside.com/board/view`)를 계산하지만 실제 canonical은 `/mgallery/board/view`라서, 원본 2회 + 계산된 짝 1회가 전부 HTTP 500 + payload `code=40002`로 확정 실패하고 발행 전체가 중단되던 문제
+  - 제한된 3회 시퀀스(`original`, `original-retry`, 계산된 짝으로의 `dcinside-paired-fallback` 정확히 1회)가 **전부 안전 연관된 found=false + HTTP 500 + `code=40002`로 확정**되고, 짝 시도 URL이 helper가 계산한 짝과 정확히 일치하고, caller가 명시적으로 켠 경우(`--template daum-trends`이고 custom OG validator 미설정)에만, 원본 URL(계산된 짝이 아님)을 카드 대신 명시적 일반 하이퍼링크로 유지 — 원본 URL은 기존 보수적 safe external http(s) 계약도 통과해야 함
+  - **깨진 OG와 실패한 짝은 절대 카드로 계산하지 않음**: 기존 `render_og_cards()` 집계/검증 경로 재사용 (`placeholder 수 − plain link 수` 카드 게이트 + 마킹된 plain link 수 일치 검증 + `ogPlainLinkFallbacks`의 `url`/`reason`/`phase` 보고, reason은 `confirmed scrap 500/code=40002 on original twice and paired fallback once`로 40009 케이스와 구분). **strict custom OG validator(`TISTORY_OG_VALIDATOR`)가 켜져 있으면 이 폴백도 비활성화**
+  - 기존 동작 불변: 짝 시도 성공은 그대로 카드 반환·계산, 원본 1·2차 성공 불변, 짝이 없거나 짝 시도에 도달하지 못한 40002 실패·시퀀스 종류/순서/횟수 불일치·짝 URL 불일치·미관측/미파싱/타 상태/타 코드·변환/검증/count 실패는 전부 기존 fail-closed abort, 확정 500/40009 Daum 다음 기사·plain-link 폴백 동작 그대로
+  - 변환/검증 정책은 40009 케이스와 공용 `degrade_to_plain_link()`로 통합 (JS helper 변경 없음). 짝 시도가 pending 문단을 짝 URL로 키잉해 두므로, 변환 전에 기존 `prepareOGRetry`로 pending을 원본 URL로 재바인딩한다 — 추가 Enter/scrap 시도 없이 문단 텍스트/키만 복원하며, 재바인딩 실패·미확인은 변환 전 fail-closed abort (40009 경로는 재바인딩 없음, 동작 불변). 보존된 2026-10-01 incident payload(마이너 갤러리 모바일 URL + 잘못 계산된 regular 짝 + 3회 시도 기록)에서 파생한 repo 내 fixture와 replay/negative/집계 regression 테스트 추가
 - **daum-trends 확정 500/40009 plain-link 폴백** (2026-09-29 발행 abort 대응)
   - 두 원본 OG 시도가 **모두 안전 연관된 HTTP 500 + payload `code=40009`로 확정**되고, 적격 v.daum.net 다음 기사 후보가 전혀 없고, caller가 명시적으로 켠 경우(`--template daum-trends`이고 custom OG validator 미설정)에만, 실패한 placeholder의 출처를 카드 대신 명시적 일반 하이퍼링크로 유지 (원본 인코딩 URL 그대로 `href`+앵커 텍스트, `_blank`, `noopener noreferrer`, `data-og-plain-link` 내구 마킹)
   - 원본 URL은 보수적 safe external http(s) 계약을 통과해야 함 — 빈/비정상 값, 비 http(s) 스킴, userinfo, localhost/`.local`/dotless 내부 이름, loopback/private/link-local/reserved/multicast literal IP는 폴백 금지 (fail-closed 유지)
