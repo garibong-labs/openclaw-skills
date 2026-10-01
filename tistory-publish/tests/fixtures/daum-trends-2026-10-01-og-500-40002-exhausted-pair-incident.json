@@ -1,0 +1,39 @@
+{
+  "description": "Minimal replay payload derived from the preserved 2026-10-01 Daum Trends run (publish-trace.log, 'OG card render failed before publish'). Both original attempts on the DCInside mobile minor-gallery post URL and the single computed desktop pair attempt failed with HTTP 500 and scrap payload code 40002. The strict pair helper maps every mobile /board/<gallery>/<post> URL to the regular-gallery desktop route /board/view, but this post lives in a minor gallery whose live canonical route is /mgallery/board/view, so the computed pair could never render and the publisher failed the whole post closed before any post was published.",
+  "template": "daum-trends",
+  "phase": "step5",
+  "error": "OG card render failed before publish",
+  "url": "https://m.dcinside.com/board/newconservativeparty/5768027",
+  "pairedUrl": "https://gall.dcinside.com/board/view/?id=newconservativeparty&no=5768027",
+  "liveCanonicalUrl": "https://gall.dcinside.com/mgallery/board/view/?id=newconservativeparty&no=5768027",
+  "fallbackUrls": [],
+  "attempts": [
+    {
+      "url": "https://m.dcinside.com/board/newconservativeparty/5768027",
+      "kind": "original",
+      "found": false,
+      "ogCardCount": 1,
+      "scrapObserved": true,
+      "scrapStatus": 500,
+      "scrapCode": "40002"
+    },
+    {
+      "url": "https://m.dcinside.com/board/newconservativeparty/5768027",
+      "kind": "original-retry",
+      "found": false,
+      "ogCardCount": 1,
+      "scrapObserved": true,
+      "scrapStatus": 500,
+      "scrapCode": "40002"
+    },
+    {
+      "url": "https://gall.dcinside.com/board/view/?id=newconservativeparty&no=5768027",
+      "kind": "dcinside-paired-fallback",
+      "found": false,
+      "ogCardCount": 1,
+      "scrapObserved": true,
+      "scrapStatus": 500,
+      "scrapCode": "40002"
+    }
+  ]
+}

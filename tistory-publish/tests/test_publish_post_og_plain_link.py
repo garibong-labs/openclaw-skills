@@ -23,7 +23,13 @@ import test_publish_post_og_retry as base
 
 SCRIPT_PATH = base.SCRIPT_PATH
 FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "daum-trends-2026-09-29-og-500-40009-incident.json"
-FUNCTION_NAMES = base.FUNCTION_NAMES | {"safe_plain_link_source_url"}
+FUNCTION_NAMES = base.FUNCTION_NAMES | {
+    "safe_plain_link_source_url",
+    # Shared plain-link degrade policy (40009 no-candidate + exhausted-pair
+    # 40002) lives in these helpers; the render flow calls them at runtime.
+    "degrade_to_plain_link",
+    "exhausted_pair_confirmed_500_40002",
+}
 
 WIKI_URL = "https://ko.wikipedia.org/wiki/%EC%9E%A5%ED%95%9C%EB%B3%84"
 DAUM_PRIMARY = base.DAUM_PRIMARY
@@ -191,7 +197,7 @@ class PlainLinkFallbackTests(unittest.TestCase):
             self.assertEqual(record["scrapCode"], "40009")
 
     def test_incident_replay_downgrades_to_plain_link_under_contract(self):
-        ns, _, logs = self.make_namespace()
+        ns, fake_time, logs = self.make_namespace()
         fixture = self.load_fixture()
         page = self.fixture_page(fixture)
         result = self.render(
@@ -212,6 +218,15 @@ class PlainLinkFallbackTests(unittest.TestCase):
         self.assertEqual(page.verify_calls, [WIKI_URL])
         # No third Enter press: the downgrade is not another card attempt.
         self.assertEqual(page.enter_presses, 2)
+        # The 40009 degrade passes no pending_url, so there is no extra
+        # prepareOGRetry rebind (the pending paragraph is still keyed to the
+        # original URL) and no added delay: exactly the two attempt preps and
+        # the pre-existing pacing.
+        self.assertEqual(
+            page.prepare_calls,
+            [("placeholder", WIKI_URL), ("retry", {"fromUrl": WIKI_URL, "toUrl": WIKI_URL})],
+        )
+        self.assertEqual(fake_time.sleeps, [0.5] + [1.5] * 8 + [2.0, 0.5] + [1.5] * 8)
         self.assertTrue(
             any("confirmed 500/code=40009 -> degraded to plain source link" in line and WIKI_URL in line and "phase=step5" in line for line in logs)
         )

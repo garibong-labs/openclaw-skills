@@ -343,6 +343,16 @@ def run_og_gate(mode, *args):
 # 안전한 외부 http(s) 원본 URL을 카드 대신 일반 출처 하이퍼링크로 유지한다.
 # 후보가 있으면 기존대로 후보 1회 시도 후 실패 시 fail-closed. plain link는
 # 절대 카드 성공으로 계산하지 않으며, generic/미확정 실패 게이트는 그대로다.
+#
+# 2026-10-01 추가: daum-trends 전용 짝 소진(exhausted-pair) plain-link 폴백.
+# 엄격한 DCInside 짝이 계산된 원본 URL에 대해 제한된 3회 시퀀스(original,
+# original-retry, 계산된 짝으로의 dcinside-paired-fallback 정확히 1회)가
+# 전부 안전 연관된 HTTP 500 + payload code=40002로 확정 실패한 경우에만
+# (마이너 갤러리 모바일 URL은 /board/view 데스크톱 짝이 틀린 경로라 짝도
+# 같은 40002로 죽는 부류), caller opt-in + 보수적 safe external URL 조건
+# 아래에서 원본 URL(짝이 아님)을 일반 출처 하이퍼링크로 유지한다. 시퀀스
+# 종류/순서/횟수 불일치, 짝 URL 불일치, 미관측/미파싱/타 상태/타 코드,
+# 짝 시도 자체가 없던 원본 전용 실패는 전부 기존 fail-closed abort 유지.
 
 def dcinside_paired_og_url(url):
     """Strict DCInside mobile<->desktop post-URL pair; None for anything else.
@@ -533,6 +543,89 @@ def safe_plain_link_source_url(url):
     return text
 
 
+def exhausted_pair_confirmed_500_40002(url, attempts):
+    """True only for the exact exhausted bounded DCInside pair sequence:
+    the original URL is a strict DCInside post URL with a non-null computed
+    pair, the attempt list is exactly the three bounded records (original and
+    original-retry on the original URL, then dcinside-paired-fallback on
+    exactly the helper-computed pair URL), and every record carries exactly
+    found=False and scrapObserved=True with a safely associated scrap response
+    of non-bool int HTTP status 500 + string payload code '40002'.
+    Any deviation (missing pair, wrong kind/order/count, mismatched URL,
+    rendered card, unobserved/unparsable scrap, other status or code, or any
+    non-exact type standing in for those confirmations) is ineligible,
+    keeping the existing fail-closed abort."""
+    paired_url = dcinside_paired_og_url(url)
+    if not paired_url:
+        return False
+    if not isinstance(attempts, list) or len(attempts) != 3:
+        return False
+    expected_sequence = [
+        (url, 'original'),
+        (url, 'original-retry'),
+        (paired_url, 'dcinside-paired-fallback'),
+    ]
+    for attempt, (expected_url, expected_kind) in zip(attempts, expected_sequence):
+        if not isinstance(attempt, dict):
+            return False
+        if attempt.get('url') != expected_url or attempt.get('kind') != expected_kind:
+            return False
+        if attempt.get('found') is not False:
+            return False
+        if attempt.get('scrapObserved') is not True:
+            return False
+        scrap_status = attempt.get('scrapStatus')
+        if type(scrap_status) is not int or scrap_status != 500:
+            return False
+        if attempt.get('scrapCode') != '40002':
+            return False
+    return True
+
+
+def degrade_to_plain_link(page, url, phase, prefix, attempts, reason, log_label, pending_url=None):
+    """Shared plain-link conversion/verification policy for both bounded
+    degrade cases: confirmed 500/40009 without an eligible Daum candidate and
+    the confirmed 500/40002 exhausted DCInside pair. Converts the failed
+    pending paragraph into an ordinary source hyperlink, verifies the marked
+    link, and returns the structured non-card outcome; conversion or
+    verification failure aborts before publish (fail-closed). The outcome is
+    never mixed up with a card success and is never counted as a card.
+
+    pending_url is the URL currently keyed on the editor's pending paragraph
+    (data-og-url-pending) when it differs from the desired link URL: the
+    exhausted-pair case leaves the paragraph keyed/texted to the paired URL
+    after the last prepareOGRetry. In that case the paragraph is first rebound
+    back to the original URL via prepareOGRetry (text/cursor only — no Enter,
+    no new scrap attempt); a missing or failed rebind aborts before any
+    conversion. The 40009 path passes no pending_url and is unchanged."""
+    if pending_url is not None and pending_url != url:
+        rebind_result = page.evaluate(
+            "({fromUrl, toUrl}) => typeof prepareOGRetry === 'function' ? prepareOGRetry(fromUrl, toUrl) : {success: false, error: 'prepareOGRetry unavailable'}",
+            {'fromUrl': pending_url, 'toUrl': url},
+        )
+        if not (isinstance(rebind_result, dict) and rebind_result.get('success')):
+            fail(f"{prefix}OG plain-link pending rebind failed before publish: {json.dumps({'url': url, 'pendingUrl': pending_url, 'result': rebind_result, 'attempts': attempts}, ensure_ascii=False)}")
+    convert_result = page.evaluate(
+        "(url) => typeof convertPendingToPlainLink === 'function' ? convertPendingToPlainLink(url) : {success: false, error: 'convertPendingToPlainLink unavailable'}",
+        url,
+    )
+    if not (isinstance(convert_result, dict) and convert_result.get('success')):
+        fail(f"{prefix}OG plain-link conversion failed before publish: {json.dumps({'url': url, 'result': convert_result, 'attempts': attempts}, ensure_ascii=False)}")
+    verify_result = page.evaluate(
+        "(url) => typeof verifyOGPlainLink === 'function' ? verifyOGPlainLink(url) : {found: false, error: 'verifyOGPlainLink unavailable'}",
+        url,
+    )
+    if not (isinstance(verify_result, dict) and verify_result.get('found')):
+        fail(f"{prefix}OG plain-link verification failed before publish: {json.dumps({'url': url, 'result': verify_result, 'attempts': attempts}, ensure_ascii=False)}")
+    log(f"  - {prefix}OG [{url[:40]}...] {log_label} -> degraded to plain source link (phase={phase}, url={url})")
+    return {
+        'plainLinkFallback': True,
+        'url': url,
+        'reason': reason,
+        'phase': phase,
+    }
+
+
 def normalize_og_entries(raw_entries):
     """Fail-closed placeholder entries for render_og_cards: each entry keeps
     its placeholder URL (even when unusable, so the mandatory-card gate still
@@ -691,6 +784,24 @@ def render_og_card_with_fallback(page, url, index, phase, fallback_urls=None, al
         log(f"  - {prefix}OG [{url[:40]}...] paired fallback: {json.dumps(attempts[-1], ensure_ascii=False)}")
         if outcome['found']:
             return paired_url
+        # 짝 소진 plain-link 폴백: 제한된 3회 시퀀스(원본 2회 + 계산된 짝
+        # 정확히 1회)가 전부 HTTP 500 + payload code=40002로 확정 실패하고,
+        # caller가 명시적으로 opt-in 했고, 원본이 보수적 safe external URL일
+        # 때만 원본 URL(짝이 아님)을 일반 출처 링크로 유지한다. 그 외는 전부
+        # 아래의 기존 fail-closed abort로 떨어진다. 마지막 짝 시도가 pending
+        # 문단을 짝 URL로 키잉해 두었으므로 pending_url=paired_url로 전달해
+        # 변환 전에 원본 URL로 재바인딩한다 (Enter/추가 scrap 시도 없음).
+        if (
+            allow_plain_link_fallback
+            and exhausted_pair_confirmed_500_40002(url, attempts)
+            and safe_plain_link_source_url(url)
+        ):
+            return degrade_to_plain_link(
+                page, url, phase, prefix, attempts,
+                'confirmed scrap 500/code=40002 on original twice and paired fallback once',
+                'confirmed 500/code=40002 on original twice and paired fallback once',
+                pending_url=paired_url,
+            )
 
     # Daum 다음 기사 폴백: 두 시도 모두 HTTP 500 + payload code=40009로 확정된
     # 경우에만, 이 placeholder에 딸린 같은 트렌드 항목의 ordered 후보에서 첫
@@ -721,28 +832,14 @@ def render_og_card_with_fallback(page, url, index, phase, fallback_urls=None, al
                 return next_daum_url
         elif allow_plain_link_fallback and safe_plain_link_source_url(url):
             # plain-link 폴백: 확정 500/40009 + 적격 Daum 후보 없음 + caller의
-            # 명시적 opt-in + 보수적 safe external URL일 때만. 실패한 pending
-            # 문단을 일반 출처 링크로 변환하고 검증까지 성공해야 계속 진행한다.
+            # 명시적 opt-in + 보수적 safe external URL일 때만. 변환/검증/집계
+            # 정책은 확정 40002 짝 소진 케이스와 degrade_to_plain_link로 공유.
             # 카드 성공(URL 반환)과 절대 섞이지 않는 별도 구조화 결과를 반환.
-            convert_result = page.evaluate(
-                "(url) => typeof convertPendingToPlainLink === 'function' ? convertPendingToPlainLink(url) : {success: false, error: 'convertPendingToPlainLink unavailable'}",
-                url,
+            return degrade_to_plain_link(
+                page, url, phase, prefix, attempts,
+                'confirmed scrap 500/code=40009 twice, no eligible Daum candidate',
+                'confirmed 500/code=40009',
             )
-            if not (isinstance(convert_result, dict) and convert_result.get('success')):
-                fail(f"{prefix}OG plain-link conversion failed before publish: {json.dumps({'url': url, 'result': convert_result, 'attempts': attempts}, ensure_ascii=False)}")
-            verify_result = page.evaluate(
-                "(url) => typeof verifyOGPlainLink === 'function' ? verifyOGPlainLink(url) : {found: false, error: 'verifyOGPlainLink unavailable'}",
-                url,
-            )
-            if not (isinstance(verify_result, dict) and verify_result.get('found')):
-                fail(f"{prefix}OG plain-link verification failed before publish: {json.dumps({'url': url, 'result': verify_result, 'attempts': attempts}, ensure_ascii=False)}")
-            log(f"  - {prefix}OG [{url[:40]}...] confirmed 500/code=40009 -> degraded to plain source link (phase={phase}, url={url})")
-            return {
-                'plainLinkFallback': True,
-                'url': url,
-                'reason': 'confirmed scrap 500/code=40009 twice, no eligible Daum candidate',
-                'phase': phase,
-            }
         else:
             log(f"  - {prefix}OG [{url[:40]}...] scrap 500/code=40009 confirmed twice but no eligible next Daum candidate; failing closed")
 
