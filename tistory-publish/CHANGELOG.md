@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+
+- **현재 publish-post.sh의 제한 시간 있는 실제 CDP preflight와 읽기 전용 target 진단**
+  - 잠금 후 에디터 생성·로그인 전에 실제 Playwright attach 1회, 성공 연결 재사용. `--cdp-connect-timeout-ms` / `TISTORY_CDP_CONNECT_TIMEOUT_MS`: 기본 15000ms, 허용 1000~60000ms
+  - 실패 시 독립 프로세스 총 5초, 최대 8개 target, 각각 최대 750ms. 선택 `websocket-client`의 직접 page 채널 상수 평가만 정상 증거로 인정하며, 모듈 부재·지원 밖 target·전송 오류·예산 소진은 unknown. 새 필수 의존성·자동 설치 없음
+  - 단계·소요 시간·제한된 target id/type·고정 상태/사유만 기록하고 URL 전체·제목·원시 예외·브라우저 메타데이터 생략. 진단 실패는 attach 오류를 가리지 않고 운영자 인터럽트 전파, 에디터 접근 전 fail-closed
+  - 기존 탭 상태를 보존하도록 URL 기반 newpost 자동 종료 두 경로 제거. 잠금·발행/이미지/OG/중복 게이트와 실행 소유 target의 기존 성공 후 정리 유지. 레거시 publish/login 변경 없음
+  - 오프라인 정상/정체 target·선택 전송 부재·예산/프로세스 종료·비밀 비노출 회귀 추가. 역사적 장애 target은 미확인이고 진단은 원인 확정 수단이 아님
 - **daum-trends 짝 소진(exhausted-pair) 확정 500/40002 plain-link 폴백** (2026-10-01 발행 abort 대응)
   - 배경: DCInside 마이너 갤러리 모바일 게시글(`m.dcinside.com/board/<g>/<no>`)은 짝 helper가 regular 데스크톱 경로(`gall.dcinside.com/board/view`)를 계산하지만 실제 canonical은 `/mgallery/board/view`라서, 원본 2회 + 계산된 짝 1회가 전부 HTTP 500 + payload `code=40002`로 확정 실패하고 발행 전체가 중단되던 문제
   - 제한된 3회 시퀀스(`original`, `original-retry`, 계산된 짝으로의 `dcinside-paired-fallback` 정확히 1회)가 **전부 안전 연관된 found=false + HTTP 500 + `code=40002`로 확정**되고, 짝 시도 URL이 helper가 계산한 짝과 정확히 일치하고, caller가 명시적으로 켠 경우(`--template daum-trends`이고 custom OG validator 미설정)에만, 원본 URL(계산된 짝이 아님)을 카드 대신 명시적 일반 하이퍼링크로 유지 — 원본 URL은 기존 보수적 safe external http(s) 계약도 통과해야 함

@@ -120,13 +120,13 @@ ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
 
 ## 동시 발행 잠금
 
-같은 블로그(또는 같은 CDP 포트)에서 두 발행 작업이 동시에 실행되면 뒤에 시작한 작업이 앞 작업의 에디터 탭을 닫아 `TargetClosedError`가 발생할 수 있습니다. 이를 방지하기 위해 `publish-post.sh`는 Playwright CDP attach 전에 `fcntl.flock` 기반 파일 잠금을 획득합니다.
+같은 블로그(또는 같은 CDP 포트)의 동시 발행 간 간섭을 막기 위해 `publish-post.sh`는 Playwright CDP attach 전에 `fcntl.flock` 기반 파일 잠금을 획득합니다.
 
 - 잠금 키: 블로그 도메인 우선, 없으면 CDP 포트
 - 잠금 파일: `/tmp/tistory-publish-{key}.lock`
 - `TISTORY_PUBLISH_LOCK_MODE=wait` — 다른 작업이 끝날 때까지 대기 (기본값)
 - `TISTORY_PUBLISH_LOCK_MODE=fail` — 잠금을 즉시 획득할 수 없으면 `publish/lock-busy` 오류로 종료
-- 잠금은 브라우저 종료 후 해제되며, 비정상 종료 시에도 `atexit`로 해제됩니다
+- 잠금은 발행 실행 종료 후 해제되며, 비정상 종료 시에도 `atexit`로 해제됩니다
 
 `TargetClosedError`가 발생하면 `publish/target-closed` 오류 코드와 함께 동시 발행 또는 외부 브라우저 종료 가능성을 안내합니다.
 
@@ -147,7 +147,7 @@ Daum Trends처럼 이미지 3장이 글의 핵심 산출물인 파이프라인�
 
 ## 자동 처리 흐름
 
-1. CDP로 Chrome에 attach
+1. 발행 잠금 후 제한 시간 내 실제 CDP attach (실패 시 읽기 전용 진단 후 중단)
 2. 새 글 페이지 열기
 3. 로그인 페이지로 redirect되면 같은 blog/CDP 포트로 `login.sh` 세션 복구 시도
 4. helper JS 주입
@@ -186,17 +186,23 @@ Daum Trends처럼 이미지 3장이 글의 핵심 산출물인 파이프라인�
 - Python 3 + Playwright
 - Node.js 18+ (배너 생성 스크립트 사용 시)
 
-CDP attach preflight:
+### CDP 연결 preflight와 실패 진단
 
-```bash
-python3 - <<'PY'
-from playwright.sync_api import sync_playwright
-with sync_playwright() as p:
-    browser = p.chromium.connect_over_cdp('http://127.0.0.1:18800', timeout=15000)
-    print('CDP attach OK, contexts=', len(browser.contexts))
-    browser.close()
-PY
-```
+현재 `publish-post.sh`는 발행 잠금을 획득한 뒤, 에디터 탭 생성·로그인 복구 전에 실제 `connect_over_cdp`를 한 번 수행합니다. 기본 제한 시간은 **15000ms**이며 `--cdp-connect-timeout-ms N` 또는 `TISTORY_CDP_CONNECT_TIMEOUT_MS`로 **1000~60000ms** 범위에서 설정합니다(CLI 우선). 성공한 연결을 그대로 재사용합니다. HTTP `/json/version` 응답이나 target 목록만으로 연결 성공을 판정하지 않습니다.
+
+실패하면 `CDP stage=attach status=failed duration_ms=...`를 기록하고, `scripts/cdp_preflight.py`의 별도 진단 프로세스를 **총 5초**까지만 실행한 뒤 `{"success": false, "error": "publish/cdp-attach-failed"}`로 중단합니다. 이 시간은 잠금 대기나 Playwright 시작 시간이 아니라 attach 호출과 실패 진단 각각의 제한입니다. 성공 로그도 연결 단계와 소요 시간을 기록합니다.
+
+- `/json/list` 조회는 최대 750ms, 응답 크기는 256KiB, 진단 대상은 목록 순서대로 최대 8개입니다. 초과 대상 수를 기록합니다.
+- 선택 모듈 `websocket-client`가 이미 있으면 page target의 **직접 WebSocket 채널**에서 상수 `1`만 평가합니다. Playwright의 실패한 전체 브라우저 연결이나 비공개 API에 의존하지 않습니다. 새 필수 의존성이나 자동 설치는 없습니다.
+- target당 연결·평가 합계 최대 750ms이며 전체 5초 잔여 예산을 넘기지 않습니다. 별도 프로세스 제한이 모듈 import, HTTP 읽기, 전송 내부 지연도 제한합니다. 타임아웃 전 완료된 진단은 보존합니다.
+- `responsive`: 직접 평가 응답을 확인함. `unresponsive`: 직접 채널 연결 후 평가 응답을 제한 시간 안에 받지 못함. 이는 관측 시점의 타임아웃이며 해당 탭이 전체 attach 실패의 원인이라는 증거는 아닙니다.
+- `unknown`: 모듈 부재, 연결 실패, 평가 오류, 지원하지 않는 target 종류, 예산 소진 등으로 판정 불가. 빈 목록·목록 조회 성공·브라우저 HTTP/WS 응답도 탭 정상의 증거가 아닙니다.
+- 로그는 단계·시간·제한된 target id/type·상태·고정 사유만 기록합니다. URL은 origin/path에도 비밀이 있을 수 있어 **전부 생략**합니다. 제목, query/fragment, WebSocket URL, 헤더, 쿠키, 저장소, 본문, 원시 예외와 임의 브라우저 메타데이터는 기록하지 않습니다.
+- 기존 탭을 자동 종료·새로고침하거나 브라우저를 재시작하지 않습니다. 과거 newpost 탭을 URL로 골라 닫던 두 경로는 제거했습니다. 진단 실패는 원래 연결 오류를 대체하지 않으며 운영자 인터럽트는 그대로 전파합니다.
+
+기존 발행 잠금·본문/이미지/OG/중복 검증과, 성공한 `daum-trends` 실행이 자신이 만든 정확한 target만 정리하는 기존 사후 처리는 유지합니다. 이번 변경은 현재 엔진에만 적용하며 `login.sh`, `publish.sh`, `tistory-publish.js`의 연결·로그인 동작은 변경하지 않습니다.
+
+운영 사례에서는 건강한 연결 약 485ms, 테스트 탭 정체 시 3초 초과, 그 테스트 탭 종료 뒤 약 453ms가 관측되었습니다. **역사적 장애의 정확한 target은 식별되지 않았습니다.** 이 진단도 과거 원인을 소급 확정하지 않습니다.
 
 ## 템플릿 추가
 
