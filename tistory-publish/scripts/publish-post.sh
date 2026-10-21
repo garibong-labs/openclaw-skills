@@ -26,6 +26,7 @@ SEO_CHECK="${TISTORY_SEO_CHECK:-off}"
 SEO_KEYWORD=""
 SEO_MIN_BODY_CHARS="${TISTORY_SEO_MIN_BODY_CHARS:-1000}"
 CDP_PORT="${TISTORY_CDP_PORT:-18800}"
+CDP_CONNECT_TIMEOUT_MS="${TISTORY_CDP_CONNECT_TIMEOUT_MS:-15000}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ALLOW_DIRECT_TISTORY_PUBLISH="${ALLOW_DIRECT_TISTORY_PUBLISH:-}"
 RUN_TOKEN="${RUN_TOKEN:-}"
@@ -52,6 +53,8 @@ Options:
   --blog           블로그 도메인 (예: anthropic.tistory.com)
   --helper         JS helper 경로
   --cdp-port       OpenClaw Chrome CDP 포트 (기본: TISTORY_CDP_PORT 또는 18800)
+  --cdp-connect-timeout-ms N
+                  실제 Playwright 연결 제한 시간 (1000~60000ms, 기본: 15000)
   --private        비공개 발행
   --seo-check      발행 전 SEO 검사: off|warn|strict (기본: off, strict는 error 시 발행 중단)
   --seo-keyword    SEO 핵심 키워드 (기본: 제목 첫 단어)
@@ -76,6 +79,7 @@ while [[ $# -gt 0 ]]; do
     --blog)          BLOG="$2"; shift 2;;
     --helper)        HELPER="$2"; shift 2;;
     --cdp-port)      CDP_PORT="$2"; shift 2;;
+    --cdp-connect-timeout-ms) CDP_CONNECT_TIMEOUT_MS="$2"; shift 2;;
     --seo-check)     SEO_CHECK="$2"; shift 2;;
     --seo-keyword)   SEO_KEYWORD="$2"; shift 2;;
     --seo-min-body-chars) SEO_MIN_BODY_CHARS="$2"; shift 2;;
@@ -118,6 +122,12 @@ fi
 [[ "$SEO_CHECK" != "off" && "$SEO_CHECK" != "warn" && "$SEO_CHECK" != "strict" ]] && fail "--seo-check must be off|warn|strict"
 [[ ! "$SEO_MIN_BODY_CHARS" =~ ^[0-9]+$ ]] && fail "--seo-min-body-chars must be a non-negative integer"
 
+# 연결 옵션은 브라우저/로그인 접근 전에 고정 범위로 검증한다.
+[[ ! "$CDP_PORT" =~ ^[0-9]{1,5}$ ]] && fail "--cdp-port must be 1..65535"
+(( 10#$CDP_PORT >= 1 && 10#$CDP_PORT <= 65535 )) || fail "--cdp-port must be 1..65535"
+[[ ! "$CDP_CONNECT_TIMEOUT_MS" =~ ^[0-9]{4,5}$ ]] && fail "--cdp-connect-timeout-ms must be 1000..60000"
+(( 10#$CDP_CONNECT_TIMEOUT_MS >= 1000 && 10#$CDP_CONNECT_TIMEOUT_MS <= 60000 )) || fail "--cdp-connect-timeout-ms must be 1000..60000"
+
 # 배너가 있는데 alt가 없으면 제목을 alt로 사용 (빈 alt로 올라가는 것 방지)
 if [[ -n "$BANNER" && -z "$BANNER_ALT" ]]; then
   BANNER_ALT="$TITLE"
@@ -151,7 +161,7 @@ TISTORY_LOGIN_SCRIPT="${TISTORY_LOGIN_SCRIPT:-$SCRIPT_DIR/login.sh}"
 TMP_STDERR="$(mktemp -t tistory-publish-stderr.XXXXXX)"
 
 set +e
-PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" "$REQUIRE_PUBLIC_IMAGE_FIGURES" "$TEMPLATE" "$BANNER_ALT" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
+PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" "$REQUIRE_PUBLIC_IMAGE_FIGURES" "$TEMPLATE" "$BANNER_ALT" "$SCRIPT_DIR" "$CDP_CONNECT_TIMEOUT_MS" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
 import sys, json, time, os, re, subprocess, urllib.request, urllib.error, ipaddress
 import html as htmlmod
 from pathlib import Path
@@ -174,6 +184,9 @@ REQUIRE_PUBLIC_IMAGE_FIGURES = int(sys.argv[10])
 TEMPLATE   = sys.argv[11]
 BANNER_ALT = sys.argv[12] if len(sys.argv) > 12 else ""
 
+sys.path.insert(0, sys.argv[13])
+from cdp_preflight import connect_preflight
+CDP_CONNECT_TIMEOUT_MS = int(sys.argv[14])
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 NEWPOST_URL = f"https://{BLOG}/manage/newpost/?type=post" if BLOG else "https://www.tistory.com/manage/newpost/?type=post"
 POSTS_URL = f"https://{BLOG}/manage/posts/" if BLOG else "https://www.tistory.com/manage/posts/"
@@ -214,43 +227,10 @@ def fail(msg):
     print(json.dumps({"success": False, "error": msg}))
     sys.exit(1)
 
-def cdp_get_json(path, timeout=5):
-    url = f"{CDP_URL}{path}"
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
 def cdp_close_target(target_id, timeout=5):
     url = f"{CDP_URL}/json/close/{quote(target_id, safe='')}"
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
-
-def is_target_newpost(url):
-    if "newpost" not in (url or ""):
-        return False
-    if BLOG and f"https://{BLOG}/manage/newpost" not in url:
-        return False
-    return True
-
-def cleanup_newpost_targets(reason):
-    try:
-        targets = cdp_get_json("/json/list")
-    except Exception as e:
-        log(f"  ⚠️ {reason}: cannot list CDP targets before attach: {type(e).__name__}: {e}")
-        return 0
-
-    closed = 0
-    for target in targets:
-        url = target.get("url") or ""
-        target_id = target.get("id") or ""
-        if not target_id or not is_target_newpost(url):
-            continue
-        try:
-            cdp_close_target(target_id)
-            closed += 1
-            log(f"  - closed stale newpost target before attach: id={target_id}, url={url}")
-        except Exception as e:
-            log(f"  ⚠️ failed to close stale newpost target id={target_id}: {type(e).__name__}: {e}")
-    return closed
 
 def log_best_effort(message):
     try:
@@ -1735,31 +1715,15 @@ def handle_dialog(dialog):
 
 publish_lock.acquire()
 
-log('Preflight: stale newpost target cleanup')
-closed_targets = cleanup_newpost_targets('stale newpost target cleanup')
-log(f"Preflight: stale newpost target cleanup OK (closed={closed_targets})")
-
 with sync_playwright() as p:
     log('Preflight: Playwright CDP attach')
-    browser = p.chromium.connect_over_cdp(CDP_URL)
-    log('Preflight: attach OK')
+    try:
+        browser = connect_preflight(p.chromium, int(CDP_PORT), CDP_CONNECT_TIMEOUT_MS, log)
+    except RuntimeError:
+        fail('publish/cdp-attach-failed')
 
-    # ── Step 1: 새 글 페이지 열기 ──
+    # 기존 탭을 닫거나 재사용하지 않고, 성공한 연결에서 실행 전용 탭을 만든다.
     log("Step 1: 새 글 페이지 열기")
-    # 기존 newpost 탭 재사용 금지. 같은 브라우저 세션의 이전 글 상태가 섞이는 걸 막는다.
-    # Lock 획득 후에도 같은 CDP에서 다른 블로그가 열려 있을 수 있으므로 현재 BLOG의 newpost만 닫는다.
-    for ctx in browser.contexts:
-        for pg in list(ctx.pages):
-            try:
-                pg_url = pg.url or ""
-                if "newpost" not in pg_url:
-                    continue
-                if BLOG and f"https://{BLOG}/manage/newpost" not in pg_url:
-                    continue
-                pg.close()
-            except Exception:
-                pass
-
     ctx0 = browser.contexts[0] if browser.contexts else browser.new_context()
     page = ctx0.new_page()
     run_page_target_id = capture_page_target_id(page)

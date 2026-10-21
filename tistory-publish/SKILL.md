@@ -90,6 +90,7 @@ bash scripts/publish.sh \
 | `--banner-alt` | | 배너 이미지 alt 텍스트 (기본: 제목 — 빈 alt로 업로드되지 않도록) |
 | `--blog` | | 블로그 도메인 (기본: tistory.com 첫 번째 블로그) |
 | `--cdp-port` | | OpenClaw Chrome CDP 포트 (기본: `TISTORY_CDP_PORT` 또는 스크립트 기본값) |
+| `--cdp-connect-timeout-ms` | | 실제 Playwright attach 제한: 기본 15000ms (`TISTORY_CDP_CONNECT_TIMEOUT_MS`), 허용 1000~60000ms. 성공 연결 재사용 |
 | `--helper` | | tistory-publish.js 경로 (기본: scripts/ 내) |
 | `--private` | | 비공개 발행 |
 | `--seo-check` | | 발행 전 SEO 검사 모드: `off`(기본)/`warn`/`strict`. `strict`는 error 발견 시 발행 중단 |
@@ -223,3 +224,9 @@ templates/my-template/
 ## 변경 이력
 
 [CHANGELOG.md](CHANGELOG.md) 참조
+
+### CDP 연결 실패 진단 (현재 publish-post.sh)
+
+발행 잠금 뒤 에디터 생성·로그인 전에 실제 연결을 확인합니다. 실패 시 최대 5초의 별도 프로세스에서 최대 8개 target을 target당 750ms 이내로 진단하고 `publish/cdp-attach-failed`로 중단합니다. 선택 `websocket-client`가 있으면 직접 page 채널의 상수 평가 응답으로 `responsive`를 확인하며, 연결 후 평가 시간 초과는 `unresponsive`, 모듈 부재·전송/평가 오류·지원 밖 종류·예산 소진은 `unknown`입니다. HTTP/target 목록 응답만으로 건강하다고 판정하지 않습니다.
+
+단계·시간·제한된 id/type·상태만 기록하고 URL 전체(origin/path 포함), 제목, 원시 예외 등은 생략합니다. 기존 탭 자동 종료·reload·브라우저 재시작은 하지 않습니다. 기존 URL 기반 newpost 정리는 제거했고, 발행 잠금과 기존 게이트·실행 소유 target의 성공 후 정리는 유지합니다. 레거시 발행/로그인 경로는 변경하지 않습니다. 과거 장애 target은 확인되지 않았으며 진단 타임아웃으로 원인 탭을 확정하지 않습니다. 상세 제한은 README의 CDP 연결 preflight 절을 따릅니다.
