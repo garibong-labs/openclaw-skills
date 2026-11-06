@@ -165,7 +165,7 @@ PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_POR
 import sys, json, time, os, re, subprocess, urllib.request, urllib.error, ipaddress
 import html as htmlmod
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 HARD_FAIL = None
 ALLOW_MISSING_IMAGES = os.environ.get('ALLOW_MISSING_IMAGES', '').lower() in ('1','true','yes')  # legacy: downgrade opt-in image policy failures to warnings
@@ -186,8 +186,8 @@ BANNER_ALT = sys.argv[12] if len(sys.argv) > 12 else ""
 
 sys.path.insert(0, sys.argv[13])
 from cdp_preflight import connect_preflight
+from cdp_owned_tab_cleanup import cleanup_owned_target
 CDP_CONNECT_TIMEOUT_MS = int(sys.argv[14])
-CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 NEWPOST_URL = f"https://{BLOG}/manage/newpost/?type=post" if BLOG else "https://www.tistory.com/manage/newpost/?type=post"
 POSTS_URL = f"https://{BLOG}/manage/posts/" if BLOG else "https://www.tistory.com/manage/posts/"
 
@@ -227,11 +227,6 @@ def fail(msg):
     print(json.dumps({"success": False, "error": msg}))
     sys.exit(1)
 
-def cdp_close_target(target_id, timeout=5):
-    url = f"{CDP_URL}/json/close/{quote(target_id, safe='')}"
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="replace")
-
 def log_best_effort(message):
     try:
         log(message)
@@ -245,11 +240,11 @@ def capture_page_target_id(page):
         session = page.context.new_cdp_session(page)
         info = session.send('Target.getTargetInfo')
         target_id = (info.get('targetInfo') or {}).get('targetId')
-        if isinstance(target_id, str) and target_id:
+        if isinstance(target_id, str) and target_id and (info.get('targetInfo') or {}).get('type') == 'page':
             return target_id
-        log_best_effort('  ⚠️ Daum Trends tab cleanup skipped: created page target id unavailable')
-    except Exception as e:
-        log_best_effort(f"  ⚠️ Daum Trends tab cleanup skipped: cannot identify created page: {type(e).__name__}: {e}")
+        log_best_effort('  ⚠️ Run tab cleanup skipped: created page target id unavailable')
+    except Exception:
+        log_best_effort('  ⚠️ Run tab cleanup skipped: cannot identify created page')
     finally:
         if session is not None:
             try:
@@ -258,17 +253,28 @@ def capture_page_target_id(page):
                 pass
     return None
 
-def close_daum_trends_run_target(template, target_id):
-    """Best-effort, bounded close of this run's exact CDP target after success."""
-    if template != 'daum-trends' or not target_id:
+def close_verified_run_target(template, target_id, result, post_publish_uncertain=False):
+    """Only the captured run page, after all applicable verification has returned."""
+    if template not in ('daum-trends', 'mk-review') or not target_id or not result.get('success'):
+        return False
+    # Daum retains its existing success eligibility. MK keeps uncertain runs open,
+    # including soft post-publish failures and missing publication identity.
+    if template == 'mk-review' and (
+        not result.get('postUrl') or not result.get('postId')
+        or result.get('warning') or post_publish_uncertain
+    ):
+        log_best_effort('  ⚠️ Run tab cleanup skipped: publication verification uncertain')
         return False
     try:
-        cdp_close_target(target_id, timeout=5)
-    except BaseException as e:
-        # Publication is already verified; even an interrupt here must not report it as failed.
-        log_best_effort(f"  ⚠️ Daum Trends tab cleanup skipped: close failed: {type(e).__name__}: {e}")
+        status = cleanup_owned_target(CDP_PORT, target_id)
+        if status != 'closed':
+            log_best_effort('  ⚠️ Run tab cleanup: closure unconfirmed; no publication retry')
+            return False
+    except BaseException:
+        # Publication is already verified; cleanup must never turn it into a retry.
+        log_best_effort('  ⚠️ Run tab cleanup: closure unconfirmed; no publication retry')
         return False
-    log_best_effort('  - Daum Trends tab cleanup: closed this run page')
+    log_best_effort('  - Run tab cleanup: confirmed this run target disappeared')
     return True
 
 OG_GATE_ENABLED = os.environ.get('TISTORY_OG_MATCH_GATE', '1').lower() not in ('0', 'false', 'no')
@@ -1519,7 +1525,11 @@ def confirm_public_publish(page, title_hint, before_posts=None, timeout_s=30):
         time.sleep(1)
     return None
 
-def republish_current_editor(page, private):
+def republish_current_editor(page, private, save_confirmation=None):
+    # Optional cleanup evidence only; retain all legacy return/warning semantics.
+    if save_confirmation is not None:
+        save_confirmation['confirmed'] = False
+    dialog_confirmed = False
     ensure_tinymce_ready(page, timeout_s=10, step_name='republish', allow_textarea_fallback=True, min_textarea_len=100)
     page.evaluate("typeof cleanupOGResiduals === 'function' ? cleanupOGResiduals() : null")
     page.evaluate("typeof tinymce !== 'undefined' && tinymce.activeEditor ? (tinymce.activeEditor.save(), 'ok') : 'no-tinymce'")
@@ -1531,27 +1541,37 @@ def republish_current_editor(page, private):
             dlg = page.evaluate("document.querySelector('[role=dialog]') ? 'yes' : 'no'")
         except Exception:
             dlg = 'yes'
+            dialog_confirmed = False
+            break
         if dlg == 'yes':
+            dialog_confirmed = True
             break
         time.sleep(1)
 
     if private:
         try:
-            page.evaluate("""(() => {
+            radio_selected = page.evaluate("""(() => {
                 const r = document.querySelector('input[type=radio][value="0"]');
-                if (r) { r.click(); r.checked = true; r.dispatchEvent(new Event('change', {bubbles:true})); }
+                if (r) { r.click(); r.checked = true; r.dispatchEvent(new Event('change', {bubbles:true})); return r.checked === true; }
+                return false;
             })()""")
             time.sleep(0.5)
-            page.evaluate("""(() => {
+            save_clicked = page.evaluate("""(() => {
                 const btns = document.querySelectorAll('button');
-                for (const b of btns) { if (b.textContent.includes('비공개 저장')) { b.click(); return; } }
+                for (const b of btns) { if (b.textContent.includes('비공개 저장')) { b.click(); return true; } }
+                return false;
             })()""")
         except Exception:
             return True
 
         for _ in range(20):
             try:
-                if "/manage/posts" in page.url:
+                current_url = page.url
+                if "/manage/posts" in current_url:
+                    if save_confirmation is not None:
+                        save_confirmation['confirmed'] = (
+                            dialog_confirmed and radio_selected is True and save_clicked is True
+                            and urlsplit(current_url).path.rstrip('/') == '/manage/posts')
                     return True
                 dlg_gone = page.evaluate("document.querySelector('[role=dialog]') ? 'open' : 'closed'")
                 if dlg_gone == 'closed':
@@ -1562,21 +1582,28 @@ def republish_current_editor(page, private):
         return False
     else:
         try:
-            page.evaluate("""(() => {
+            radio_selected = page.evaluate("""(() => {
                 const r = document.querySelector('input[type=radio][value="20"]');
-                if (r) { r.click(); r.checked = true; r.dispatchEvent(new Event('change', {bubbles:true})); }
+                if (r) { r.click(); r.checked = true; r.dispatchEvent(new Event('change', {bubbles:true})); return r.checked === true; }
+                return false;
             })()""")
             time.sleep(0.5)
-            page.evaluate("""(() => {
+            save_clicked = page.evaluate("""(() => {
                 const btns = document.querySelectorAll('button');
-                for (const b of btns) { if (b.textContent.includes('공개 발행')) { b.click(); return; } }
+                for (const b of btns) { if (b.textContent.includes('공개 발행')) { b.click(); return true; } }
+                return false;
             })()""")
         except Exception:
             return True
 
         for _ in range(20):
             try:
-                if "/manage/posts" in page.url:
+                current_url = page.url
+                if "/manage/posts" in current_url:
+                    if save_confirmation is not None:
+                        save_confirmation['confirmed'] = (
+                            dialog_confirmed and radio_selected is True and save_clicked is True
+                            and urlsplit(current_url).path.rstrip('/') == '/manage/posts')
                     return True
             except Exception:
                 return True
@@ -2130,6 +2157,7 @@ with sync_playwright() as p:
     # 이후 publish 중 새로 발생한 alert/confirm은 handle_dialog가 다시 기록한다.
     last_dialog_message = None
     warning = None
+    post_publish_uncertain = False
     post_info = None
     gap_check = None
     # 발행 직전 OG 뒤 빈 문단 정리 1회 더 수행 (티스토리 직렬화 과정에서 재삽입되는 케이스 대응)
@@ -2372,6 +2400,7 @@ with sync_playwright() as p:
                         target = post
                         break
                 if not target and posts:
+                    post_publish_uncertain = True
                     target = posts[0]
                 if target:
                     m = re.search(r'/([0-9]+)$', target.get('href', ''))
@@ -2381,6 +2410,7 @@ with sync_playwright() as p:
                         'text': target.get('text', ''),
                     }
             except Exception as e:
+                post_publish_uncertain = True
                 log(f"  ⚠️ private latest-post lookup failed: {e}")
         if not post_info:
             post_info = find_latest_post(page, final_title, before_posts=before_posts, timeout_s=60)
@@ -2405,17 +2435,26 @@ with sync_playwright() as p:
             second_cleanup = page.evaluate("typeof cleanupOGResiduals === 'function' ? cleanupOGResiduals() : null")
             log(f"  - post-publish cleanup result: {second_cleanup}")
             try:
-                saved = republish_current_editor(page, PRIVATE)
+                if TEMPLATE == 'mk-review':
+                    save_confirmation = {}
+                    saved = republish_current_editor(page, PRIVATE, save_confirmation=save_confirmation)
+                    if save_confirmation.get('confirmed') is not True:
+                        post_publish_uncertain = True
+                else:
+                    saved = republish_current_editor(page, PRIVATE)
                 log(f"  - post-publish resave: {saved}")
                 if not saved:
                     warning = "post_publish_resave_failed"
             except Exception as e:
                 log(f"  ⚠️ post-publish resave raced with navigation: {e}")
                 saved = False
+                post_publish_uncertain = True
 
         gap_url = post_info.get('publicUrl') or post_info['url']
         gap_check = inspect_gap(page, gap_url)
         log(f"  - gap check: {gap_check}")
+        if not isinstance(gap_check, dict) or gap_check.get('gapPersists') is not False:
+            post_publish_uncertain = True
         if gap_check and gap_check.get('gapPersists'):
             warning = "og_gap_persisted"
 
@@ -2493,7 +2532,7 @@ with sync_playwright() as p:
     print(json.dumps(result))
     if result.get("postUrl"):
         print(f"TISTORY_POST_URL={result['postUrl']}", file=sys.stderr)
-    close_daum_trends_run_target(TEMPLATE, run_page_target_id)
+    close_verified_run_target(TEMPLATE, run_page_target_id, result, post_publish_uncertain)
     browser.close()
     publish_lock.release()
 
