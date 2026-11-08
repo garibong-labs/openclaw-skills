@@ -97,7 +97,7 @@ def select_simple_account(page, expected_id, login_domains):
                 if ids.count() and passwords.count():
                     return 'form'
             else:
-                buttons = page.locator('button')
+                buttons = page.locator('button, a.wrap_profile[role="button"]')
                 for i in range(buttons.count()):
                     button = buttons.nth(i)
                     if button.is_visible() and button.is_enabled():

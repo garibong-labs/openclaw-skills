@@ -1,5 +1,6 @@
 """Offline AST tests: no credential files, Playwright import, CDP or network."""
 import ast
+from html.parser import HTMLParser
 from pathlib import Path
 import re
 import unittest
@@ -32,11 +33,13 @@ class Clock:
 
 
 class Element:
-    def __init__(self, text='', visible=True, enabled=True, action=None):
+    def __init__(self, text='', visible=True, enabled=True, action=None,
+                 tag='button', attrs=None):
         self.text, self.visible, self.enabled = text, visible, enabled
         self.action = action
         self.clicks = 0
         self.fills = []
+        self.tag, self.attrs = tag, attrs or {}
 
     def is_visible(self):
         return self.visible
@@ -76,6 +79,40 @@ class Locator:
         return self.first.inner_text(**kwargs)
 
 
+class ControlFixtureParser(HTMLParser):
+    """Synthetic controls only; span/div boundaries model displayed profile lines.
+
+    This is not a browser layout or Playwright selector-engine integration test.
+    """
+    def __init__(self, html):
+        super().__init__()
+        self.controls = []
+        self.current = None
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ('a', 'button'):
+            self.current = Element(tag=tag, attrs=dict(attrs))
+            self.controls.append(self.current)
+
+    def handle_data(self, data):
+        if self.current:
+            self.current.text += data
+
+    def handle_endtag(self, tag):
+        if self.current and tag in ('span', 'div'):
+            self.current.text += '\n'
+        if tag in ('a', 'button'):
+            self.current = None
+
+
+def account_anchor(identifier=EXPECTED):
+    return ControlFixtureParser(
+        '<a class="wrap_profile" role="button"><div class="cont_profile">'
+        '<span class="tit_profile">' + identifier + '</span>'
+        '<span>fixture name</span></div></a>').controls[0]
+
+
 class Page:
     def __init__(self, url=SIMPLE, buttons=()):
         self.url = url
@@ -95,7 +132,12 @@ class Page:
         if selector == 'body':
             return Locator([self.body])
         if selector == 'button':
-            return Locator(self.buttons)
+            return Locator([b for b in self.buttons if b.tag == 'button'])
+        if selector == 'button, a.wrap_profile[role="button"]':
+            # CSS selector lists return each matching node once.
+            return Locator([b for b in self.buttons if b.tag == 'button' or (
+                b.tag == 'a' and 'wrap_profile' in b.attrs.get('class', '').split()
+                and b.attrs.get('role') == 'button')])
         if selector.startswith('iframe'):
             return Locator(self.challenges)
         if selector.startswith('input[placeholder'):
@@ -132,6 +174,102 @@ class SimpleLoginTests(unittest.TestCase):
         self.assertEqual(page.id.fills, [])
         self.assertEqual(page.password.fills, [])
         self.assertEqual(page.submit.clicks, 0)
+
+    def test_actual_profile_anchor_selected_once_without_control_decoys(self):
+        exact = account_anchor()
+        decoys = ControlFixtureParser(
+            '<a class="btn_close" role="button">계정 삭제</a>'
+            '<a class="link_add" role="button">다른 계정으로 로그인</a>'
+            '<button class="btn_close">계정 삭제</button>'
+            '<button>다른 계정으로 로그인</button>').controls
+        page = Page(buttons=decoys + [exact])
+        exact.action = lambda: page.transition(FORM)
+        self.run_login(page)
+        self.assertEqual(exact.clicks, 1)
+        self.assertTrue(all(b.clicks == 0 for b in decoys))
+        self.assertEqual(page.id.fills, [EXPECTED])
+        self.assertEqual(page.submit.clicks, 1)
+
+    def test_native_role_button_is_counted_once(self):
+        exact = ControlFixtureParser(
+            '<button class="wrap_profile" role="button">' + EXPECTED + '</button>').controls[0]
+        page = Page(buttons=[exact])
+        exact.action = lambda: page.transition(AUTH)
+        self.run_login(page)
+        self.assertEqual(exact.clicks, 1)
+        self.assert_no_credentials(page)
+
+    def test_mixed_and_anchor_duplicate_exact_accounts_stop_immediately(self):
+        for duplicate in (Element(EXPECTED), account_anchor()):
+            with self.subTest(tag=duplicate.tag):
+                exact = account_anchor()
+                page = Page(buttons=[exact, duplicate])
+                self.assert_stops(page)
+                self.assertEqual((exact.clicks, duplicate.clicks), (0, 0))
+                self.assertEqual(self.clock.sleeps, [])
+                self.assert_no_credentials(page)
+
+    def test_profile_anchor_ineligible_identifiers_and_states(self):
+        candidates = [account_anchor(identifier) for identifier in (
+            'other@example.test', 'own***@example.test', 'owner@example',
+            'x' + EXPECTED, EXPECTED + '.invalid', 'Log in as ' + EXPECTED)]
+        hidden, disabled = account_anchor(), account_anchor()
+        hidden.visible, disabled.enabled = False, False
+        for exact in candidates + [hidden, disabled]:
+            with self.subTest(text=exact.text, visible=exact.visible, enabled=exact.enabled):
+                page = Page(buttons=[exact])
+                self.assert_stops(page)
+                self.assertEqual(exact.clicks, 0)
+                self.assert_no_credentials(page)
+
+    def test_non_profile_anchors_with_exact_identifier_are_not_candidates(self):
+        decoys = ControlFixtureParser(
+            '<a class="btn_close" role="button">' + EXPECTED + '</a>'
+            '<a class="link_add" role="button">' + EXPECTED + '</a>'
+            '<a class="wrap_profile">' + EXPECTED + '</a>').controls
+        page = Page(buttons=decoys)
+        self.assert_stops(page)
+        self.assertTrue(all(b.clicks == 0 for b in decoys))
+        self.assert_no_credentials(page)
+
+    def test_profile_anchor_delayed_render_then_enable_preserves_backoff(self):
+        page = Page()
+        exact = account_anchor()
+        exact.enabled = False
+        exact.action = lambda: page.transition(AUTH)
+        def appear(now):
+            if now >= 0.75:
+                page.buttons = [exact]
+            if now >= 1.75:
+                exact.enabled = True
+        self.clock.on_sleep = appear
+        self.run_login(page)
+        self.assertEqual(self.clock.sleeps, [0.25, 0.5, 1.0])
+        self.assertEqual(exact.clicks, 1)
+        self.assert_no_credentials(page)
+
+    def test_profile_anchor_challenge_before_during_and_after_selection(self):
+        for stage in ('before', 'during', 'after'):
+            with self.subTest(stage=stage):
+                exact = account_anchor()
+                page = Page(buttons=[exact] if stage != 'during' else [])
+                def challenge():
+                    page.body.text = '추가 인증'
+                if stage == 'before':
+                    challenge()
+                elif stage == 'during':
+                    def appear(now):
+                        page.buttons = [exact]
+                        challenge()
+                    self.clock.on_sleep = appear
+                else:
+                    def select():
+                        page.transition(FORM)
+                        challenge()
+                    exact.action = select
+                self.assertIn('사용자 인증', self.assert_stops(page))
+                self.assertEqual(exact.clicks, 1 if stage == 'after' else 0)
+                self.assert_no_credentials(page)
 
     def test_unique_exact_account_with_decoys_then_form(self):
         page = Page()
