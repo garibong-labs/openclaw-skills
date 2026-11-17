@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **MK 업로드 동일 src 쓰기 오탐 수정**
+  - 시작 시 원본 이미지 노드별 정확한 src 속성 값(null·빈 문자열 구분)을 고정하고 `attributeOldValue`를 수집. 콜백과 polling의 `takeRecords()` 모두에서 모든 oldValue와 최종 값이 원래 값과 같은 경우만 무변경으로 인정
+  - 실제 src 전이·같은 배치/별도 배치의 변경 후 복원·oldValue 증거 누락은 영구 실패 유지. body 교체·기존 src 재사용·복수 첨부 제한·유일 노드 안정화·노드 identity·재전달 차단 유지
+  - 동일 값 쓰기, null/빈 문자열 전이, 원본 여러 노드의 교차 기록과 기존 보호 조건을 합성 fixture로 집중 검증. 실제 DOM 검증은 별도이며, 과거 live 장애의 mutation old/new 값이 없어 해당 장애 원인을 확정하지 않음
+
 - **Stage3 CC R5 여섯 항목 수정**
   - 기사 filename을 단일 basename으로 제한하고 실제 원본을 fingerprint에 명시적으로 포함. 빈 값·점/상위/절대 경로·양쪽 구분자·source symlink를 사전 검증과 업로드 전 거부
   - 사전 검증 성공 후 원래 draft 결과를 재호출 없이 `draft-gate.json`에 0600으로 저장. 거절 시 디렉터리 미예약과 이후 실패 증거 유지

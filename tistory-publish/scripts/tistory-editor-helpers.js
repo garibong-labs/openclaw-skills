@@ -1649,11 +1649,20 @@ function beginMKImageUpload(token) {
   const editor = getSafeTinyEditor();
   if (!editor || mkImageUploadOperation || !token) throw new Error('MK upload unavailable');
   const body = editor.getBody();
-  const original = new Set(body.querySelectorAll('img'));
+  // Keep exact attribute values (including null/empty), bound to original nodes.
+  const original = new Map(Array.from(body.querySelectorAll('img'), node => [node, node.getAttribute('src')]));
   const operation = { token, editor, body, original, added: new Set(), error: '', src: '', since: 0, ambiguousSince: null };
   operation.observe = records => {
     for (const record of records) {
-      if (record.type === 'attributes' && original.has(record.target)) operation.error = 'existing image mutated';
+      if (record.type === 'attributes' && original.has(record.target)) {
+        const baseline = original.get(record.target);
+        // Every oldValue plus the final value must equal the immutable baseline.
+        // Subsequent oldValues expose intermediate transitions even for A->B->A
+        // in one batch. Missing oldValue (undefined) cannot prove a no-op.
+        if (record.attributeName !== 'src' || record.oldValue !== baseline || record.target.getAttribute('src') !== baseline) {
+          operation.error = 'existing image mutated';
+        }
+      }
       for (const node of record.addedNodes || []) {
         const imgs = node.nodeType === 1 ? [ ...(node.matches('img') ? [node] : []), ...node.querySelectorAll('img') ] : [];
         for (const img of imgs) if (!original.has(img)) operation.added.add(img);
@@ -1661,7 +1670,7 @@ function beginMKImageUpload(token) {
     }
   };
   operation.observer = new MutationObserver(operation.observe);
-  operation.observer.observe(body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+  operation.observer.observe(body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'], attributeOldValue: true });
   mkImageUploadOperation = operation;
   editor.selection.select(body, true);
   editor.selection.collapse(false);
@@ -1675,7 +1684,7 @@ function pollMKImageUpload(token) {
   if (op.editor.getBody() !== op.body) op.error = 'editor body replaced';
   for (const img of op.added) if (!op.body.contains(img)) op.added.delete(img);
   for (const img of op.added) {
-    if (Array.from(op.original).some(node => node.getAttribute('src') === img.getAttribute('src'))) {
+    if (Array.from(op.original.values()).some(src => src === img.getAttribute('src'))) {
       op.error = 'upload reused existing src';
     }
   }
