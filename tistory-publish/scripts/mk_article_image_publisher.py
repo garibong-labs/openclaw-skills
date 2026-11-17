@@ -351,7 +351,18 @@ class MKArticleImages:
         observed = page.evaluate('() => preserveMKOGThumbnailEvidence()')
         if not isinstance(observed, dict) or observed.get('success') is not True:
             raise ImagePublishError('observed OG thumbnail evidence unavailable')
-        html = page.evaluate('() => { tinymce.activeEditor.save(); return tinymce.activeEditor.getContent(); }')
+        try:
+            html = page.evaluate('''() => {
+                const editor = typeof tinymce !== 'undefined' && tinymce.activeEditor;
+                if (!editor || typeof editor.save !== 'function' || typeof editor.getBody !== 'function') return null;
+                editor.save();
+                const body = editor.getBody();
+                if (!body || body.nodeType !== 1) return null;
+                const html = body.innerHTML;
+                return typeof html === 'string' && html.trim() ? html : null;
+            }''')
+        except Exception as error:
+            raise ImagePublishError('MK editor body snapshot unavailable') from error
         return self.snapshot_gate('editor', html)
 
     def before_submit(self, page):

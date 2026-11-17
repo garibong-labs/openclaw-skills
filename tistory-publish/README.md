@@ -112,6 +112,8 @@ ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
 
 MK opt-in의 두 editor gate는 snapshot/save 전에 TinyMCE가 만든 최상위 bare `<p>` 중 BR(속성 없음 또는 정확한 `data-mce-bogus="1"`)·NBSP와 공백만 있는 문단에 `data-ke-size="size16"`을 추가합니다. 기존 속성/다른 size/의미 있는 자식/중첩 문단은 변경하지 않고 strict validator에 맡기며, helper 실행·성공 확인이 불가능하면 중단합니다. 노드 삭제·새 문단 생성·누락된 코멘트 간격 복구는 하지 않습니다. 기존 비-MK OG cleanup과 외부 validator는 유지합니다.
 
+MK editor snapshot은 빈 문단 정규화 → OG thumbnail 증거 보존 → `save()` 이후 현재 `getBody().innerHTML` 순서로 수집합니다. `getContent()`의 저장용 직렬화는 이미지를 `[##_Image]` shortcode로 바꿀 수 있으므로 검증에는 렌더링된 본문 DOM을 사용합니다. editor/body가 없거나 snapshot이 유효한 비어 있지 않은 문자열이 아니면 제출 전에 중단하며 저장용 직렬화로 대체하지 않습니다. 공개 snapshot과 legacy 경로는 그대로 유지합니다.
+
 이미지 증명은 최종 JSON의 `articleImageValidation.draft`/`.public`에 별도로 보고합니다. 기존 `TISTORY_OG_VALIDATOR`와 OG match gate가 켜져 있으면 추가 OG draft/public 검증도 실제로 실행합니다. MK 경로의 추가 validator에는 명시한 이미지 interpreter와 현재 입력/run/출처 증거를 전달하고, public에는 이미 수집한 snapshot/receipt/scope도 전달합니다. 해당 Stage2 CLI 인자가 필수이며 추가 OG validator의 stdout(최대 128KiB)은 마지막 비어 있지 않은 줄의 JSON 객체로 해석합니다. 앞선 진행/경고 로그는 허용하지만 정확한 `success:true`와 종료 코드 0을 모두 요구하며 오류/거절/배열/falsy/결과 누락은 중단합니다. 필수 Stage2 이미지 validator는 계속 전체 stdout을 하나의 JSON 객체로 해석하는 별도 계약입니다. 추가 OG 검증이 꺼져 있으면 `draftOgValidation`/`publicOgValidation`을 내보내지 않습니다. 이미지 gate는 추가 OG 설정과 무관하게 필수입니다.
 
 ### 실패와 검증 범위

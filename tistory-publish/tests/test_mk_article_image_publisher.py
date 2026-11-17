@@ -47,6 +47,49 @@ def failure_adapter(phase):
     return adapter
 
 
+def execute_editor_snapshot(expression, html, scenario='valid'):
+    """Execute the publisher's actual JS against save-time body replacement."""
+    harness = r'''
+const vm = require('node:vm');
+const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const trace = [];
+let body = {nodeType: 1, innerHTML: '<p>stale before save</p>'};
+const storage = typeof input.html === 'string' ? input.html.replace(
+    /<figure data-ke-type="image">[\s\S]*?<\/figure>/g, '[##_Image|synthetic-storage-image|_##]') : '';
+const editor = {
+    save() {
+        trace.push('save');
+        if (input.scenario === 'save-error') throw Error('save failed');
+        // Replacing the whole node exposes snapshots captured before save.
+        body = {nodeType: 1, get innerHTML() { trace.push('innerHTML'); return input.html; }};
+        if (input.scenario === 'missing-body') body = null;
+        if (input.scenario === 'non-element') body = {nodeType: 3, innerHTML: input.html};
+    },
+    getBody() {
+        trace.push('getBody');
+        if (input.scenario === 'body-error') throw Error('body failed');
+        return body;
+    },
+    getContent() { trace.push('getContent'); return storage; }
+};
+const context = {tinymce: {activeEditor: editor}};
+if (input.scenario === 'missing-tinymce') delete context.tinymce;
+if (input.scenario === 'missing-editor') context.tinymce.activeEditor = null;
+if (input.scenario === 'missing-save') delete editor.save;
+if (input.scenario === 'missing-getBody') delete editor.getBody;
+try {
+    const html = vm.runInNewContext('(' + input.expression + ')()', context, {timeout: 1000});
+    process.stdout.write(JSON.stringify({html, trace, storage}));
+} catch (error) {
+    process.stdout.write(JSON.stringify({error: error.message, trace, storage}));
+}
+'''
+    result = subprocess.run(['node', '-e', harness],
+                            input=json.dumps(dict(expression=expression, html=html, scenario=scenario)),
+                            capture_output=True, text=True, check=True, timeout=5)
+    return json.loads(result.stdout)
+
+
 def failure_namespace(adapter, post_info=None):
     functions = [n for n in embedded().body if isinstance(n, ast.FunctionDef)
                  and n.name in ('fail', 'mk_failure_result')]
@@ -352,9 +395,10 @@ class ContractTests(unittest.TestCase):
                         return {'success': True, 'normalized': 4}
                     if 'preserveMKOGThumbnailEvidence' in expression:
                         return {'success': True}
-                    self.assertIn('.save();', expression)
-                    self.assertIn('.getContent();', expression)
-                    return '<p data-ke-size="size16"><br data-mce-bogus="1"></p>'
+                    result = execute_editor_snapshot(
+                        expression, '<p data-ke-size="size16"><br data-mce-bogus="1"></p>')
+                    self.assertEqual(result['trace'], ['save', 'getBody', 'innerHTML'])
+                    return result['html']
                 page = Mock()
                 page.evaluate.side_effect = evaluate
                 adapter.snapshot_gate = Mock(side_effect=lambda *args: trace.append('snapshot_gate'))
@@ -363,11 +407,37 @@ class ContractTests(unittest.TestCase):
                 getattr(adapter, method)(page)
                 self.assertIn('normalizeMKEmptyParagraphs', trace[0])
                 self.assertIn('preserveMKOGThumbnailEvidence', trace[1])
-                self.assertIn('getContent', trace[2])
+                self.assertIn('getBody', trace[2])
                 self.assertEqual(trace[3:], ['snapshot_gate'] + (['binding', 'state'] if method == 'before_submit' else []))
                 adapter.snapshot_gate.assert_called_once_with(
                     'editor', '<p data-ke-size="size16"><br data-mce-bogus="1"></p>')
                 self.assertEqual(adapter.submitted, method == 'before_submit')
+
+    def test_invalid_editor_body_blocks_validator_and_submission(self):
+        cases = [(scenario, '<p>valid rendered body</p>') for scenario in (
+            'missing-tinymce', 'missing-editor', 'missing-save', 'missing-getBody',
+            'missing-body', 'non-element', 'save-error', 'body-error')]
+        cases += [('valid', value) for value in ('', ' \n\t', None, 42, {}, [])]
+        for method in ('editor_gate', 'before_submit'):
+            for scenario, html in cases:
+                with self.subTest(method=method, scenario=scenario, html=html):
+                    adapter = failure_adapter('draft')
+                    adapter.check_upload_evidence = Mock()
+                    adapter.gate = Mock()
+                    adapter.invoke = Mock()
+                    adapter.check_binding = Mock()
+                    page = FakeEditor(None)
+                    page.snapshot, page.snapshot_scenario = html, scenario
+                    with self.assertRaises(stage3.ImagePublishError):
+                        getattr(adapter, method)(page)
+                    self.assertEqual(adapter.phase, 'editor')
+                    self.assertFalse(adapter.submitted)
+                    self.assertNotIn('getContent', page.snapshot_trace)
+                    adapter.check_upload_evidence.assert_not_called()
+                    adapter.gate.assert_not_called()
+                    adapter.invoke.assert_not_called()
+                    adapter.check_binding.assert_not_called()
+                    adapter.write.assert_not_called()
 
     def test_normalizer_failure_blocks_both_gates_before_snapshot_or_submission(self):
         for method in ('editor_gate', 'before_submit'):
@@ -597,6 +667,8 @@ class FakeEditor:
         self.srcs = []
         self.uploads = []
         self.snapshot = ''
+        self.snapshot_scenario = 'valid'
+        self.snapshot_trace = []
         self.calls = []
         self.return_src = None
 
@@ -616,8 +688,12 @@ class FakeEditor:
             return {'success': True, 'normalized': 0}
         elif 'preserveMKOGThumbnailEvidence' in expression:
             return {'success': True}
-        elif 'getContent' in expression:
-            return self.snapshot
+        elif 'tinymce' in expression:
+            result = execute_editor_snapshot(expression, self.snapshot, self.snapshot_scenario)
+            self.snapshot_trace.extend(result['trace'])
+            if 'error' in result:
+                raise RuntimeError(result['error'])
+            return result['html']
         else:
             raise AssertionError(expression)
 
@@ -1283,6 +1359,24 @@ class RealStage2Tests(unittest.TestCase):
         result = subprocess.run(['node', str(SCRIPTS.parent / 'tests' / 'test_mk_empty_paragraph_helpers.js'),
                                  '--normalize'], input=json.dumps([spec]), capture_output=True, text=True, check=True)
         return json.loads(result.stdout)
+
+    def test_rendered_body_passes_unchanged_validator_while_storage_shortcodes_fail(self):
+        adapter, editor = self.uploaded()
+        rendered = editor.snapshot
+        # Tistory storage serialization drops rendered img nodes, including the
+        # separate banner. No production content or attachment URLs are used.
+        serialized = execute_editor_snapshot('() => tinymce.activeEditor.getContent()', rendered)['html']
+        self.assertEqual(serialized.count('[##_Image|'), 5)
+        self.assertNotIn('<figure data-ke-type="image">', serialized)
+        with self.assertRaises(stage3.ImagePublishError):
+            adapter.snapshot_gate('editor', serialized)
+        self.assertFalse(adapter.submitted)
+        self.assertTrue(adapter.editor_gate(editor)['success'])
+        self.assertEqual((adapter.evidence / 'editor.html').read_text(encoding='utf-8'), rendered)
+        self.assertEqual(rendered.count('<figure data-ke-type="image">'), 5)
+        adapter.before_submit(editor)
+        self.assertTrue(adapter.submitted)
+        self.assertEqual(editor.snapshot_trace, ['save', 'getBody', 'innerHTML'] * 2)
 
     def test_actual_js_normalized_bogus_br_passes_strict_external_editor_gate(self):
         adapter, editor = self.uploaded()
