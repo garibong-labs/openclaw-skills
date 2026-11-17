@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Stage3 CC R5 여섯 항목 수정**
+  - 기사 filename을 단일 basename으로 제한하고 실제 원본을 fingerprint에 명시적으로 포함. 빈 값·점/상위/절대 경로·양쪽 구분자·source symlink를 사전 검증과 업로드 전 거부
+  - 사전 검증 성공 후 원래 draft 결과를 재호출 없이 `draft-gate.json`에 0600으로 저장. 거절 시 디렉터리 미예약과 이후 실패 증거 유지
+  - 태그 `tags`, 동기화/중복 검사/다이얼로그 `publish`, snapshot 입력 오류 `editor`/`public` phase를 실제 경계에 지정. URL/ID 복구 시 실패 phase 보존
+  - parser 종료만으로 잡히지 않는 잘린 태그/속성과 rawtext 내부 marker를 인용값·주석을 구분하는 lexical 검사로 차단. 실제 legacy shell과 MK-disabled embedded 경로 및 무해한 literal 회귀 추가
+  - 배너 audit CLI에 import·dependency API·입력·배너·embed·내부 오류 고정 진단 추가. 경로/원시 예외를 출력하지 않으며 외부 Stage2 없이 실행되는 모듈 mock 진입점 회귀 추가
+  - Step11이 실제 공개 fetch timeout/용량/decode/validator·추가 OG 원인을 마스킹·제한하여 JSON/state에 전달. 발행 identity·non-zero·자동 재시도 금지 유지
+
 - **Stage3 CC R4 다섯 항목 수정**
   - 실제 embedded `fail` 경로의 호출자 코드/원인을 credential 마스킹·500자 제한한 `detail`로 최종 JSON과 실패 state에 동일 보존. Step6 실패는 `representative` phase로 기록하고 URL/ID 복구는 원래 실패 phase 유지
   - 업로드 결과 대기를 rAF 대신 250ms 숫자 polling으로 지정. 오류 시 해당 token의 observer만 해제하고 실패 작업을 유지하며 원인 예외 보존·두 번째 파일 전달 차단

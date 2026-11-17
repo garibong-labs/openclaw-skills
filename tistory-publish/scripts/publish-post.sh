@@ -2199,6 +2199,8 @@ with sync_playwright() as p:
         log("Step 6: 완료")
 
     # ── Step 7: 태그 ──
+    if mk_images.enabled:
+        mk_images.phase = 'tags'
     if TAGS_STR:
         log("Step 7: 태그")
         tags = list(dict.fromkeys(t.strip() for t in TAGS_STR.split(',') if t.strip()))
@@ -2250,6 +2252,8 @@ with sync_playwright() as p:
     else:
         log("Step 7: 태그 생략")
 
+    if mk_images.enabled:
+        mk_images.phase = 'publish'
     page.evaluate("typeof tinymce !== 'undefined' && tinymce.activeEditor ? (tinymce.activeEditor.save(), 'ok') : 'no-tinymce'")
     time.sleep(1)
     current_url = page.url
@@ -2307,6 +2311,7 @@ with sync_playwright() as p:
 
     if mk_images.enabled:
         mk_images.editor_gate(page)
+        mk_images.phase = 'publish'
 
     try:
         pre_complete_state = debug_newpost_state(page)
@@ -2609,8 +2614,9 @@ with sync_playwright() as p:
             public_image_gate = mk_images.public_gate(fetch_mk_public)
             if should_run_og_gate():
                 public_og_gate = run_og_gate('public', mk_images.post_url)
-        except Exception:
-            fail('MK public image/OG validation failed; publication retained; no automatic retry')
+        except Exception as error:
+            fail('MK public image/OG validation failed; ' + bounded_diagnostic(error, 500)
+                 + '; publication retained; no automatic retry')
     elif not PRIVATE and post_info and post_info.get('url'):
         log("Step 11: 공개 페이지 검증")
         import urllib.request

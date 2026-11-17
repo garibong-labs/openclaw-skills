@@ -7,11 +7,12 @@ import hashlib
 import json
 import mimetypes
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import subprocess
 import sys
 from html.parser import HTMLParser
+from html import unescape
 from urllib.parse import urlsplit
 import uuid
 
@@ -70,6 +71,17 @@ def guard_legacy_markers(body, template):
                 self.forbidden = True
     parser = Markers()
     parser.feed(body)
+    parser.close()
+    # HTMLParser buffers incomplete tags and treats script/style as raw text.
+    # Scan apparent start tags too, keeping quoted values and comments intact so
+    # prose, escaped examples and marker names inside unrelated values are safe.
+    tags = re.compile(r'''<!--.*?(?:-->|$)|<[a-zA-Z][a-zA-Z0-9:_-]*(?=[\s/>]|$)((?:[^<>"']|"[^"]*(?:"|$)|'[^']*(?:'|$))*)(?:>|(?=<)|$)''', re.S)
+    attrs = re.compile(r'''\s*([^\s/=>]+)(?:\s*=\s*(?:"([^"]*)(?:"|$)|'([^']*)(?:'|$)|([^\s>]+)))?''')
+    for tag in tags.finditer(body):
+        if tag.group(1) is not None:
+            parsed = [(a.group(1).lower(), unescape(next((v for v in a.groups()[1:] if v is not None), '')))
+                      for a in attrs.finditer(tag.group(1))]
+            parser.handle_starttag('', parsed)
     if parser.forbidden:
         raise ImagePublishError('image marker draft requires --mk-article-images and complete evidence')
 
@@ -127,13 +139,24 @@ class MKArticleImages:
         if len(self.plan['articles']) != 4 or len(self.assets) != 4:
             raise ImagePublishError('four verified assets required')
         for entry in self.plan['articles']:
-            article_mime(entry['filename'], (self.run_dir / entry['filename']).read_bytes())
+            article_mime(entry['filename'], self.article_source(entry['filename']).read_bytes())
         self.check_binding()
         if digest(self.banner.read_bytes()) in [asset['sha256'] for asset in self.assets]:
             raise ImagePublishError('banner reuses article bytes')
         self.evidence.mkdir(mode=0o700, parents=False, exist_ok=False)
         self.ready = True
+        self.write('draft-gate.json', self.draft_validation)
         self.write('state.json', self.status('draft-verified'))
+
+    def article_source(self, filename):
+        if (not isinstance(filename, str) or not filename or filename in ('.', '..')
+                or re.search(r'[/\\\x00]', filename) or Path(filename).is_absolute()
+                or PureWindowsPath(filename).drive or Path(filename).name != filename):
+            raise ImagePublishError('article filename must be a plain basename')
+        source = self.run_dir / filename
+        if source.is_symlink() or source.resolve().parent != self.run_dir.resolve():
+            raise ImagePublishError('article source symlink escape unsupported')
+        return source
 
     def fingerprint(self):
         state = json.loads((self.run_dir / 'manifest.json').read_text(encoding='utf-8'))
@@ -141,6 +164,9 @@ class MKArticleImages:
                  Path(state['engine']['path']), Path(__file__).absolute(),
                  self.validator.parent / 'mk_article_images.py',
                  self.validator.parent / 'mk_image_validation.py'}
+        # The exact source used for FilePayload must be inside this binding,
+        # independently of the recursive directory enumeration.
+        paths.update(self.article_source(e['filename']) for e in state['plan']['articles'])
         paths.update(p for p in self.run_dir.rglob('*') if p.is_file())
         result = {}
         for path in sorted(paths):
@@ -261,7 +287,7 @@ class MKArticleImages:
             raise ImagePublishError('article uploads already started')
         for entry, asset in zip(self.plan['articles'], self.assets):
             self.check_binding()
-            content = (self.run_dir / entry['filename']).read_bytes()
+            content = self.article_source(entry['filename']).read_bytes()
             if digest(content) != asset['sha256']:
                 raise ImagePublishError('article source SHA changed')
             src = self.upload_one(page, upload, {'name': entry['filename'], 'mimeType': article_mime(entry['filename'], content), 'buffer': content}, entry)
@@ -296,9 +322,9 @@ class MKArticleImages:
             raise ImagePublishError('operation receipt/banner evidence changed')
 
     def snapshot_gate(self, phase, html, post_url=None):
+        self.phase = phase
         if not isinstance(html, str) or not html or len(html.encode('utf-8')) > 10 * 1024 * 1024:
             raise ImagePublishError('bounded nonempty snapshot required')
-        self.phase = phase
         self.check_upload_evidence()
         snapshot = self.write(phase + '.html', html)
         snapshot_sha = digest(snapshot.read_bytes())
@@ -352,31 +378,58 @@ class MKArticleImages:
 def audit_banner(directory, snapshot, banner_file, selector):
     # Read-only Stage2 helper import. Never import/execute the generation engine.
     sys.path.insert(0, directory)
-    import mk_image_validation as images
-    root = images.content_root(Path(snapshot).read_text(encoding='utf-8'), selector or None)
-    nodes = list(root.walk())
-    banner = json.loads(Path(banner_file).read_text(encoding='utf-8'))
-    identity = images.attachment_identity(banner['src'])
-    first = next(i for i, n in enumerate(nodes) if n.tag == 'h2' and images.compact(n.text()) != '들어가며')
-    before = [n for n in nodes[:first] if n.tag == 'img']
-    if len(before) != 1 or images.attachment_identity(before[0].attrs.get('src', '')) != identity or before[0].attrs.get('alt') != banner['alt']:
-        raise ImagePublishError('separate banner missing/extra/src/alt mismatch')
-    images.require_visible(before[0])
-    figure = before[0].parent
-    while figure is not None and figure.tag != 'figure':
-        figure = figure.parent
-    if figure is None or figure.attrs.get('data-ke-type') != 'image':
-        raise ImagePublishError('native banner figure required')
-    if any(n.tag in ('iframe', 'embed', 'object', 'video', 'audio', 'svg', 'canvas') for n in nodes):
-        raise ImagePublishError('unsupported non-image embed')
+    try:
+        import mk_image_validation as images
+    except Exception:
+        raise ImagePublishError('audit/import-failed') from None
+    if not all(callable(getattr(images, name, None)) for name in
+               ('content_root', 'attachment_identity', 'require_visible', 'compact')):
+        raise ImagePublishError('audit/dependency-api')
+    try:
+        html = Path(snapshot).read_text(encoding='utf-8')
+        banner = json.loads(Path(banner_file).read_text(encoding='utf-8'))
+        if not isinstance(banner, dict) or not all(isinstance(banner.get(k), str) and banner[k] for k in ('src', 'alt')):
+            raise ValueError('banner input required')
+    except (OSError, UnicodeError, ValueError):
+        raise ImagePublishError('audit/input-invalid') from None
+    try:
+        root = images.content_root(html, selector or None)
+    except (AttributeError, TypeError):
+        raise ImagePublishError('audit/dependency-api') from None
+    except Exception:
+        raise ImagePublishError('audit/input-invalid') from None
+    try:
+        nodes = list(root.walk())
+        first = next((i for i, n in enumerate(nodes) if n.tag == 'h2' and images.compact(n.text()) != '들어가며'), None)
+        if first is None:
+            raise ImagePublishError('audit/input-invalid')
+        identity = images.attachment_identity(banner['src'])
+        before = [n for n in nodes[:first] if n.tag == 'img']
+        if len(before) != 1 or images.attachment_identity(before[0].attrs.get('src', '')) != identity or before[0].attrs.get('alt') != banner['alt']:
+            raise ImagePublishError('audit/banner-mismatch')
+        images.require_visible(before[0])
+        figure = before[0].parent
+        while figure is not None and figure.tag != 'figure':
+            figure = figure.parent
+        if figure is None or figure.attrs.get('data-ke-type') != 'image':
+            raise ImagePublishError('audit/banner-mismatch')
+        if any(n.tag in ('iframe', 'embed', 'object', 'video', 'audio', 'svg', 'canvas') for n in nodes):
+            raise ImagePublishError('audit/embed-mismatch')
+    except (AttributeError, TypeError):
+        raise ImagePublishError('audit/dependency-api') from None
+    except ValueError:
+        raise ImagePublishError('audit/banner-mismatch') from None
     return {'success': True}
 
 
 if __name__ == '__main__':
     try:
         if len(sys.argv) != 6 or sys.argv[1] != '--audit-banner':
-            raise ImagePublishError('internal audit arguments required')
+            raise ImagePublishError('audit/input-invalid')
         print(json.dumps(audit_banner(*sys.argv[2:])))
+    except ImagePublishError as error:
+        print(json.dumps({'success': False, 'error': str(error)}))
+        sys.exit(1)
     except Exception:
-        print(json.dumps({'success': False, 'error': 'banner/embed audit failed'}))
+        print(json.dumps({'success': False, 'error': 'audit/internal-failed'}))
         sys.exit(1)
