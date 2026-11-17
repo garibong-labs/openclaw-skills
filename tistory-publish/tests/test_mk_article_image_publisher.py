@@ -341,6 +341,57 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(adapter.submitted)
         adapter.write.assert_not_called()
 
+    def test_editor_and_before_submit_normalize_before_og_save_and_snapshot(self):
+        for method in ('editor_gate', 'before_submit'):
+            with self.subTest(method=method):
+                adapter = failure_adapter('draft')
+                trace = []
+                def evaluate(expression):
+                    trace.append(expression)
+                    if 'normalizeMKEmptyParagraphs' in expression:
+                        return {'success': True, 'normalized': 4}
+                    if 'preserveMKOGThumbnailEvidence' in expression:
+                        return {'success': True}
+                    self.assertIn('.save();', expression)
+                    self.assertIn('.getContent();', expression)
+                    return '<p data-ke-size="size16"><br data-mce-bogus="1"></p>'
+                page = Mock()
+                page.evaluate.side_effect = evaluate
+                adapter.snapshot_gate = Mock(side_effect=lambda *args: trace.append('snapshot_gate'))
+                adapter.check_binding = Mock(side_effect=lambda: trace.append('binding'))
+                adapter.write.side_effect = lambda *args: trace.append('state')
+                getattr(adapter, method)(page)
+                self.assertIn('normalizeMKEmptyParagraphs', trace[0])
+                self.assertIn('preserveMKOGThumbnailEvidence', trace[1])
+                self.assertIn('getContent', trace[2])
+                self.assertEqual(trace[3:], ['snapshot_gate'] + (['binding', 'state'] if method == 'before_submit' else []))
+                adapter.snapshot_gate.assert_called_once_with(
+                    'editor', '<p data-ke-size="size16"><br data-mce-bogus="1"></p>')
+                self.assertEqual(adapter.submitted, method == 'before_submit')
+
+    def test_normalizer_failure_blocks_both_gates_before_snapshot_or_submission(self):
+        for method in ('editor_gate', 'before_submit'):
+            for result in (None, False, [], {}, {'success': False}, {'success': 1}, {'success': 'true'},
+                           RuntimeError('helper missing or evaluation failed')):
+                with self.subTest(method=method, result=result):
+                    adapter = failure_adapter('draft')
+                    adapter.snapshot_gate = Mock()
+                    adapter.check_binding = Mock()
+                    page = Mock()
+                    if isinstance(result, Exception):
+                        page.evaluate.side_effect = result
+                    else:
+                        page.evaluate.return_value = result
+                    with self.assertRaisesRegex(stage3.ImagePublishError, 'normalization un'):
+                        getattr(adapter, method)(page)
+                    self.assertEqual(adapter.phase, 'editor')
+                    self.assertFalse(adapter.submitted)
+                    self.assertEqual(page.evaluate.call_count, 1)
+                    self.assertIn('normalizeMKEmptyParagraphs', page.evaluate.call_args.args[0])
+                    adapter.snapshot_gate.assert_not_called()
+                    adapter.check_binding.assert_not_called()
+                    adapter.write.assert_not_called()
+
     def test_strict_file_delivery_does_not_retry_after_ambiguous_chooser_error(self):
         # Reuse the real embedded upload function with a chooser that might
         # already have accepted the bytes when it raises.
@@ -561,6 +612,8 @@ class FakeEditor:
             src = self.return_src or 'https://cdn.example/attachment-%s.jpg?token=whole-%s' % (index, index)
             self.srcs.append(src)
             return {'success': True, 'token': self.token, 'src': src}
+        elif 'normalizeMKEmptyParagraphs' in expression:
+            return {'success': True, 'normalized': 0}
         elif 'preserveMKOGThumbnailEvidence' in expression:
             return {'success': True}
         elif 'getContent' in expression:
@@ -1225,6 +1278,55 @@ class RealStage2Tests(unittest.TestCase):
         adapter.upload_banner(editor, editor.upload)
         editor.snapshot = render_editor(self.bundle, editor)
         return adapter, editor
+
+    def normalize_fixture(self, spec):
+        result = subprocess.run(['node', str(SCRIPTS.parent / 'tests' / 'test_mk_empty_paragraph_helpers.js'),
+                                 '--normalize'], input=json.dumps([spec]), capture_output=True, text=True, check=True)
+        return json.loads(result.stdout)
+
+    def test_actual_js_normalized_bogus_br_passes_strict_external_editor_gate(self):
+        adapter, editor = self.uploaded()
+        original = editor.snapshot
+        bare = '<p><br data-mce-bogus="1"></p>'
+        editor.snapshot = original.replace('</a></figure>', '</a></figure>' + bare)
+        self.assertEqual(editor.snapshot.count(bare), 4)
+        with self.assertRaisesRegex(stage3.ImagePublishError, 'invalid spacer'):
+            adapter.editor_gate(editor)
+        self.assertFalse(adapter.submitted)
+        normalized = self.normalize_fixture({'tag': 'p', 'children': [
+            {'tag': 'br', 'attrs': {'data-mce-bogus': '1'}}]})
+        self.assertEqual(normalized['result'], {'success': True, 'normalized': 1})
+        self.assertEqual(normalized['html'], '<p data-ke-size="size16"><br data-mce-bogus="1"></p>')
+        editor.snapshot = editor.snapshot.replace(bare, normalized['html'])
+        self.assertEqual(editor.snapshot.replace(normalized['html'], ''), original)
+        self.assertTrue(adapter.editor_gate(editor)['success'])
+        adapter.before_submit(editor)
+        self.assertTrue(adapter.submitted)
+
+    def test_actual_js_leaves_unsafe_paragraphs_for_strict_external_rejection(self):
+        adapter, editor = self.uploaded()
+        original = editor.snapshot
+        br = {'tag': 'br'}
+        variants = [{'tag': 'p', 'children': [{'tag': tag}, br]}
+                    for tag in ('img', 'iframe', 'video', 'svg', 'a', 'span', 'script', 'style')]
+        variants += [{'tag': 'p', 'attrs': attrs, 'children': [br]} for attrs in (
+            {'hidden': ''}, {'style': 'display:none'}, {'onclick': 'run()'}, {'contenteditable': 'false'},
+            {'data-image-marker': 'unexpected'}, {'data-ke-size': 'size14'})]
+        variants += [{'tag': 'p', 'children': [{'tag': 'br', 'attrs': {'onclick': 'run()'}}]}]
+        for spec in variants:
+            with self.subTest(spec=spec):
+                normalized = self.normalize_fixture(spec)
+                self.assertEqual(normalized['result']['normalized'], 0)
+                editor.snapshot = original.replace('</a></figure>', '</a></figure>' + normalized['html'], 1)
+                with self.assertRaises(stage3.ImagePublishError):
+                    adapter.before_submit(editor)
+                self.assertFalse(adapter.submitted)
+        # Normalization never manufactures the required adjacent comment spacer.
+        editor.snapshot = original.replace('<p data-ke-size="size16">&nbsp;</p>', '')
+        self.assertNotEqual(editor.snapshot, original)
+        with self.assertRaisesRegex(stage3.ImagePublishError, 'comment_spacing_missing'):
+            adapter.before_submit(editor)
+        self.assertFalse(adapter.submitted)
 
     def test_real_validator_all_phases_receipt_bytes_and_separate_banner(self):
         adapter, editor = self.uploaded()

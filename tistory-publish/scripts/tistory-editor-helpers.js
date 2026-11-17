@@ -1754,6 +1754,42 @@ function finishMKImageUpload({token, entry, bannerAlt}) {
   return { success: true, token, src: op.src };
 }
 
+/**
+ * MK opt-in editor gate 전용. TinyMCE가 만든 최상위 bare p의 서식만 보완한다.
+ * 본문/카드 내부, 기존 속성, 의미 있는 자식은 건드리지 않고 strict gate에 맡긴다.
+ * 노드 삭제/삽입이나 누락된 코멘트 간격 복구는 하지 않는다.
+ */
+function normalizeMKEmptyParagraphs() {
+  const editor = getSafeTinyEditor();
+  if (!editor || typeof editor.getBody !== 'function') throw new Error('MK editor unavailable');
+  const body = editor.getBody();
+  if (!body) throw new Error('MK editor body unavailable');
+  let normalized = 0;
+  for (const p of Array.from(body.children)) {
+    // size16을 포함해 기존 속성은 전부 보존. 다른 size/marker/hidden/event 등은
+    // 서식을 덧붙여 유효한 spacer처럼 보이게 만들지 않는다.
+    if (p.tagName !== 'P' || p.attributes.length !== 0) continue;
+    let hasSpacer = false;
+    const inert = Array.from(p.childNodes).every(child => {
+      if (child.nodeType === 3) {
+        if (child.data.includes('\u00a0')) hasSpacer = true;
+        return /^[\t\n\f\r \u00a0]*$/.test(child.data);
+      }
+      if (child.nodeType !== 1 || child.tagName !== 'BR' || child.childNodes.length !== 0) return false;
+      const attrs = Array.from(child.attributes);
+      if (attrs.some(attr => attr.name !== 'data-mce-bogus' || attr.value !== '1')) return false;
+      hasSpacer = true;
+      return true;
+    });
+    if (!inert || !hasSpacer) continue;
+    p.setAttribute('data-ke-size', 'size16');
+    normalized++;
+  }
+  if (normalized) editor.setDirty(true);
+  // save는 호출자가 정규화/OG 증거 수집 후 snapshot 직전에 수행한다.
+  return { success: true, normalized };
+}
+
 function preserveMKOGThumbnailEvidence() {
   const editor = getSafeTinyEditor();
   if (!editor) throw new Error('MK editor unavailable');
