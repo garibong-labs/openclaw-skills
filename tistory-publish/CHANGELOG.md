@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **MK editor gate의 실제 본문 DOM snapshot 사용**
+  - 빈 문단 정규화·OG thumbnail 증거 보존·`save()` 순서를 유지하고, 저장 후 현재 `getBody().innerHTML`을 strict Stage2에 전달. 이미지가 shortcode로 직렬화되는 `getContent()`는 사용하지 않음
+  - editor/body 부재·잘못된/빈 snapshot·읽기 오류는 제출 전 중단. validator·receipt·공개 snapshot·legacy 경로 유지
+  - 실제 snapshot JS의 저장 후 body 교체/호출 순서/실패 차단과 합성 네 기사·별도 배너의 DOM 통과 및 저장용 직렬화 거절 회귀 추가
+
 - **MK Stage3 TinyMCE 빈 문단 서식 보완**
   - MK opt-in의 editor gate와 최종 submit 직전 gate에서 snapshot/save 전에 최상위 bare `<p>`의 BR(속성 없음 또는 정확한 `data-mce-bogus="1"`)·NBSP·공백만 확인해 `data-ke-size="size16"`을 추가. 노드 삭제/삽입, 누락된 코멘트 간격 복구, 기존 속성 변경은 하지 않음
   - 의미 있는 텍스트·다른 자식·hidden/event/marker 등 속성·충돌하는 size·중첩 문단은 그대로 strict Stage2 검증에 전달. helper 부재/평가 오류/성공 결과 누락은 제출 전 중단하며 기존 비-MK OG cleanup과 외부 validator는 유지
