@@ -31,6 +31,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ALLOW_DIRECT_TISTORY_PUBLISH="${ALLOW_DIRECT_TISTORY_PUBLISH:-}"
 RUN_TOKEN="${RUN_TOKEN:-}"
 REQUIRE_PUBLIC_IMAGE_FIGURES="${REQUIRE_PUBLIC_IMAGE_FIGURES:-0}"
+MK_ARTICLE_IMAGES=false
+IMAGE_INPUT=""
+IMAGE_RUN_DIR=""
+IMAGE_VALIDATOR=""
+IMAGE_VALIDATOR_PYTHON=""
+SOURCE_EVIDENCE_FILE=""
+IMAGE_EVIDENCE_DIR=""
+IMAGE_CONTENT_SELECTOR=""
 
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 fail() { echo "{\"success\":false,\"error\":\"$*\"}" ; exit 1; }
@@ -55,6 +63,14 @@ Options:
   --cdp-port       OpenClaw Chrome CDP 포트 (기본: TISTORY_CDP_PORT 또는 18800)
   --cdp-connect-timeout-ms N
                   실제 Playwright 연결 제한 시간 (1000~60000ms, 기본: 15000)
+  --mk-article-images
+                  MK Stage3 opt-in (공개 mk-review 전용, 아래 경로 모두 필수)
+  --image-input FILE --image-run-dir DIR
+  --image-validator FILE --image-validator-python EXECUTABLE
+  --source-evidence-file FILE --image-evidence-dir NEW_DIR
+                  현재 선정 입력/Stage1 run/Stage2 validator+siblings/명시적 Python/출처 증거/새 증거 디렉터리
+  --image-content-selector SELECTOR
+                  공개 snapshot 본문 scope (선택, #id/.class/tag)
   --private        비공개 발행
   --seo-check      발행 전 SEO 검사: off|warn|strict (기본: off, strict는 error 시 발행 중단)
   --seo-keyword    SEO 핵심 키워드 (기본: 제목 첫 단어)
@@ -84,6 +100,19 @@ while [[ $# -gt 0 ]]; do
     --seo-keyword)   SEO_KEYWORD="$2"; shift 2;;
     --seo-min-body-chars) SEO_MIN_BODY_CHARS="$2"; shift 2;;
     --require-public-image-figures) REQUIRE_PUBLIC_IMAGE_FIGURES="$2"; shift 2;;
+    --mk-article-images) MK_ARTICLE_IMAGES=true; shift;;
+    --image-input|--image-run-dir|--image-validator|--image-validator-python|--source-evidence-file|--image-evidence-dir|--image-content-selector)
+      [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || fail "image option value required"
+      case "$1" in
+        --image-input) IMAGE_INPUT="$2";;
+        --image-run-dir) IMAGE_RUN_DIR="$2";;
+        --image-validator) IMAGE_VALIDATOR="$2";;
+        --image-validator-python) IMAGE_VALIDATOR_PYTHON="$2";;
+        --source-evidence-file) SOURCE_EVIDENCE_FILE="$2";;
+        --image-evidence-dir) IMAGE_EVIDENCE_DIR="$2";;
+        --image-content-selector) IMAGE_CONTENT_SELECTOR="$2";;
+      esac
+      shift 2;;
     --private)       PRIVATE=true; shift;;
     -h|--help)       usage; exit 0;;
     *) echo "Unknown option: $1" >&2; usage; exit 1;;
@@ -161,7 +190,7 @@ TISTORY_LOGIN_SCRIPT="${TISTORY_LOGIN_SCRIPT:-$SCRIPT_DIR/login.sh}"
 TMP_STDERR="$(mktemp -t tistory-publish-stderr.XXXXXX)"
 
 set +e
-PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" "$REQUIRE_PUBLIC_IMAGE_FIGURES" "$TEMPLATE" "$BANNER_ALT" "$SCRIPT_DIR" "$CDP_CONNECT_TIMEOUT_MS" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
+PYTHON_RESULT=$(TISTORY_LOGIN_SCRIPT="$TISTORY_LOGIN_SCRIPT" python3 - "$CDP_PORT" "$BLOG" "$TITLE" "$BODY_FILE" "$CATEGORY" "$TAGS" "$BANNER" "$HELPER" "$PRIVATE" "$REQUIRE_PUBLIC_IMAGE_FIGURES" "$TEMPLATE" "$BANNER_ALT" "$SCRIPT_DIR" "$CDP_CONNECT_TIMEOUT_MS" "$MK_ARTICLE_IMAGES" "$IMAGE_INPUT" "$IMAGE_RUN_DIR" "$IMAGE_VALIDATOR" "$IMAGE_VALIDATOR_PYTHON" "$SOURCE_EVIDENCE_FILE" "$IMAGE_EVIDENCE_DIR" "$IMAGE_CONTENT_SELECTOR" 2> >(tee "$TMP_STDERR" >&2) << 'PYTHON_SCRIPT'
 import sys, json, time, os, re, subprocess, urllib.request, urllib.error, ipaddress
 import html as htmlmod
 from pathlib import Path
@@ -224,8 +253,26 @@ def public_url_for(url):
 
 def log(msg): print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr)
 def fail(msg):
+    if globals().get('mk_images') and mk_images.enabled:
+        result = mk_failure_result(msg)
+        print(json.dumps(result))
+        sys.exit(1)
     print(json.dumps({"success": False, "error": msg}))
     sys.exit(1)
+
+def mk_failure_result(error):
+    # Confirmation can precede Step 9. Preserve that exact evidence even if a
+    # later lookup or navigation fails before the normal Stage3 public gate.
+    info = globals().get('post_info') or {}
+    failed_phase = mk_images.phase
+    if not mk_images.post_url and info.get('url') and info.get('id'):
+        try:
+            mk_images.confirm_publication(info.get('publicUrl') or public_url_for(info['url']), info['id'])
+        except Exception:
+            pass
+        finally:
+            mk_images.phase = failed_phase
+    return mk_images.failure(error)
 
 def log_best_effort(message):
     try:
@@ -296,7 +343,32 @@ def run_og_gate(mode, *args):
         cmd += ['--body-file', BODY_FILE, '--post-url', args[0]]
     else:
         fail(f"unknown OG validation mode: {mode}")
+    image_mode = bool(globals().get('mk_images') and mk_images.enabled)
+    if image_mode:
+        cmd[0] = str(mk_images.interpreter)
+        cmd += ['--image-input', str(mk_images.current), '--image-run-dir', str(mk_images.run_dir),
+                '--source-evidence-file', str(mk_images.sources)]
+        if mode == 'public':
+            cmd += ['--snapshot-file', str(mk_images.evidence / 'public.html'),
+                    '--upload-receipt', str(mk_images.evidence / 'upload-receipt.json')]
+            if mk_images.selector:
+                cmd += ['--content-selector', mk_images.selector]
+        mk_images.check_binding()
     proc = subprocess.run(cmd, text=True, capture_output=True, timeout=90)
+    if image_mode:
+        detail = bounded_diagnostic('stdout=' + (proc.stdout or '') + '; stderr=' + (proc.stderr or ''))
+        if len(proc.stdout or '') > 131072:
+            fail('OG ' + mode + ' validator output oversized: ' + detail)
+        if proc.returncode != 0:
+            fail('OG ' + mode + ' validation failed: ' + detail)
+        try:
+            proof = json.loads((proc.stdout or '').strip().splitlines()[-1])
+        except (ValueError, TypeError, IndexError):
+            fail('OG ' + mode + ' validator did not return structured success: ' + detail)
+        if not isinstance(proof, dict) or proof.get('success') is not True:
+            fail('OG ' + mode + ' validation rejected: ' + detail)
+        mk_images.check_binding()
+        return proof
     detail = (proc.stdout or proc.stderr or '').strip()
     if detail:
         log(f"  - OG {mode} gate: {detail[:1200]}")
@@ -1082,9 +1154,10 @@ def find_image_file_input(page, timeout_ms=3500):
     raise RuntimeError(f"image file input not attached: {last_error}")
 
 
-def upload_editor_image(page, image_path, context, attempts=3):
+def upload_editor_image(page, image_path, context, attempts=3, single_delivery=False):
     last_error = None
     last_state = None
+    delivery_started = False
     for attempt in range(1, attempts + 1):
         chooser_error = None
         try:
@@ -1094,18 +1167,24 @@ def upload_editor_image(page, image_path, context, attempts=3):
             # DOM-input path below for older editor builds.
             with page.expect_file_chooser(timeout=5000) as chooser_info:
                 open_attach_image_menu(page)
+            delivery_started = True
             chooser_info.value.set_files(image_path)
             log(f"  - {context} file input ready (attempt {attempt}/{attempts}, selector=file-chooser)")
             return
         except Exception as e:
+            if single_delivery and delivery_started:
+                raise RuntimeError('MK upload delivery uncertain; no second file delivery') from e
             chooser_error = e
 
         try:
             file_input, selector = find_image_file_input(page)
+            delivery_started = True
             file_input.set_input_files(image_path)
             log(f"  - {context} file input ready (attempt {attempt}/{attempts}, selector={selector})")
             return
         except Exception as e:
+            if single_delivery and delivery_started:
+                raise RuntimeError('MK upload delivery uncertain; no second file delivery') from e
             last_error = e
             last_state = get_image_upload_dom_state(page)
             chooser_detail = (
@@ -1129,6 +1208,22 @@ def upload_editor_image(page, image_path, context, attempts=3):
         f"{context} image upload unavailable after {attempts} attempts; "
         f"last_error={type(last_error).__name__}: {last_error}; state={last_state}"
     )
+
+def select_mk_banner_representative(page, banner_src, skip_setting):
+    """MK는 업로드에서 관찰한 별도 배너 src만 대표이미지 대상으로 허용한다."""
+    if skip_setting.lower() in ('1', 'true', 'yes'):
+        fail('mk-images/representative-skip-forbidden')
+    if not isinstance(banner_src, str) or not banner_src.startswith('https://'):
+        fail('mk-images/representative-banner-src-missing')
+    result = page.evaluate(
+        "(src) => typeof setRepresentImageFromEditor === 'function' ? setRepresentImageFromEditor({targetSrc: src}) : {success: false}",
+        banner_src,
+    )
+    if not (isinstance(result, dict) and result.get('success') is True
+            and result.get('imageUrl') == banner_src):
+        detail = bounded_diagnostic(result.get('error', '') if isinstance(result, dict) else '', 300)
+        fail('mk-images/representative-banner-selection-failed' + (': ' + detail if detail else ''))
+
 
 def resolve_represent_image_target(template, image_filenames):
     """daum-trends 대표이미지 대상(첫 non-comic 본문 첨부 파일명)을 결정한다.
@@ -1702,6 +1797,9 @@ def _is_target_closed(exc):
 _orig_excepthook = sys.excepthook
 def _classify_excepthook(etype, evalue, etb):
     publish_lock.release()
+    if globals().get('mk_images') and mk_images.enabled:
+        print(json.dumps(mk_failure_result(evalue)))
+        sys.exit(1)
     if _is_target_closed(evalue):
         print(json.dumps({
             "success": False,
@@ -1718,6 +1816,19 @@ last_dialog_message = None
 body_html = open(BODY_FILE, 'r', encoding='utf-8').read()
 draft_og_gate = None
 public_og_gate = None
+public_image_gate = None
+
+from mk_article_image_publisher import MKArticleImages, bounded_diagnostic
+mk_images = None
+try:
+    mk_images = MKArticleImages(
+        enabled=sys.argv[15] == 'true', template=TEMPLATE, private=PRIVATE,
+        body=BODY_FILE, current=sys.argv[16], run_dir=sys.argv[17],
+        validator=sys.argv[18], interpreter=sys.argv[19], sources=sys.argv[20],
+        evidence_dir=sys.argv[21], selector=sys.argv[22], banner=BANNER,
+        banner_alt=BANNER_ALT, legacy_images=os.environ.get('TISTORY_INLINE_IMAGE_FILES', ''))
+except Exception as error:
+    fail('mk-images/draft-preflight-failed: ' + bounded_diagnostic(error))
 
 if should_run_og_gate():
     log("Preflight: OG URL/title validation")
@@ -1741,6 +1852,9 @@ def handle_dialog(dialog):
         log(f"  ⚠️ dialog handler failed: {e}")
 
 publish_lock.acquire()
+
+if mk_images.enabled:
+    mk_images.check_binding()
 
 with sync_playwright() as p:
     log('Preflight: Playwright CDP attach')
@@ -1896,7 +2010,9 @@ with sync_playwright() as p:
     image_files = []
     image_files_env = os.environ.get('TISTORY_INLINE_IMAGE_FILES', '').strip()
     inline_image_caption = os.environ.get('TISTORY_INLINE_IMAGE_CAPTION', '').strip()
-    if image_files_env:
+    if mk_images.enabled:
+        mk_images.upload_articles(page, upload_editor_image)
+    elif image_files_env:
         log("Step 3.5: inline 이미지 업로드")
         image_files = [p for p in image_files_env.split(':') if p]
         marker_names = [f'trend-image-{i+1}' for i in range(len(image_files))]
@@ -2007,7 +2123,9 @@ with sync_playwright() as p:
         log("Step 3.5: inline 이미지 생략")
 
     # ── Step 4: 배너 업로드 ──
-    if BANNER:
+    if mk_images.enabled:
+        mk_images.upload_banner(page, upload_editor_image)
+    elif BANNER:
         log("Step 4: 배너 업로드")
         # visible한 첨부 버튼 찾기 — aria-label="첨부" 중 visible인 것
         uploaded = False
@@ -2052,7 +2170,14 @@ with sync_playwright() as p:
     log("Step 5: 완료")
 
     # ── Step 6: 대표이미지 ──
-    if os.environ.get('TISTORY_SKIP_REPRESENT_IMAGE', '').lower() in ('1', 'true', 'yes'):
+    if mk_images.enabled:
+        mk_images.phase = 'representative'
+        log("Step 6: 관찰한 MK 배너 src로 대표이미지 선택")
+        select_mk_banner_representative(
+            page, mk_images.banner_src, os.environ.get('TISTORY_SKIP_REPRESENT_IMAGE', ''),
+        )
+        log("Step 6: 배너 선택 helper 성공 (플랫폼 대표 상태 검증 아님)")
+    elif os.environ.get('TISTORY_SKIP_REPRESENT_IMAGE', '').lower() in ('1', 'true', 'yes'):
         log("Step 6: 대표이미지 생략")
     else:
         log("Step 6: 대표이미지")
@@ -2074,6 +2199,8 @@ with sync_playwright() as p:
         log("Step 6: 완료")
 
     # ── Step 7: 태그 ──
+    if mk_images.enabled:
+        mk_images.phase = 'tags'
     if TAGS_STR:
         log("Step 7: 태그")
         tags = list(dict.fromkeys(t.strip() for t in TAGS_STR.split(',') if t.strip()))
@@ -2125,10 +2252,14 @@ with sync_playwright() as p:
     else:
         log("Step 7: 태그 생략")
 
+    if mk_images.enabled:
+        mk_images.phase = 'publish'
     page.evaluate("typeof tinymce !== 'undefined' && tinymce.activeEditor ? (tinymce.activeEditor.save(), 'ok') : 'no-tinymce'")
     time.sleep(1)
     current_url = page.url
     if "/manage/posts" in current_url:
+        if mk_images.enabled:
+            fail('MK editor navigated before validation; no draft rebuild fallback')
         log(f"  ⚠️ unexpected navigation before publish: {current_url}")
         page.goto(NEWPOST_URL, wait_until="domcontentloaded", timeout=30000)
         if not wait_tinymce(page, timeout_s=40):
@@ -2177,6 +2308,10 @@ with sync_playwright() as p:
     log(f"  - textarea sync check: {ta_len}")
     if ta_len < 100:
         fail(f"textarea too short before publish ({ta_len})")
+
+    if mk_images.enabled:
+        mk_images.editor_gate(page)
+        mk_images.phase = 'publish'
 
     try:
         pre_complete_state = debug_newpost_state(page)
@@ -2266,6 +2401,9 @@ with sync_playwright() as p:
         time.sleep(0.8)
         log(f"  - public mode normalized state: {get_dialog_state(page)}")
 
+    if mk_images.enabled:
+        # Fresh editor gate after dialog preparation, directly before submit.
+        mk_images.before_submit(page)
     if PRIVATE:
         page.evaluate("""(() => {
             const dialog = document.querySelector('[role="dialog"]') || document;
@@ -2421,8 +2559,13 @@ with sync_playwright() as p:
         if post_info.get('publicUrl') != post_info.get('url'):
             log(f"  - public post url: {post_info['publicUrl']}")
 
+    if mk_images.enabled:
+        if not post_info or not post_info.get('url') or not post_info.get('id'):
+            fail('MK confirmed publication identity missing')
+        mk_images.confirm_publication(post_info.get('publicUrl') or post_info['url'], post_info['id'])
+
     # ── Step 10: 발행 후 cleanup 재진입 ──
-    if post_info and og_entries:
+    if post_info and og_entries and not mk_images.enabled:
         log("Step 10: 발행 후 cleanup 재진입")
         edit_url = f"https://{BLOG}/manage/newpost/{post_info['id']}?type=post&returnURL=/manage/posts/"
         page.goto(edit_url, wait_until="domcontentloaded", timeout=30000)
@@ -2459,7 +2602,22 @@ with sync_playwright() as p:
             warning = "og_gap_persisted"
 
     # ── Step 11: 공개 페이지 재검증 ──
-    if not PRIVATE and post_info and post_info.get('url'):
+    if mk_images.enabled:
+        def fetch_mk_public(post_url):
+            req = urllib.request.Request(post_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=15) as response:
+                raw = response.read(10 * 1024 * 1024 + 1)
+                if len(raw) > 10 * 1024 * 1024:
+                    raise RuntimeError('public snapshot too large')
+                return raw.decode(response.headers.get_content_charset() or 'utf-8', 'strict')
+        try:
+            public_image_gate = mk_images.public_gate(fetch_mk_public)
+            if should_run_og_gate():
+                public_og_gate = run_og_gate('public', mk_images.post_url)
+        except Exception as error:
+            fail('MK public image/OG validation failed; ' + bounded_diagnostic(error, 500)
+                 + '; publication retained; no automatic retry')
+    elif not PRIVATE and post_info and post_info.get('url'):
         log("Step 11: 공개 페이지 검증")
         import urllib.request
         post_url = post_info.get('publicUrl') or post_info['url']
@@ -2522,6 +2680,11 @@ with sync_playwright() as p:
         result["draftOgValidation"] = {"success": True, "count": draft_og_gate.get('count')}
     if public_og_gate:
         result["publicOgValidation"] = {"success": True, "cardCount": public_og_gate.get('card_count')}
+    if mk_images.enabled:
+        result["articleImageValidation"] = {
+            "draft": {"success": True, "images": mk_images.draft_validation['images']},
+            "public": {"success": True, "images": public_image_gate['images']},
+        }
     if warning:
         result["warning"] = warning
     if HARD_FAIL:

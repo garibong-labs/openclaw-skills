@@ -37,7 +37,7 @@ def load_cleanup_helpers():
         closes.append((port, target_id))
         return 'closed'
 
-    ns = {'log': logs.append, 'cleanup_owned_target': cleanup, 'CDP_PORT': '9222'}
+    ns = {'log': logs.append, 'cleanup_owned_target': cleanup, 'CDP_PORT': '9222', 'mk_images': SimpleNamespace(enabled=False)}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(SCRIPT_PATH), 'exec'), ns)
     ns.update(logs=logs, closes=closes)
     return ns
@@ -192,7 +192,7 @@ class RunTabCleanupTests(unittest.TestCase):
         block = next(node for node in embedded_tree().body if isinstance(node, ast.With))
         step10 = next(node for node in block.body if isinstance(node, ast.If)
                       and isinstance(node.test, ast.BoolOp)
-                      and [getattr(value, 'id', None) for value in node.test.values] == ['post_info', 'og_entries'])
+                      and [getattr(value, 'id', None) for value in node.test.values][:2] == ['post_info', 'og_entries'])
         code = compile(ast.Module(body=[step10], type_ignores=[]), str(SCRIPT_PATH), 'exec')
         for ready, saved, gap, should_close in (
             (True, True, {'gapPersists': False}, True),
@@ -313,7 +313,7 @@ class RealResaveCleanupTests(unittest.TestCase):
         block = next(n for n in tree.body if isinstance(n, ast.With))
         step10 = next(n for n in block.body if isinstance(n, ast.If)
                       and isinstance(n.test, ast.BoolOp)
-                      and [getattr(v, 'id', None) for v in n.test.values] == ['post_info', 'og_entries'])
+                      and [getattr(v, 'id', None) for v in n.test.values][:2] == ['post_info', 'og_entries'])
         start = next(i for i, n in enumerate(block.body) if isinstance(n, ast.Assign)
                      and any(isinstance(t, ast.Name) and t.id == 'result' for t in n.targets))
         end = next(i for i, n in enumerate(block.body) if isinstance(n, ast.Expr)

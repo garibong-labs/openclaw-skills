@@ -447,6 +447,7 @@ function loadRepresentImageHelper(scriptFile) {
     makeImg('01-trend.jpg', 'https://blog.kakaocdn.net/primary-upload'),
     makeImg(null, 'https://blog.kakaocdn.net/02-trend.jpg'),
   ];
+  const body = { querySelectorAll: sel => (sel === 'img' ? images : []), querySelector: () => null };
   const sandbox = {
     console,
     URL,
@@ -460,10 +461,7 @@ function loadRepresentImageHelper(scriptFile) {
     },
     tinymce: {
       activeEditor: {
-        getBody: () => ({
-          querySelectorAll: sel => (sel === 'img' ? images : []),
-          querySelector: () => null,
-        }),
+        getBody: () => body,
       },
     },
   };
@@ -473,7 +471,7 @@ function loadRepresentImageHelper(scriptFile) {
     sandbox,
     { filename: scriptPath },
   );
-  return { setRepresentImageFromEditor: sandbox.__setRepresentImageFromEditor, clicks, button };
+  return { setRepresentImageFromEditor: sandbox.__setRepresentImageFromEditor, clicks, button, images, makeImg, sandbox };
 }
 
 (async () => {
@@ -527,7 +525,64 @@ function loadRepresentImageHelper(scriptFile) {
       ]);
     }
   }
-  console.log('setRepresentImageFromEditor tests passed');
+  // MK targetSrc is current-helper only; legacy/Daum selection above stays unchanged.
+  const exactSrc = 'https://cdn.example/opaque?signature=keep%2Fall&v=2';
+  const exactFixture = () => {
+    const f = loadRepresentImageHelper('tistory-editor-helpers.js');
+    // Article + OG images and a near-match precede the separate uploaded banner.
+    f.images.push(f.makeImg('banner.jpg', exactSrc + '&og=1'));
+    f.images.push(f.makeImg('unrelated-server-name.jpg', exactSrc));
+    return f;
+  };
+  {
+    const f = exactFixture();
+    const result = await f.setRepresentImageFromEditor({targetSrc: exactSrc, targetFilename: '00-comic.jpg'});
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.imageUrl, exactSrc);
+    assert.deepStrictEqual(f.clicks, ['unrelated-server-name.jpg']);
+    assert.strictEqual(f.button.clicked, 1);
+  }
+  for (const scenario of ['missing', 'ambiguous', 'empty', 'null', 'undefined', 'blob', 'filename-only']) {
+    const f = exactFixture();
+    let targetSrc = exactSrc;
+    if (scenario === 'missing') targetSrc += '&missing=1';
+    if (scenario === 'ambiguous') f.images.push(f.makeImg('og-thumbnail.jpg', exactSrc));
+    if (scenario === 'empty') targetSrc = '';
+    if (scenario === 'null') targetSrc = null;
+    if (scenario === 'undefined') targetSrc = undefined;
+    if (scenario === 'blob') targetSrc = 'blob:pending';
+    if (scenario === 'filename-only') targetSrc = 'unrelated-server-name.jpg';
+    const result = await f.setRepresentImageFromEditor({targetSrc});
+    assert.strictEqual(result.success, false, scenario);
+    assert.deepStrictEqual(f.clicks, [], scenario);
+    assert.strictEqual(f.button.clicked, 0, scenario);
+  }
+  {
+    const f = exactFixture();
+    f.sandbox.document.querySelector = () => null;
+    const result = await f.setRepresentImageFromEditor({targetSrc: exactSrc});
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.error, 'represent button not found');
+    assert.strictEqual(f.button.clicked, 0);
+  }
+  {
+    const f = exactFixture();
+    f.button.click = () => { throw new Error('button dispatch failed'); };
+    await assert.rejects(f.setRepresentImageFromEditor({targetSrc: exactSrc}), /button dispatch failed/);
+  }
+  for (const scenario of ['target-removed', 'duplicate-added', 'src-mutated']) {
+    const f = exactFixture();
+    f.sandbox.setTimeout = callback => {
+      if (scenario === 'target-removed') f.images.pop();
+      if (scenario === 'duplicate-added') f.images.push(f.makeImg('duplicate.jpg', exactSrc));
+      if (scenario === 'src-mutated') f.images[f.images.length - 1] = f.makeImg('changed.jpg', exactSrc + '&changed=1');
+      callback();
+    };
+    const result = await f.setRepresentImageFromEditor({targetSrc: exactSrc});
+    assert.strictEqual(result.success, false, scenario);
+    assert.strictEqual(f.button.clicked, 0, scenario);
+  }
+  console.log('setRepresentImageFromEditor tests passed (MK exact-src: 13 scenarios)');
 })().catch(err => {
   console.error(err);
   process.exitCode = 1;
@@ -770,3 +825,5 @@ for (const scriptFile of PLAIN_LINK_HELPER_SCRIPTS) {
 }
 
 console.log('convertPendingToPlainLink/verifyOGPlainLink/cleanup preservation tests passed');
+
+require('./test_mk_article_image_helpers.js');

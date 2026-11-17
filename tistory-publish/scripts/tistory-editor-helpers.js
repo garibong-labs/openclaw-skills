@@ -1215,10 +1215,17 @@ async function uploadBannerFromWindow(mimeType = 'image/jpeg') {
  *   4. 여러 셀렉터로 대표이미지 버튼 탐색 (main doc + iframe 모두)
  *   5. 못 찾으면 버튼 목록 디버그 반환 (silent fail 방지)
  *
- * @param {{targetFilename?: string}} [options]
+ * MK Stage3의 targetSrc는 관찰한 전체 src와 정확히 일치하는 유일한 img를 요구한다.
+ * 성공은 대상/버튼 클릭 완료이며 플랫폼의 저장된 대표 상태 증거는 아니다.
+ * @param {{targetFilename?: string, targetSrc?: string}} [options]
  */
 async function setRepresentImageFromEditor(options = {}) {
   const targetFilename = options && options.targetFilename ? String(options.targetFilename) : '';
+  const exactSrc = options && Object.prototype.hasOwnProperty.call(options, 'targetSrc');
+  const targetSrc = exactSrc ? options.targetSrc : null;
+  if (exactSrc && (typeof targetSrc !== 'string' || !/^https:\/\//.test(targetSrc))) {
+    return { success: false, error: 'exact representative src required' };
+  }
   const editor = getSafeTinyEditor();
   if (!editor || !editor.getBody) return { success: false, error: 'tinymce unavailable' };
   const body = editor.getBody();
@@ -1226,7 +1233,13 @@ async function setRepresentImageFromEditor(options = {}) {
   if (!images.length) return { success: false, error: 'no image in editor' };
 
   let targetImg = images[0];
-  if (targetFilename) {
+  if (exactSrc) {
+    const matches = images.filter(img => img.getAttribute('src') === targetSrc);
+    if (matches.length !== 1) {
+      return { success: false, error: 'exact representative target missing or ambiguous' };
+    }
+    targetImg = matches[0];
+  } else if (targetFilename) {
     targetImg = images.find(img => {
       const name = img.getAttribute('data-filename') || img.getAttribute('src') || '';
       return name.includes(targetFilename);
@@ -1241,7 +1254,7 @@ async function setRepresentImageFromEditor(options = {}) {
     }
   }
 
-  const imgUrl = targetImg.src;
+  const imgUrl = exactSrc ? targetImg.getAttribute('src') : targetImg.src;
   if (imgUrl.startsWith('data:')) {
     return { success: false, error: 'image not uploaded yet (still data URL)', targetFilename };
   }
@@ -1249,6 +1262,13 @@ async function setRepresentImageFromEditor(options = {}) {
   // 이미지 클릭 (에디터 내부)
   targetImg.click();
   await new Promise(r => setTimeout(r, 1000));
+
+  if (exactSrc) {
+    const matches = Array.from(body.querySelectorAll('img')).filter(img => img.getAttribute('src') === targetSrc);
+    if (getSafeTinyEditor() !== editor || editor.getBody() !== body || matches.length !== 1 || matches[0] !== targetImg) {
+      return { success: false, error: 'exact representative target changed' };
+    }
+  }
 
   // 대표이미지 버튼 셀렉터 목록 (가능한 모든 패턴)
   const candidates = [
@@ -1620,4 +1640,131 @@ function rebuildContentWithImageFigures(sectionMarkers) {
     if (t.value.length > 100) t.value = editor.getContent();
   });
   return { success: true, contentLength: editor.getContent().length };
+}
+
+// MK Stage3 only. One file delivery, one operation, retained node references.
+// Never search by filename/marker claims to identify the returned attachment.
+let mkImageUploadOperation = null;
+function beginMKImageUpload(token) {
+  const editor = getSafeTinyEditor();
+  if (!editor || mkImageUploadOperation || !token) throw new Error('MK upload unavailable');
+  const body = editor.getBody();
+  const original = new Set(body.querySelectorAll('img'));
+  const operation = { token, editor, body, original, added: new Set(), error: '', src: '', since: 0, ambiguousSince: null };
+  operation.observe = records => {
+    for (const record of records) {
+      if (record.type === 'attributes' && original.has(record.target)) operation.error = 'existing image mutated';
+      for (const node of record.addedNodes || []) {
+        const imgs = node.nodeType === 1 ? [ ...(node.matches('img') ? [node] : []), ...node.querySelectorAll('img') ] : [];
+        for (const img of imgs) if (!original.has(img)) operation.added.add(img);
+      }
+    }
+  };
+  operation.observer = new MutationObserver(operation.observe);
+  operation.observer.observe(body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+  mkImageUploadOperation = operation;
+  editor.selection.select(body, true);
+  editor.selection.collapse(false);
+  return { token };
+}
+
+function pollMKImageUpload(token) {
+  const op = mkImageUploadOperation;
+  if (!op || op.token !== token) throw new Error('MK operation mismatch');
+  op.observe(op.observer.takeRecords());
+  if (op.editor.getBody() !== op.body) op.error = 'editor body replaced';
+  for (const img of op.added) if (!op.body.contains(img)) op.added.delete(img);
+  for (const img of op.added) {
+    if (Array.from(op.original).some(node => node.getAttribute('src') === img.getAttribute('src'))) {
+      op.error = 'upload reused existing src';
+    }
+  }
+  if (op.error) return { ready: true, error: op.error };
+  // A final node may be inserted one task before its placeholder is removed.
+  // Allow at most 1000ms of observed overlap, then latch ambiguity permanently.
+  // After overlap/absence/pending src, require a fresh 500ms sole-node window.
+  if (op.added.size > 1) {
+    op.img = null; op.src = ''; op.since = 0;
+    if (op.ambiguousSince === null) op.ambiguousSince = Date.now();
+    if (Date.now() - op.ambiguousSince >= 1000) {
+      op.error = 'ambiguous upload attachments';
+      return { ready: true, error: op.error };
+    }
+    return { ready: false };
+  }
+  op.ambiguousSince = null;
+  const img = Array.from(op.added)[0];
+  if (!img || !op.body.contains(img)) {
+    op.img = null; op.src = ''; op.since = 0;
+    return { ready: false };
+  }
+  const src = img.getAttribute('src') || '';
+  if (!/^https:\/\//.test(src)) {
+    op.img = null; op.src = ''; op.since = 0;
+    return { ready: false };
+  }
+  if (op.img !== img || op.src !== src) { op.img = img; op.src = src; op.since = Date.now(); }
+  return { ready: Date.now() - op.since >= 500 };
+}
+
+function abortMKImageUpload(token) {
+  const op = mkImageUploadOperation;
+  if (!op || op.token !== token) return false;
+  op.observer.disconnect();
+  // Retain a failed operation tombstone: cleanup never authorizes redelivery
+  // or promotes a different DOM attachment to evidence.
+  if (!op.error) op.error = 'upload aborted';
+  return true;
+}
+
+function finishMKImageUpload({token, entry, bannerAlt}) {
+  const state = pollMKImageUpload(token);
+  const op = mkImageUploadOperation;
+  if (!state.ready || state.error) throw new Error(state.error || 'upload pending');
+  op.observer.disconnect();
+  const img = Array.from(op.added)[0];
+  const figure = img.closest('figure[data-ke-type="image"]');
+  if (!figure || figure.querySelectorAll('img').length !== 1 || !op.body.contains(figure)) throw new Error('native attachment figure required');
+  if (entry) {
+    const markers = Array.from(op.body.querySelectorAll('[data-image-marker]')).filter(node => node.getAttribute('data-image-marker') === entry.marker);
+    if (markers.length !== 1) throw new Error('exact MK marker required');
+    const marker = markers[0];
+    if (marker.getAttribute('data-article-id') !== entry.article_id || marker.getAttribute('data-image-alt') !== entry.alt || marker.getAttribute('data-image-caption') !== entry.caption) throw new Error('MK marker binding changed');
+    img.setAttribute('alt', entry.alt);
+    if (figure.querySelectorAll('figcaption').length > 1) throw new Error('ambiguous caption');
+    applyImageCaption(figure, entry.caption);
+    marker.replaceWith(figure);
+  } else {
+    img.setAttribute('alt', bannerAlt);
+    op.body.insertBefore(figure, op.body.firstChild);
+  }
+  op.editor.setDirty(true);
+  op.editor.fire('change');
+  op.editor.save();
+  mkImageUploadOperation = null;
+  return { success: true, token, src: op.src };
+}
+
+function preserveMKOGThumbnailEvidence() {
+  const editor = getSafeTinyEditor();
+  if (!editor) throw new Error('MK editor unavailable');
+  const cards = getOGCardElements(editor.getBody());
+  if (cards.length !== 4) throw new Error('four MK cards required');
+  for (const card of cards) {
+    if (card.querySelector('figure, picture, source, iframe, object, embed, video, audio, svg, canvas')) throw new Error('unsupported OG embed');
+    const imgs = Array.from(card.querySelectorAll('img'));
+    if (imgs.length > 1) throw new Error('ambiguous OG thumbnail');
+    if (imgs.length === 1) {
+      const observed = imgs[0].getAttribute('src') || '';
+      if (!/^https:\/\//.test(observed)) throw new Error('unknown OG thumbnail identity');
+      const declared = card.getAttribute('data-og-image');
+      if (declared && declared !== observed) throw new Error('OG thumbnail evidence mismatch');
+      // Actual rendered card result, observed before the editor snapshot. No
+      // source/canonical/title facts are synthesized from the draft.
+      card.setAttribute('data-og-image', observed);
+    }
+  }
+  editor.setDirty(true);
+  editor.save();
+  return { success: true };
 }
