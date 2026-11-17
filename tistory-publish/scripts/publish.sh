@@ -120,6 +120,21 @@ if [[ -n "$BANNER" && -z "$BANNER_ALT" ]]; then
   BANNER_ALT="$TITLE"
 fi
 
+# Stage1 이미지 원고는 legacy publisher로 우회할 수 없다 (브라우저 접근 전).
+if ! python3 - "$SCRIPT_DIR" "$BODY_FILE" "$TEMPLATE" <<'MK_DRAFT_GUARD'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from mk_article_image_publisher import guard_legacy_markers
+try:
+    guard_legacy_markers(Path(sys.argv[2]).read_text(encoding='utf-8'), sys.argv[3])
+except Exception:
+    raise SystemExit(1)
+MK_DRAFT_GUARD
+then
+  fail "image marker draft requires publish-post.sh --mk-article-images and complete evidence"
+fi
+
 # ── SEO 검사 (발행 전) ──
 if [[ "$SEO_CHECK" != "off" ]]; then
   log "SEO 검사 실행 (mode=$SEO_CHECK)"

@@ -5,6 +5,7 @@ runtime:
   - python3
   - playwright
   - node (optional, for banner generation)
+  - explicit Python interpreter with Pillow (optional, required for MK Stage3 external validator)
 credentials:
   - purpose: Kakao login for Tistory session recovery (used only by scripts/login.sh --cred-file)
     required: false
@@ -106,6 +107,20 @@ bash scripts/publish.sh \
 
 > 자신만의 preset을 추가하려면 `templates/` 아래에 폴더를 만들고 `publish.sh --template <이름>` 으로 사용하세요.
 
+### MK 기사 이미지 Stage3 opt-in (`publish-post.sh` 전용)
+
+공개 `--template mk-review`에서 `--mk-article-images`와 다음 여섯 옵션을 **모두** 지정합니다: `--image-input FILE`, `--image-run-dir DIR`, `--image-validator FILE`, `--image-validator-python EXECUTABLE`, `--source-evidence-file FILE`, `--image-evidence-dir NEW_DIR`. 기존 `--body-file`은 변경하지 않은 Stage1 본문, `--banner`는 기사 네 장과 별도인 필수 배너입니다. `--private`와 legacy `TISTORY_INLINE_IMAGE_FILES`는 함께 사용할 수 없습니다. 선택 `--image-content-selector`는 공개 본문의 유일한 scope를 지정합니다.
+
+명시적 validator는 Stage2 `validate-og.py`이며 siblings `mk_image_validation.py`/`mk_article_images.py`가 필요합니다. interpreter는 외부 코드와 Pillow를 실행할 수 있어야 하며 publisher Python 3.9와 자동으로 같다고 가정하지 않습니다. 출처 증거는 신뢰하는 수집자가 관찰한 정확한 URL → `{title, canonical}` JSON이어야 합니다. 생성/수집은 수행하지 않습니다.
+
+필수 순서는 **CDP 전 draft → 고정 순서 네 파일의 작업별 업로드 src/SHA receipt + 별도 배너 → 발행 전 editor snapshot gate → 확인된 글 URL의 public snapshot gate**입니다. 각 gate는 현재 입력·run·원본 본문·출처 증거를 다시 검사하고 editor/public에는 receipt/snapshot을 전달합니다. 파일명/개수 추정이 아닌 작업 중 관찰한 유일한 새 첨부 노드를 사용하며, alt·figure 내부 AI figcaption과 실제 관찰한 OG `data-og-image`를 보존합니다. 기사 순서·출처 OG·이미지·요약·코멘트 대응과 배너 분리를 모두 검증합니다. gate off/SEO off/`ALLOW_MISSING_IMAGES`로 우회할 수 없습니다.
+
+MK 대표이미지는 별도 배너 업로드에서 실제 관찰한 전체 src의 유일한 정확 일치 대상으로 선택합니다. `TISTORY_SKIP_REPRESENT_IMAGE=1|true|yes`를 거부하고, src 누락·대상 미발견/중복·버튼 미발견·helper 실패·반환 src 불일치이면 제출 전 중단합니다. 버튼 클릭/helper 성공만으로 플랫폼에 저장된 대표 상태를 입증하지 않습니다.
+
+Draft/editor 실패는 발행 전 중단하고 public 실패는 `success:false`, non-zero와 `postUrl`/`postId`, `automaticRetryAllowed:false`를 보존합니다. 새 private 증거 디렉터리(0700, 파일 0600)에 receipt·snapshot·gate 결과·제출 상태를 남기고 실패한 실행 탭을 보존합니다. MK 이미지 모드의 자동 사후 재저장/재발행은 없습니다. 제출 뒤 URL 미확인은 기존 글부터 수동 확인합니다. 증거 디렉터리를 재사용하거나 새 디렉터리로 자동 우회 재시도하지 않습니다.
+
+실제 Tistory 속성 보존/업로드/CDN 바이트/렌더링에 대한 live 호환성 증거는 없습니다. Stage2 PR285 P2 후속(OG 비이미지 embed, legacy public fallback scope)은 외부 코드를 수정/완화하지 않으며 이미지 경로는 비이미지 embed를 거부하고 scoped snapshot을 사용합니다. 생성·cron(Stage4)은 범위 밖입니다. `publish.sh`에는 우회 방지 guard만 추가하고 Stage3 기능은 legacy JS에 미러링하지 않습니다. **정확한 호출 예시·receipt 필드·실패 처리·오프라인 테스트는 [README의 Stage3 계약](README.md#mk-기사-이미지-stage3-명시적-opt-in)을 따릅니다.**
+
 ### Daum Trends preset
 
 Use `--template daum-trends` for Daum 실시간 트렌드 posts. This preset supplies content defaults such as tags only. The caller must still pass `--blog` and `--category` explicitly.
@@ -141,7 +156,7 @@ bash scripts/login.sh \
 5. 본문 HTML 삽입
 6. inline/배너 이미지 업로드 (첨부→사진 메뉴 → file chooser 포착, 동적 file input fallback·제한 재시도) + alt 텍스트 설정
 7. OG 카드 생성 (placeholder URL → Enter 키 → 카드 렌더링)
-8. 대표이미지 설정 (`daum-trends`는 첫 non-comic 본문 첨부를 결정적으로 선택 — 대상 미발견 시 발행 중단, 다른 템플릿은 첫 이미지)
+8. 대표이미지 설정 (MK 이미지 opt-in은 관찰한 별도 배너 src 필수, `daum-trends`는 첫 non-comic 본문 첨부를 결정적으로 선택 — 대상 미발견 시 발행 중단, 그 외는 첫 이미지)
 9. 태그 등록
 10. 발행 (공개/비공개)
 11. `mk-review`/`daum-trends`는 발행 및 적용되는 post-publish 검증 후 해당 실행이 만든 정확한 page target만 정리. `mk-review`는 글 ID·URL 확인 및 경고·불확실성 없는 검증 완료가 필수이며, 실패·미확인·사후 재저장/검증 불확실성에서는 실행 탭 보존. Daum의 기존 성공 경로 조건(경고 허용 포함)과 다른 템플릿의 비정리 동작은 유지
@@ -208,7 +223,7 @@ templates/my-template/
 
 ### 메타데이터
 - `setTags(tags[])` — 태그 등록
-- `setRepresentImageFromEditor(options?)` — 대표이미지 설정. `{targetFilename}` 지정 시 `data-filename`/`src` 매칭으로 해당 이미지만 선택하고, 없으면 클릭 없이 실패 반환 (기본: 첫 이미지)
+- `setRepresentImageFromEditor(options?)` — 대표이미지 설정. 현재 helper의 MK 전용 `{targetSrc}`는 전체 src의 유일한 정확 일치만 허용. 기존 `{targetFilename}`은 `data-filename`/`src` 매칭으로 대상 미발견 시 실패 반환 (옵션 없는 기본: 첫 이미지)
 - `setImageAlt(alt, index)` — 에디터 내 이미지 alt 텍스트 설정 (SEO)
 - `setImageAltForUploadedImage(alt, filename, previousCount)` — 업로드 직후 새 이미지 alt 텍스트 설정 (기존 이미지 덮어쓰기 방지)
 

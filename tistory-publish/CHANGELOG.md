@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **MK Stage3 대표이미지 배너 선택 필수화 (R2)**
+  - 별도 배너 업로드에서 실제 관찰한 전체 src의 유일한 정확 일치 대상만 선택. MK 생략 설정, src 누락/중복/미발견, 버튼 미발견, helper 실패/반환 대상 불일치는 제출 전 중단. 기존 helper 선택 로직에 `targetSrc` 옵션을 추가하며 legacy/Daum 동작 유지
+  - 실제 Step6 분기와 JS helper의 오프라인 회귀 추가. mock/helper 성공·버튼 클릭은 live 플랫폼 대표이미지 저장 상태 증거가 아님
+
+- **MK 기사 이미지 Stage3 공통 publisher opt-in**
+  - `publish-post.sh --mk-article-images`와 현재 입력/run/외부 Stage2 validator+명시적 interpreter/출처 증거/새 private 증거 디렉터리를 모두 요구. CDP 전 mandatory draft, 발행 전 editor snapshot, 확인된 글 URL의 public snapshot을 동일 Stage2 증거 계약으로 검증. 환경변수/SEO 설정으로 gate를 끄거나 legacy로 낮출 수 없음
+  - stdlib Python 3.9 호환 `mk_article_image_publisher.py` adapter 추가. 고정 순서 네 verified 파일의 SHA를 확인한 바이트를 기존 UI에 전달하고, 작업 전 observer로 추적한 유일한 새 첨부 노드의 실제 HTTPS src로 Stage2 receipt 생산. filename/개수/늦은 DOM 추정 금지, 파일 전달 뒤 불확실한 재전달 금지. 기사별 alt·figure figcaption AI disclosure, 실제 관찰한 카드 thumbnail `data-og-image`, 별도 배너 검증
+  - 현재 입력/자산/sidecar/엔진/validator 코드 identity·SHA 및 receipt/snapshot 변조를 단계 사이 재검사. 제출/발행 identity와 bounded 증거 보존. public 실패는 non-success·non-zero, 페이지 보존, 경고 전환/자동 재저장/재발행 없음
+  - 기존 Daum flags/OG 폴백/대표이미지/잠금/로그인/성공 탭 정리 유지. legacy `publish.sh`에는 Stage1 marker 원고 우회 방지 guard만 추가; Stage3 전용 JS는 legacy helper에 미러링하지 않음
+  - 합성 Stage1-compatible JPEG/sidecar와 실제 외부 Stage2 validator의 오프라인 통합, UI mock 및 기존 회귀 검증. 외부 출처/engine/provider/CDP/실제 업로드·공개 fetch 미실행이며 live Tistory 호환성 증거 없음. Stage2 PR285 알려진 P2 후속은 외부 코드 수정/완화 없이 제한으로 문서화, 이미지 경로의 비이미지 embed 거부. 생성/cron Stage4 미구현
+
 - **카카오 간편로그인 프로필 앵커 선택 지원**
   - `login.sh` 계정 후보에 실제 화면의 `a.wrap_profile[role="button"]`을 기존 네이티브 버튼과 함께 단일 선택자로 포함. 동일 노드를 중복 집계하지 않으며 표시된 독립 행의 전체 식별자가 정확히 일치하는 표시·활성 후보가 유일할 때만 선택
   - 네이티브 버튼·프로필 앵커 혼합 중복은 즉시 중단. 다른 계정·부분/마스킹 식별자·계정 삭제/새 계정 컨트롤을 선택하지 않으며, 기존 인증 요구 중단·제한 시간·백오프·지연 렌더링/활성화 처리 유지
