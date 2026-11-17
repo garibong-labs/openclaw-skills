@@ -119,6 +119,10 @@ MK 대표이미지는 별도 배너 업로드에서 실제 관찰한 전체 src�
 
 Draft/editor 실패는 발행 전 중단하고 public 실패는 `success:false`, non-zero와 `postUrl`/`postId`, `automaticRetryAllowed:false`를 보존합니다. 새 private 증거 디렉터리(0700, 파일 0600)에 receipt·snapshot·gate 결과·제출 상태를 남기고 실패한 실행 탭을 보존합니다. MK 이미지 모드의 자동 사후 재저장/재발행은 없습니다. 제출 뒤 URL 미확인은 기존 글부터 수동 확인합니다. 증거 디렉터리를 재사용하거나 새 디렉터리로 자동 우회 재시도하지 않습니다.
 
+발행 URL/ID를 확보해도 실제 공개 검증 전 실패의 phase는 바꾸지 않습니다. draft 사전검사 오류는 길이를 제한하고 credential을 마스킹한 원인/validator stdout·stderr를 보고하며 증거 디렉터리를 만들지 않습니다. 기사 파일은 Stage1/2와 같은 JPEG 계약(확장자·바이트 서명 확인)만 허용합니다. 임시 첨부 노드가 교체되면 새 노드의 안정화를 기다리며 동시에 남은 복수 첨부는 중단합니다.
+
+최종 JSON의 이미지 증명은 `articleImageValidation`에 담습니다. `TISTORY_OG_VALIDATOR`와 기존 OG match gate가 켜져 있으면 추가 OG draft/public 검증도 명시한 이미지 interpreter·전체 이미지 context로 실행하며, public은 이미 수집한 snapshot을 사용합니다. Stage2 CLI 계약/structured success가 필요하고 거절 시 중단합니다. 꺼져 있으면 OG 성공 필드는 생략하며 필수 이미지 gate는 계속 실행합니다. 기존 속성 없는 `trend-image-N` marker는 기본/simple-post/Daum 및 legacy 경로에서 허용하지만 Stage1 전용 속성/알 수 없는 marker는 계속 차단합니다.
+
 실제 Tistory 속성 보존/업로드/CDN 바이트/렌더링에 대한 live 호환성 증거는 없습니다. Stage2 PR285 P2 후속(OG 비이미지 embed, legacy public fallback scope)은 외부 코드를 수정/완화하지 않으며 이미지 경로는 비이미지 embed를 거부하고 scoped snapshot을 사용합니다. 생성·cron(Stage4)은 범위 밖입니다. `publish.sh`에는 우회 방지 guard만 추가하고 Stage3 기능은 legacy JS에 미러링하지 않습니다. **정확한 호출 예시·receipt 필드·실패 처리·오프라인 테스트는 [README의 Stage3 계약](README.md#mk-기사-이미지-stage3-명시적-opt-in)을 따릅니다.**
 
 ### Daum Trends preset

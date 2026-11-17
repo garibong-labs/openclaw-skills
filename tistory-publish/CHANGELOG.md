@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Stage3 CC 일곱 항목 수정**
+  - 기본/simple-post/Daum과 legacy publisher의 `trend-image-N` 일반 첨부 복원. Stage1 전용 속성·알 수 없는 marker 차단 유지
+  - 실패 처리의 발행 URL/ID 복구가 원래 phase를 바꾸지 않도록 수정. 설정된 추가 OG draft/public validator를 실제 실행하고 이미지 증명은 `articleImageValidation`으로 분리하며 미실행 OG 성공 보고 제거
+  - CDP 전 생성자/draft 거절에 제한된 원인·validator stdout/stderr와 credential 마스킹 제공. 거절 시 증거 디렉터리 미예약 유지
+  - thumbnail 증거 수집에 공용 OG discovery 적용. 분리된 업로드 임시 노드는 제외하고 교체 노드는 동일 src라도 안정화 시간 초기화; 동시에 남은 복수 첨부·기존 src 재사용/변조 거부 유지
+  - Stage1/2의 JPEG 전용 계약을 명시하고 기사 확장자·바이트 서명 불일치를 증거 디렉터리 생성/업로드 전에 거부. 전달 시 SHA 확인한 frozen bytes와 MIME 일치 검사
+  - 일곱 항목 오프라인 재현/회귀, 실제 외부 Stage2와 추가 OG CLI의 합성 snapshot 통합 검증. 외부 코드 변경·네트워크·실제 브라우저/업로드/발행 없음
+
 - **MK Stage3 대표이미지 배너 선택 필수화 (R2)**
   - 별도 배너 업로드에서 실제 관찰한 전체 src의 유일한 정확 일치 대상만 선택. MK 생략 설정, src 누락/중복/미발견, 버튼 미발견, helper 실패/반환 대상 불일치는 제출 전 중단. 기존 helper 선택 로직에 `targetSrc` 옵션을 추가하며 legacy/Daum 동작 유지
   - 실제 Step6 분기와 JS helper의 오프라인 회귀 추가. mock/helper 성공·버튼 클릭은 live 플랫폼 대표이미지 저장 상태 증거가 아님

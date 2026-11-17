@@ -125,10 +125,11 @@ if ! python3 - "$SCRIPT_DIR" "$BODY_FILE" "$TEMPLATE" <<'MK_DRAFT_GUARD'
 import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
-from mk_article_image_publisher import guard_legacy_markers
+from mk_article_image_publisher import guard_legacy_markers, bounded_diagnostic
 try:
     guard_legacy_markers(Path(sys.argv[2]).read_text(encoding='utf-8'), sys.argv[3])
-except Exception:
+except Exception as error:
+    print(bounded_diagnostic(error), file=sys.stderr)
     raise SystemExit(1)
 MK_DRAFT_GUARD
 then

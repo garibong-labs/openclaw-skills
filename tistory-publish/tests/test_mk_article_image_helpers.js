@@ -16,6 +16,7 @@ class Node {
   removeAttribute(key) { delete this.attrs[key]; }
   matches(selector) {
     return selector.split(',').some(part => {
+      if (part.trim().startsWith('.')) return (this.attrs.class || '').split(/\s+/).includes(part.trim().slice(1));
       const match = part.trim().match(/^(\w+)?(?:\[([\w-]+)(?:="([^"]+)")?\])?$/);
       return match && (!match[1] || match[1] === this.tag) && (!match[2] ||
         (match[3] ? this.attrs[match[2]] === match[3] : Object.hasOwn(this.attrs, match[2])));
@@ -31,6 +32,10 @@ class Node {
     if (node.parent) node.parent.children.splice(node.parent.children.indexOf(node), 1);
     node.parent = this;
     this.children.push(node);
+  }
+  remove() {
+    if (this.parent) this.parent.children.splice(this.parent.children.indexOf(this), 1);
+    this.parent = null;
   }
   replaceWith(node) {
     const parent = this.parent;
@@ -113,6 +118,24 @@ for (const scenario of ['two-new-images', 'existing-src-mutated', 'reused-src', 
   f.tick();
   assert.throws(() => f.api.finishMKImageUpload({token: scenario === 'wrong-token' ? 'other' : 'one', entry}), undefined, scenario);
 }
+for (const sameSrc of [false, true]) {
+  const f = fixture();
+  f.body.appendChild(marker());
+  f.api.beginMKImageUpload('replace');
+  const placeholder = image('https://cdn.example/transient.jpg');
+  f.add(placeholder);
+  f.api.pollMKImageUpload('replace');
+  f.tick();
+  placeholder.remove();
+  const replacement = image(sameSrc ? 'https://cdn.example/transient.jpg' : 'https://cdn.example/final.jpg');
+  f.add(replacement);
+  assert.strictEqual(f.api.pollMKImageUpload('replace').ready, false, 'replacement needs its own stability window');
+  f.tick();
+  assert.strictEqual(f.api.pollMKImageUpload('replace').ready, true);
+  const result = f.api.finishMKImageUpload({token: 'replace', entry});
+  assert.strictEqual(result.src, replacement.querySelector('img').getAttribute('src'));
+  assert.strictEqual(placeholder.querySelector('img').getAttribute('alt'), null);
+}
 {
   const f = fixture();
   f.body.appendChild(new Node('h2'));
@@ -139,5 +162,28 @@ for (const scenario of ['observed', 'declared-mismatch', 'extra-img', 'non-image
     assert.strictEqual(card.getAttribute('data-og-source-url'), null);
     assert.strictEqual(card.getAttribute('data-og-title'), null);
   } else assert.throws(() => f.api.preserveMKOGThumbnailEvidence(), undefined, scenario);
+}
+for (const shape of ['og-container', 'data-og-host', 'mixed']) {
+  for (const invalid of ['', 'extra-img', 'nested', 'unknown-src', 'declared-mismatch']) {
+    const f = fixture();
+    for (let i = 0; i < 4; i++) {
+      const attrs = shape === 'og-container' || (shape === 'mixed' && i === 0)
+        ? {class: 'og-container'} : shape === 'data-og-host' || (shape === 'mixed' && i === 1)
+        ? {'data-og-host': 'mk.co.kr'} : {'data-ke-type': 'opengraph'};
+      f.body.appendChild(new Node(attrs['data-ke-type'] ? 'figure' : 'div', attrs,
+        [new Node('img', {src: 'https://og.example/' + i + '.jpg'})]));
+    }
+    const card = f.body.children[0];
+    if (invalid === 'extra-img') card.appendChild(new Node('img', {src: 'https://og.example/extra.jpg'}));
+    if (invalid === 'nested') card.appendChild(new Node('figure', {'data-ke-type': 'opengraph'}));
+    if (invalid === 'unknown-src') card.querySelector('img').setAttribute('src', 'blob:pending');
+    if (invalid === 'declared-mismatch') card.setAttribute('data-og-image', 'https://og.example/false.jpg');
+    if (invalid) assert.throws(() => f.api.preserveMKOGThumbnailEvidence(), undefined, shape + '/' + invalid);
+    else {
+      assert.strictEqual(f.api.preserveMKOGThumbnailEvidence().success, true, shape);
+      assert.strictEqual(card.getAttribute('data-og-image'), 'https://og.example/0.jpg');
+      assert.strictEqual(card.getAttribute('data-og-source-url'), null);
+    }
+  }
 }
 console.log('MK Stage3 operation identity, marker/caption/banner and observed OG evidence tests passed');

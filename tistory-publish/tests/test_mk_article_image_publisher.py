@@ -36,9 +36,49 @@ def embedded():
         return ast.parse(source)
 
 
+def og_namespace(adapter, process):
+    functions = [n for n in embedded().body if isinstance(n, ast.FunctionDef)
+                 and n.name in ('fail', 'mk_failure_result', 'should_run_og_gate', 'run_og_gate')]
+    ns = dict(mk_images=adapter, post_info=None, public_url_for=lambda url: url,
+              sys=sys, json=json, Path=Path, subprocess=process, log=Mock(),
+              OG_GATE_ENABLED=True, OG_VALIDATOR=str(adapter.validator), BODY_FILE=str(adapter.body),
+              bounded_diagnostic=stage3.bounded_diagnostic)
+    exec(compile(ast.Module(body=functions, type_ignores=[]), 'actual-og-functions', 'exec'), ns)
+    return ns
+
+
 class ContractTests(unittest.TestCase):
+    def test_both_publishers_accept_legacy_markers_and_reject_mk_attributes(self):
+        legacy = (SCRIPTS / 'publish.sh').read_text()
+        guard = re.search(r"<<'MK_DRAFT_GUARD'\n(.*?)\nMK_DRAFT_GUARD", legacy, re.S)[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            body = Path(tmp) / 'body.html'
+            options = dict(enabled=False, private=False, body=body, current='', run_dir='',
+                           validator='', interpreter='', sources='', evidence_dir='', banner='', banner_alt='')
+            for template in ('', 'simple-post', 'daum-trends', 'mk-review'):
+                for html, accepted in (('<p data-image-marker="trend-image-1"/>', True),
+                                       ('<p data-image-marker="mk-article-1"/>', False),
+                                       ('<p data-image-marker="trend-image-1" data-article-id="mk-1"/>', False)):
+                    with self.subTest(template=template, html=html):
+                        body.write_text(html)
+                        if accepted:
+                            stage3.MKArticleImages(template=template, legacy_images='/image.jpg', **options)
+                        else:
+                            with self.assertRaises(stage3.ImagePublishError):
+                                stage3.MKArticleImages(template=template, **options)
+                        proc = subprocess.run([sys.executable, '-', str(SCRIPTS), str(body), template],
+                                              input=guard, capture_output=True, text=True)
+                        self.assertEqual(proc.returncode == 0, accepted, proc.stderr)
+
     def test_legacy_marker_guard_including_no_template_and_self_closing(self):
         for template in ('', 'mk-review', 'simple-post', 'daum-trends'):
+            for marker in ('trend-image-1', 'trend-image-12'):
+                stage3.guard_legacy_markers('<p data-image-marker="%s"/>' % marker, template)
+            for marker in ('mk-image-1', 'arbitrary', 'trend-image-0', 'trend-image-1-extra'):
+                with self.subTest(template=template, marker=marker), self.assertRaises(stage3.ImagePublishError):
+                    stage3.guard_legacy_markers('<p data-image-marker="%s"/>' % marker, template)
+            with self.subTest(template=template), self.assertRaises(stage3.ImagePublishError):
+                stage3.guard_legacy_markers('<p data-image-marker="mk-image-1" data-image-marker="trend-image-1"/>', template)
             for attr in ('data-image-alt', 'data-image-caption', 'data-article-id'):
                 with self.subTest(template=template, attr=attr), self.assertRaises(stage3.ImagePublishError):
                     stage3.guard_legacy_markers('<p %s="x"/>' % attr, template)
@@ -98,7 +138,7 @@ class ContractTests(unittest.TestCase):
         adapter.post_url = adapter.post_id = None
         adapter.phase = 'submit'
         adapter.submitted = True
-        adapter.ready = False
+        adapter.ready = True
         adapter.write = Mock()
         functions = [n for n in embedded().body if isinstance(n, ast.FunctionDef)
                      and n.name in ('fail', 'mk_failure_result')]
@@ -113,6 +153,10 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(result['postId'], '456')
         self.assertTrue(result['submitted'])
         self.assertFalse(result['automaticRetryAllowed'])
+        self.assertEqual(result['phase'], 'submit')
+        self.assertEqual(result['error'], 'mk-images/submit-failed')
+        self.assertEqual(adapter.write.call_args.args[1]['phase'], 'submit')
+        self.assertEqual(adapter.write.call_args.args[1]['postId'], '456')
 
     def test_before_submit_runs_real_editor_gate_and_failure_never_mints_submission(self):
         adapter = object.__new__(stage3.MKArticleImages)
@@ -142,6 +186,83 @@ class ContractTests(unittest.TestCase):
             ns['upload_editor_image'](page, {'buffer': b'bytes'}, 'MK', single_delivery=True)
         self.assertEqual(page.expect_file_chooser.call_count, 1)
         find_input.assert_not_called()
+
+
+class OGWiringTests(unittest.TestCase):
+    def setUp(self):
+        self.tree = embedded()
+        self.adapter = SimpleNamespace(enabled=True, phase='draft', post_url='https://blog.example/123',
+                                       draft_validation={'success': True, 'images': {'verified': 4}},
+                                       public_gate=Mock(return_value={'success': True, 'images': {'verified': 4}}))
+        def fail(message):
+            raise stage3.ImagePublishError(message)
+        self.ns = dict(mk_images=self.adapter, should_run_og_gate=lambda: self.configured,
+                       run_og_gate=Mock(side_effect=lambda mode, *args: {'success': True, 'count': 4, 'card_count': 4}),
+                       log=Mock(), fail=fail, draft_og_gate=None, public_og_gate=None, public_image_gate=None,
+                       post_info={'url': 'https://blog.example/123', 'id': '123'}, PRIVATE=False)
+        self.configured = False
+
+    def preflight(self):
+        start = next(i for i, n in enumerate(self.tree.body) if isinstance(n, ast.Try)
+                     and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                             and c.func.id == 'MKArticleImages' for c in ast.walk(n)))
+        branch = self.tree.body[start + 1]
+        exec(compile(ast.Module(body=[branch], type_ignores=[]), 'actual-og-preflight', 'exec'), self.ns)
+
+    def public(self):
+        block = next(n for n in self.tree.body if isinstance(n, ast.With))
+        branch = next(n for n in block.body if isinstance(n, ast.If)
+                      and any(isinstance(c, ast.Call) and ast.unparse(c.func) == 'mk_images.public_gate'
+                              for c in ast.walk(n)))
+        exec(compile(ast.Module(body=[branch], type_ignores=[]), 'actual-public-gates', 'exec'), self.ns)
+
+    def result(self):
+        block = next(n for n in self.tree.body if isinstance(n, ast.With))
+        start = next(i for i, n in enumerate(block.body) if isinstance(n, ast.Assign)
+                     and any(isinstance(t, ast.Name) and t.id == 'result' for t in n.targets))
+        stop = next(i for i in range(start, len(block.body)) if isinstance(block.body[i], ast.If)
+                    and ast.unparse(block.body[i].test) == 'HARD_FAIL')
+        self.ns.update(final_url='https://blog.example/manage/posts', elapsed=1, PUBLIC_BASE_URL='',
+                       gap_check=None, og_render_summary=None, warning=None)
+        exec(compile(ast.Module(body=block.body[start:stop], type_ignores=[]), 'actual-result', 'exec'), self.ns)
+        return self.ns['result']
+
+    def test_unconfigured_og_never_claims_success_for_image_proofs(self):
+        self.preflight()
+        self.public()
+        result = self.result()
+        self.ns['run_og_gate'].assert_not_called()
+        self.assertNotIn('draftOgValidation', result)
+        self.assertNotIn('publicOgValidation', result)
+        self.assertEqual(result['articleImageValidation']['public']['images']['verified'], 4)
+
+    def test_configured_draft_and_public_og_both_run_and_report_actual_results(self):
+        self.configured = True
+        self.preflight()
+        self.public()
+        self.assertEqual(self.ns['run_og_gate'].call_args_list,
+                         [unittest.mock.call('draft'), unittest.mock.call('public', 'https://blog.example/123')])
+        result = self.result()
+        self.assertEqual(result['draftOgValidation'], {'success': True, 'count': 4})
+        self.assertEqual(result['publicOgValidation'], {'success': True, 'cardCount': 4})
+
+    def test_configured_draft_rejection_stops_before_browser(self):
+        self.configured = True
+        self.ns['run_og_gate'].side_effect = stage3.ImagePublishError('strict OG rejected')
+        browser_entry = Mock()
+        with self.assertRaises(stage3.ImagePublishError):
+            self.preflight()
+            browser_entry()
+        browser_entry.assert_not_called()
+
+    def test_configured_public_rejection_cannot_become_success_or_resubmit(self):
+        self.configured = True
+        self.ns['run_og_gate'].side_effect = stage3.ImagePublishError('strict OG public rejected')
+        cleanup_or_resubmit = Mock()
+        with self.assertRaises(stage3.ImagePublishError):
+            self.public()
+            cleanup_or_resubmit()
+        cleanup_or_resubmit.assert_not_called()
 
 
 class MKRepresentativeTests(unittest.TestCase):
@@ -347,7 +468,7 @@ class MockBoundaryTests(unittest.TestCase):
             entry = dict(index=i, article_id='mock-%s' % i, source_url='https://www.mk.co.kr/news/economy/%s' % i,
                          marker='trend-image-%s' % i, filename='asset-%s.jpg' % i, alt='alt %s' % i, caption='AI disclosure')
             plan['articles'].append(entry)
-            output = run / entry['filename']; output.write_bytes(b'mock bytes ' + bytes([i]))
+            output = run / entry['filename']; output.write_bytes(b'\xff\xd8\xffmock JPEG bytes ' + bytes([i]))
             assets.append({'sha256': stage3.digest(output.read_bytes())})
         save(run / 'manifest.json', {'plan': plan, 'assets': assets,
              'engine': {'path': str(engine), 'sha256': stage3.digest(engine.read_bytes())}})
@@ -404,6 +525,7 @@ class MockBoundaryTests(unittest.TestCase):
         for payload, row, src in zip(page.uploads, adapter.rows, page.srcs):
             self.assertEqual(row['file_sha256'], stage3.digest(payload['buffer']))
             self.assertEqual(row['uploaded_src'], src)
+            self.assertEqual(payload['mimeType'], 'image/jpeg')
         self.assertEqual(len(adapter.rows), 4)
         self.assertNotIn(adapter.banner_src, [r['uploaded_src'] for r in adapter.rows])
 
@@ -474,6 +596,128 @@ class MockBoundaryTests(unittest.TestCase):
         self.assertEqual(len(adapter.rows), 1)
         self.assertFalse(adapter.submitted)
 
+    def test_draft_rejection_keeps_bounded_stdout_and_stderr_without_reserving_evidence(self):
+        def reject(args, **kwargs):
+            return subprocess.CompletedProcess(args, 1, json.dumps({'success': False, 'items': ['x' * 3000],
+                                                                   'errors': ['source title mismatch']}),
+                                               'validator: invalid source evidence')
+        with self.assertRaises(stage3.ImagePublishError) as failure:
+            stage3.MKArticleImages(**dict(self.options, runner=reject))
+        self.assertIn('source title mismatch', str(failure.exception))
+        self.assertIn('invalid source evidence', str(failure.exception))
+        self.assertFalse(self.options['evidence_dir'].exists())
+
+    def test_actual_constructor_failure_reports_distinct_reasons_before_browser(self):
+        tree = embedded()
+        constructor = next(n for n in tree.body if isinstance(n, ast.Try)
+                           and any(isinstance(c, ast.Call) and ast.unparse(c.func) == 'MKArticleImages'
+                                   for c in ast.walk(n)))
+        blank = {key: '' for key in ('current', 'run_dir', 'validator', 'interpreter', 'sources', 'evidence_dir')}
+        cases = [(dict(self.options, current=''), 'complete image flags'),
+                 (dict(self.options, current=self.tmp / 'missing.json'), 'input file unavailable'),
+                 (dict(self.options, enabled=False, **blank), 'image marker draft requires'),
+                 (dict(self.options, runner=lambda *a, **k: subprocess.CompletedProcess(
+                     a, 1, '{"success":false,"error":"source title mismatch"}',
+                     'source unavailable; TOKEN="two word secret"')), 'source title mismatch')]
+        body = self.options['body']
+        original = body.read_text()
+        for options, reason in cases:
+            with self.subTest(reason=reason):
+                body.write_text('<p data-article-id="mk"/>' if not options['enabled'] else original)
+                def fail(message):
+                    raise stage3.ImagePublishError(message)
+                ns = dict(MKArticleImages=lambda **ignored: stage3.MKArticleImages(**options),
+                          sys=SimpleNamespace(argv=[''] * 23), TEMPLATE='mk-review', PRIVATE=False,
+                          BODY_FILE=str(body), BANNER=str(self.options['banner']), BANNER_ALT='banner', os=os,
+                          fail=fail, bounded_diagnostic=stage3.bounded_diagnostic)
+                browser_entry = Mock()
+                with self.assertRaises(stage3.ImagePublishError) as failure:
+                    exec(compile(ast.Module(body=[constructor], type_ignores=[]), 'constructor', 'exec'), ns)
+                    browser_entry()
+                self.assertIn('mk-images/draft-preflight-failed:', str(failure.exception))
+                self.assertIn(reason, str(failure.exception))
+                self.assertNotIn('two word secret', str(failure.exception))
+                browser_entry.assert_not_called()
+                self.assertFalse(self.options['evidence_dir'].exists())
+        body.write_text(original)
+
+    def test_diagnostics_are_bounded_and_redact_credentials_in_both_streams(self):
+        with patch.dict(os.environ, TEST_API_KEY='env-credential-value'):
+            text = stage3.bounded_diagnostic('mismatch env-credential-value password="two word secret" '
+                                             'https://user:pass@example.test/path Bearer raw-auth\n' + 'x' * 5000)
+        for secret in ('env-credential-value', 'two word secret', 'user:pass', 'raw-auth'):
+            self.assertNotIn(secret, text)
+        self.assertIn('mismatch', text)
+        self.assertIn('[truncated]', text)
+        self.assertLessEqual(len(text), 1820)
+        for stdout, stderr, reason in (('unparsed', 'decode failed', 'structured success'),
+                                        ('x' * 140000, 'too large', 'oversized'),
+                                        ('[]', 'wrong shape', 'object required')):
+            def runner(*args, **kwargs):
+                return subprocess.CompletedProcess(args, 1, stdout, stderr)
+            with self.subTest(reason=reason), self.assertRaises(stage3.ImagePublishError) as failure:
+                stage3.MKArticleImages(**dict(self.options, runner=runner))
+            self.assertIn(reason, str(failure.exception))
+            self.assertIn(stderr, str(failure.exception))
+            self.assertLess(len(str(failure.exception)), 1500)
+
+    def test_actual_og_command_uses_image_context_and_public_snapshot(self):
+        adapter, page = self.uploaded()
+        process = Mock()
+        process.run.return_value = subprocess.CompletedProcess([], 0, '{"success":true,"count":4,"card_count":4}', '')
+        ns = og_namespace(adapter, process)
+        ns['run_og_gate']('draft')
+        draft = process.run.call_args.args[0]
+        self.assertEqual(draft[:3], [str(adapter.interpreter), str(adapter.validator), 'draft'])
+        for flag, value in (('--image-input', adapter.current), ('--image-run-dir', adapter.run_dir),
+                            ('--source-evidence-file', adapter.sources)):
+            self.assertEqual(draft[draft.index(flag) + 1], str(value))
+        adapter.before_submit(page)
+        adapter.confirm_publication('https://blog.example/345', '345')
+        adapter.public_gate(Mock(return_value=page.snapshot))
+        ns['run_og_gate']('public', adapter.post_url)
+        public = process.run.call_args.args[0]
+        self.assertEqual(public[public.index('--snapshot-file') + 1], str(adapter.evidence / 'public.html'))
+        self.assertEqual(public[public.index('--upload-receipt') + 1], str(adapter.evidence / 'upload-receipt.json'))
+
+    def test_actual_strict_og_failure_retains_publication_identity_and_nonzero_exit(self):
+        adapter, page = self.uploaded()
+        adapter.before_submit(page)
+        adapter.confirm_publication('https://blog.example/345', '345')
+        adapter.public_gate(Mock(return_value=page.snapshot))
+        process = Mock()
+        ns = og_namespace(adapter, process)
+        for code, stdout in ((1, '{"success":false}'), (0, '{"success":false}'),
+                             (0, 'not JSON'), (0, '[]'), (0, '{"success":1}')):
+            process.run.return_value = subprocess.CompletedProcess([], code, stdout, 'OG mismatch')
+            with self.subTest(code=code, stdout=stdout), patch('builtins.print') as output, self.assertRaises(SystemExit) as exit_code:
+                ns['run_og_gate']('public', adapter.post_url)
+            self.assertEqual(exit_code.exception.code, 1)
+            result = json.loads(output.call_args.args[0])
+            self.assertEqual(result['phase'], 'public')
+            self.assertEqual(result['postUrl'], 'https://blog.example/345')
+            self.assertEqual(result['postId'], '345')
+            self.assertTrue(result['submitted'])
+            self.assertFalse(result['success'])
+            self.assertFalse(result['automaticRetryAllowed'])
+            self.assertEqual(json.loads((adapter.evidence / 'state.json').read_text())['status'], 'failed')
+
+    def test_only_stage1_jpeg_contract_is_accepted_before_evidence_or_upload(self):
+        manifest = self.bundle['run'] / 'manifest.json'
+        original = json.loads(manifest.read_text())
+        for name, content in (('asset.png', b'\x89PNG\r\n\x1a\nPNG bytes'),
+                              ('asset.jpg', b'\x89PNG\r\n\x1a\nPNG bytes'),
+                              ('asset.unknown', b'\xff\xd8\xffJPEG bytes')):
+            with self.subTest(name=name):
+                state = copy.deepcopy(original)
+                state['plan']['articles'][0]['filename'] = name
+                (self.bundle['run'] / name).write_bytes(content)
+                state['assets'][0]['sha256'] = stage3.digest(content)
+                save(manifest, state)
+                with self.assertRaisesRegex(stage3.ImagePublishError, 'JPEG'):
+                    stage3.MKArticleImages(**self.options)
+                self.assertFalse(self.options['evidence_dir'].exists())
+
 
 @unittest.skipUnless(os.environ.get('MK_STAGE2_DIR'), 'set MK_STAGE2_DIR for external Stage2 integration')
 class RealStage2Tests(unittest.TestCase):
@@ -529,6 +773,18 @@ class RealStage2Tests(unittest.TestCase):
         for file in adapter.evidence.iterdir():
             self.assertEqual(file.stat().st_mode & 0o777, 0o600)
         self.assertEqual(adapter.evidence.stat().st_mode & 0o777, 0o700)
+
+    def test_real_configured_og_gates_use_full_image_contract_without_fetch(self):
+        adapter, editor = self.uploaded()
+        ns = og_namespace(adapter, subprocess)
+        self.assertTrue(ns['run_og_gate']('draft')['success'])
+        adapter.before_submit(editor)
+        adapter.confirm_publication('https://blog.example/124', '124')
+        adapter.public_gate(Mock(return_value='<div class="contents_style">' + editor.snapshot + '</div>'))
+        proof = ns['run_og_gate']('public', adapter.post_url)
+        self.assertTrue(proof['success'])
+        self.assertEqual(proof['card_count'], 4)
+        self.assertEqual(proof['images']['verified'], 4)
 
     def test_editor_rejects_structural_and_identity_mistakes_before_submit(self):
         adapter, editor = self.uploaded()

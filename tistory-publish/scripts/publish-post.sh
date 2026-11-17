@@ -340,7 +340,32 @@ def run_og_gate(mode, *args):
         cmd += ['--body-file', BODY_FILE, '--post-url', args[0]]
     else:
         fail(f"unknown OG validation mode: {mode}")
+    image_mode = bool(globals().get('mk_images') and mk_images.enabled)
+    if image_mode:
+        cmd[0] = str(mk_images.interpreter)
+        cmd += ['--image-input', str(mk_images.current), '--image-run-dir', str(mk_images.run_dir),
+                '--source-evidence-file', str(mk_images.sources)]
+        if mode == 'public':
+            cmd += ['--snapshot-file', str(mk_images.evidence / 'public.html'),
+                    '--upload-receipt', str(mk_images.evidence / 'upload-receipt.json')]
+            if mk_images.selector:
+                cmd += ['--content-selector', mk_images.selector]
+        mk_images.check_binding()
     proc = subprocess.run(cmd, text=True, capture_output=True, timeout=90)
+    if image_mode:
+        detail = bounded_diagnostic('stdout=' + (proc.stdout or '') + '; stderr=' + (proc.stderr or ''))
+        if len(proc.stdout or '') > 131072:
+            fail('OG ' + mode + ' validator output oversized: ' + detail)
+        if proc.returncode != 0:
+            fail('OG ' + mode + ' validation failed: ' + detail)
+        try:
+            proof = json.loads(proc.stdout)
+        except (ValueError, TypeError):
+            fail('OG ' + mode + ' validator did not return structured success: ' + detail)
+        if not isinstance(proof, dict) or proof.get('success') is not True:
+            fail('OG ' + mode + ' validation rejected: ' + detail)
+        mk_images.check_binding()
+        return proof
     detail = (proc.stdout or proc.stderr or '').strip()
     if detail:
         log(f"  - OG {mode} gate: {detail[:1200]}")
@@ -1787,8 +1812,9 @@ last_dialog_message = None
 body_html = open(BODY_FILE, 'r', encoding='utf-8').read()
 draft_og_gate = None
 public_og_gate = None
+public_image_gate = None
 
-from mk_article_image_publisher import MKArticleImages
+from mk_article_image_publisher import MKArticleImages, bounded_diagnostic
 mk_images = None
 try:
     mk_images = MKArticleImages(
@@ -1797,12 +1823,10 @@ try:
         validator=sys.argv[18], interpreter=sys.argv[19], sources=sys.argv[20],
         evidence_dir=sys.argv[21], selector=sys.argv[22], banner=BANNER,
         banner_alt=BANNER_ALT, legacy_images=os.environ.get('TISTORY_INLINE_IMAGE_FILES', ''))
-except Exception:
-    fail('mk-images/draft-preflight-failed')
+except Exception as error:
+    fail('mk-images/draft-preflight-failed: ' + bounded_diagnostic(error))
 
-if mk_images.enabled:
-    draft_og_gate = {'success': True, 'count': 4}
-elif should_run_og_gate():
+if should_run_og_gate():
     log("Preflight: OG URL/title validation")
     draft_og_gate = run_og_gate('draft')
     log(f"  - OG draft gate OK ({draft_og_gate.get('count', 0)} cards)")
@@ -2577,9 +2601,11 @@ with sync_playwright() as p:
                     raise RuntimeError('public snapshot too large')
                 return raw.decode(response.headers.get_content_charset() or 'utf-8', 'strict')
         try:
-            public_og_gate = mk_images.public_gate(fetch_mk_public)
+            public_image_gate = mk_images.public_gate(fetch_mk_public)
+            if should_run_og_gate():
+                public_og_gate = run_og_gate('public', mk_images.post_url)
         except Exception:
-            fail('MK public image validation failed; publication retained; no automatic retry')
+            fail('MK public image/OG validation failed; publication retained; no automatic retry')
     elif not PRIVATE and post_info and post_info.get('url'):
         log("Step 11: 공개 페이지 검증")
         import urllib.request
@@ -2643,6 +2669,11 @@ with sync_playwright() as p:
         result["draftOgValidation"] = {"success": True, "count": draft_og_gate.get('count')}
     if public_og_gate:
         result["publicOgValidation"] = {"success": True, "cardCount": public_og_gate.get('card_count')}
+    if mk_images.enabled:
+        result["articleImageValidation"] = {
+            "draft": {"success": True, "images": mk_images.draft_validation['images']},
+            "public": {"success": True, "images": public_image_gate['images']},
+        }
     if warning:
         result["warning"] = warning
     if HARD_FAIL:

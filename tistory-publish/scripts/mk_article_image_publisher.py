@@ -20,6 +20,31 @@ class ImagePublishError(RuntimeError):
     pass
 
 
+def bounded_diagnostic(value, limit=1800):
+    """Operator diagnostics only: bounded, no credential env values/assignments."""
+    if isinstance(value, bytes):
+        value = value.decode('utf-8', 'replace')
+    text = str(value or '')
+    sensitive = r'password|passwd|secret|token|credential|authorization|cookie|api[_-]?key'
+    for key, secret in os.environ.items():
+        if secret and re.search(sensitive, key, re.I):
+            text = text.replace(secret, '[redacted]')
+    text = re.sub(r'(?i)\b(?:bearer|basic)\s+[^\s,"\x27]+', '[redacted authorization]', text)
+    text = re.sub(r'(?i)(\b[\w-]*(?:' + sensitive + r')[\w-]*[\s"\x27]*[:=]\s*)("[^"\n]*"|\x27[^\x27\n]*\x27|[^\s,;"\x27}]+)',
+                  r'\1[redacted]', text)
+    text = re.sub(r'(https?://)[^/@\s]+@', r'\1[redacted]@', text)
+    text = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '?', text)
+    return text[:limit] + (' [truncated]' if len(text) > limit else '')
+
+
+def article_mime(filename, content):
+    # Stage1 verify() decodes JPEG only. This is a transport consistency check;
+    # the mandatory Stage2 re-verification remains the decoded-image proof.
+    if Path(filename).suffix.lower() not in ('.jpg', '.jpeg') or not content.startswith(b'\xff\xd8\xff'):
+        raise ImagePublishError('Stage1 article requires JPEG filename and JPEG bytes')
+    return 'image/jpeg'
+
+
 def digest(value):
     return hashlib.sha256(value).hexdigest()
 
@@ -40,7 +65,8 @@ def guard_legacy_markers(body, template):
         def handle_starttag(self, tag, attrs):
             keys = dict(attrs)
             if (set(keys) & {'data-image-alt', 'data-image-caption', 'data-article-id'}
-                    or ('data-image-marker' in keys and template != 'daum-trends')):
+                    or any(key == 'data-image-marker' and not re.fullmatch(r'trend-image-[1-9][0-9]*', value or '')
+                           for key, value in attrs)):
                 self.forbidden = True
     parser = Markers()
     parser.feed(body)
@@ -93,12 +119,14 @@ class MKArticleImages:
             if path == self.evidence or path in self.evidence.parents:
                 raise ImagePublishError('evidence must be outside source/validator directories')
         self.binding = self.fingerprint()
-        self.gate('draft')  # MUST precede CDP, editor creation, and upload.
+        self.draft_validation = self.gate('draft')  # MUST precede CDP, editor creation, and upload.
         state = json.loads((self.run_dir / 'manifest.json').read_text(encoding='utf-8'))
         self.plan = state['plan']
         self.assets = state['assets']
         if len(self.plan['articles']) != 4 or len(self.assets) != 4:
             raise ImagePublishError('four verified assets required')
+        for entry in self.plan['articles']:
+            article_mime(entry['filename'], (self.run_dir / entry['filename']).read_bytes())
         self.check_binding()
         if digest(self.banner.read_bytes()) in [asset['sha256'] for asset in self.assets]:
             raise ImagePublishError('banner reuses article bytes')
@@ -152,26 +180,35 @@ class MKArticleImages:
                   **self.status('failed')}
         if self.ready:
             try:
-                self.write('state.json', dict(result, detail=str(error)[:500] if error else ''))
+                self.write('state.json', dict(result, detail=bounded_diagnostic(error, 500)))
             except OSError:
                 pass  # Still emit the non-success publication identity on disk failure.
         return result
 
     def invoke(self, command, record=None):
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
-        proc = self.runner(command, text=True, capture_output=True, timeout=90, env=env)
+        try:
+            proc = self.runner(command, text=True, capture_output=True, timeout=90, env=env)
+        except subprocess.TimeoutExpired as error:
+            raise ImagePublishError('validator timeout: stdout=' + bounded_diagnostic(error.stdout, 600)
+                                    + '; stderr=' + bounded_diagnostic(error.stderr, 600)) from None
+        diagnostics = ('; stdout=' + bounded_diagnostic(proc.stdout, 600)
+                       + '; stderr=' + bounded_diagnostic(proc.stderr, 600))
         if len(proc.stdout or '') > 131072:
-            raise ImagePublishError('oversized validator output')
+            raise ImagePublishError('oversized validator output' + diagnostics)
         try:
             result = json.loads(proc.stdout)
         except (ValueError, TypeError):
-            raise ImagePublishError('validator did not return structured success')
+            raise ImagePublishError('validator did not return structured success' + diagnostics)
         if not isinstance(result, dict):
-            raise ImagePublishError('validator object required')
+            raise ImagePublishError('validator object required' + diagnostics)
         if self.ready:
             self.write(record or self.phase + '-gate.json', result)
         if proc.returncode != 0 or result.get('success') is not True:
-            raise ImagePublishError('mandatory image validator rejected ' + self.phase)
+            # Stage2 puts errors after potentially long per-article evidence.
+            # Keep the rejection reason visible even when stdout is truncated.
+            reason = bounded_diagnostic(json.dumps(result.get('errors', result.get('error', '')), ensure_ascii=False), 400)
+            raise ImagePublishError('mandatory image validator rejected ' + self.phase + '; errors=' + reason + diagnostics)
         return result
 
     def gate(self, phase, snapshot=None, post_url=None):
@@ -214,7 +251,7 @@ class MKArticleImages:
             content = (self.run_dir / entry['filename']).read_bytes()
             if digest(content) != asset['sha256']:
                 raise ImagePublishError('article source SHA changed')
-            src = self.upload_one(page, upload, {'name': entry['filename'], 'mimeType': 'image/jpeg', 'buffer': content}, entry)
+            src = self.upload_one(page, upload, {'name': entry['filename'], 'mimeType': article_mime(entry['filename'], content), 'buffer': content}, entry)
             self.check_binding()
             if src in [row['uploaded_src'] for row in self.rows]:
                 raise ImagePublishError('duplicate upload attachment')
@@ -282,11 +319,11 @@ class MKArticleImages:
         self.write('state.json', self.status('submission-started'))
 
     def confirm_publication(self, post_url, post_id):
-        self.phase = 'public'
-        self.post_url = https_src(post_url)
-        self.post_id = str(post_id or '')
-        if not self.post_id:
+        confirmed_url = https_src(post_url)
+        confirmed_id = str(post_id or '')
+        if not confirmed_id:
             raise ImagePublishError('publication identity missing')
+        self.post_url, self.post_id = confirmed_url, confirmed_id
         self.write('state.json', self.status('published-awaiting-verification'))
 
     def public_gate(self, fetch):

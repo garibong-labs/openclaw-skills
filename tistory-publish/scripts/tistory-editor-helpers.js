@@ -1673,6 +1673,7 @@ function pollMKImageUpload(token) {
   if (!op || op.token !== token) throw new Error('MK operation mismatch');
   op.observe(op.observer.takeRecords());
   if (op.editor.getBody() !== op.body) op.error = 'editor body replaced';
+  for (const img of op.added) if (!op.body.contains(img)) op.added.delete(img);
   if (op.added.size > 1) op.error = 'ambiguous upload attachments';
   if (op.error) return { ready: true, error: op.error };
   const img = Array.from(op.added)[0];
@@ -1683,7 +1684,7 @@ function pollMKImageUpload(token) {
     op.error = 'upload reused existing src';
     return { ready: true, error: op.error };
   }
-  if (op.src !== src) { op.src = src; op.since = Date.now(); }
+  if (op.img !== img || op.src !== src) { op.img = img; op.src = src; op.since = Date.now(); }
   return { ready: Date.now() - op.since >= 500 };
 }
 
@@ -1718,7 +1719,7 @@ function finishMKImageUpload({token, entry, bannerAlt}) {
 function preserveMKOGThumbnailEvidence() {
   const editor = getSafeTinyEditor();
   if (!editor) throw new Error('MK editor unavailable');
-  const cards = Array.from(editor.getBody().querySelectorAll('figure[data-ke-type="opengraph"]'));
+  const cards = getOGCardElements(editor.getBody());
   if (cards.length !== 4) throw new Error('four MK cards required');
   for (const card of cards) {
     if (card.querySelector('figure, picture, source, iframe, object, embed, video, audio, svg, canvas')) throw new Error('unsupported OG embed');

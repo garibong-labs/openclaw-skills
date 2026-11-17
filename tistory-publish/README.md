@@ -95,7 +95,7 @@ ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
   --image-evidence-dir "$MK_NEW_EVIDENCE_DIR"
 ```
 
-- `--mk-article-images`와 위 여섯 증거 옵션은 모두 필수입니다. `--private`, `TISTORY_INLINE_IMAGE_FILES`와 함께 사용할 수 없습니다. 일부 옵션만 주거나 opt-in 없이 이미지 옵션을 주면 CDP 전에 중단합니다. Stage1 속성/일반 이미지 marker 원고도 legacy로 통과하지 않습니다. 기존 Daum 전용 marker 경로는 유지합니다.
+- `--mk-article-images`와 위 여섯 증거 옵션은 모두 필수입니다. `--private`, `TISTORY_INLINE_IMAGE_FILES`와 함께 사용할 수 없습니다. 일부 옵션만 주거나 opt-in 없이 이미지 옵션을 주면 CDP 전에 중단합니다. Stage1 전용 `data-article-id`/`data-image-alt`/`data-image-caption` 속성이나 알 수 없는 marker 원고는 legacy로 통과하지 않습니다. 이 속성 없는 기존 `trend-image-N`(1부터 시작) marker는 기본/simple-post/Daum 및 legacy publisher에서 계속 사용할 수 있습니다.
 - `--image-validator`는 Stage2 `validate-og.py`의 명시적 파일 경로입니다. 같은 디렉터리에 `mk_image_validation.py`, `mk_article_images.py`가 있어야 합니다. 호출자가 신뢰하는 코드를 선택하는 경계이며, 임의 validator의 정확성을 독립 인증하는 기능은 아닙니다. 기준 계약은 workflows Stage2 `e9870c232d66c0623aa78704b4c5f6fddfa0122e`입니다.
 - `--image-validator-python`은 해당 Stage2 코드와 **Pillow**를 실행할 수 있는 Python 실행 파일 경로입니다(필요하면 전용 venv 사용). publisher의 Python 3.9 호환성과 외부 검증기의 의존성은 별개입니다. 검증기 코드를 읽어 3.9 문법 범위임을 확인했지만 이번 로컬 실제 통합 실행은 Python 3.14.9 + Pillow 12.1.1이며, 3.9/3.13 런타임 증거는 아닙니다. 자동 interpreter 선택·패키지 설치·provider 호출은 없습니다.
 - `--source-evidence-file`은 신뢰하는 출처 수집자가 제공한 UTF-8 JSON입니다. 정확한 `source_url`을 key로 하고 값에 관찰한 `title`, 정확한 `canonical`을 담습니다. 네 행이 모두 필요하며 원고 제목/URL을 복사해서 증거를 만들어서는 안 됩니다. Stage3는 출처 수집을 구현하지 않으며 모든 gate에 이 파일을 전달합니다. 누락 시 네트워크 보충/legacy 전환이 없습니다.
@@ -105,16 +105,20 @@ ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
 ### 증거 생산자/소비자 계약과 순서
 
 1. **draft**: CDP 연결·새 탭·로그인·업로드 전에 필수 Stage2 `draft`를 실행합니다. 현재 입력, 원본 본문, run, 출처 증거를 항상 전달합니다. `TISTORY_OG_MATCH_GATE=0`, `TISTORY_OG_VALIDATOR` 미설정, SEO off, `ALLOW_MISSING_IMAGES=1`로 이 gate를 끌 수 없습니다.
-2. **업로드**: Stage1 고정 순서의 네 verified 파일을 읽고 SHA를 확인한 동일 바이트를 Playwright `FilePayload`로 기존 첨부→사진 UI에 전달합니다. 작업 전 시작한 observer가 새로 추가된 유일한 이미지 노드의 참조와 src 변화를 유지합니다. 그 작업의 안정된 HTTPS attachment src만 반환하며, 파일명 부분 일치·늦은 DOM 전체 수집·개수·marker의 자기 주장으로 receipt를 만들지 않습니다. 입력 확보는 최대 3회(2/4초 backoff), 실제 파일 전달 시작 뒤 불확실한 오류는 재전달하지 않고 중단합니다. 첨부 결과 대기는 최대 30초입니다.
+2. **업로드**: Stage1 고정 순서의 네 verified 파일을 읽고 SHA를 확인한 동일 바이트를 Playwright `FilePayload`로 기존 첨부→사진 UI에 전달합니다. 현재 Stage1/2의 기사 자산 계약은 decoded JPEG이며, Stage3도 `.jpg`/`.jpeg` 확장자와 JPEG 바이트 서명을 증거 디렉터리 생성 전에 확인하고 `image/jpeg`로 전달합니다. PNG/미지원 확장자/서명 불일치는 거부합니다. 작업 전 시작한 observer가 새로 추가된 유일한 이미지 노드의 참조와 src 변화를 유지합니다. 분리된 임시 노드는 제외하며 교체 노드는 같은 src라도 새 500ms 안정화 시간이 필요합니다. 동시에 붙어 있는 복수 새 이미지는 거부합니다. 그 작업의 안정된 HTTPS attachment src만 반환하며, 파일명 부분 일치·늦은 DOM 전체 수집·개수·marker의 자기 주장으로 receipt를 만들지 않습니다. 입력 확보는 최대 3회(2/4초 backoff), 실제 파일 전달 시작 뒤 불확실한 오류는 재전달하지 않고 중단합니다. 첨부 결과 대기는 최대 30초입니다.
 3. **배치/receipt**: 그 노드의 native image figure를 해당 marker에 옮기고 정확한 alt와 figure 내부 figcaption AI disclosure를 설정합니다. 최종 순서는 `h2 → 해당 기사 OG 전체 → 기사 첨부/figcaption → 입력 요약 → 빈 size16 문단 → 코멘트`입니다. `upload-receipt.json`은 Stage2 그대로 `schema_version:1`, `input_sha256`, 고정 순서의 `articles` 네 행이며 각 행은 `index, article_id, source_url, marker, filename, file_sha256, uploaded_src`를 담습니다. 배너는 별도 작업·`banner.json`에 기록하고 첫 기사 전에 둡니다. 기사 파일/첨부 identity 재사용, 배너 누락/추가/src/alt 오류도 거부합니다.
-4. **editor**: 실제 카드에서 관찰한 thumbnail src를 `data-og-image`로 보존합니다. 기존 선언과 관찰값이 다르거나 unknown/복수 thumbnail/비이미지 embed이면 중단합니다. source/canonical/title은 생성하지 않습니다. `editor.html`, receipt와 전체 현재 증거를 Stage2 `editor`에 전달하며 발행 다이얼로그 전과 최종 submit 직전에 검사합니다. source·입력·run·엔진 코드·validator/siblings의 파일 identity/SHA, receipt/banner와 snapshot을 단계 사이에 재검사합니다.
+4. **editor**: 공용 OG discovery가 인식하는 `figure[data-ke-type="opengraph"]`, `.og-container`, `[data-og-host]` 카드에서 관찰한 thumbnail src를 `data-og-image`로 보존합니다. 기존 선언과 관찰값이 다르거나 unknown/복수 thumbnail/중첩 figure/비이미지 embed이면 중단합니다. source/canonical/title은 생성하지 않습니다. 이후 실제 snapshot 구조의 허용 여부는 Stage2가 별도로 판단합니다. `editor.html`, receipt와 전체 현재 증거를 Stage2 `editor`에 전달하며 발행 다이얼로그 전과 최종 submit 직전에 검사합니다. source·입력·run·엔진 코드·validator/siblings의 파일 identity/SHA, receipt/banner와 snapshot을 단계 사이에 재검사합니다.
 5. **public**: submit 전에 `state.json`에 `submission-started`를 기록합니다. 글 URL/ID 확인 후 `published-awaiting-verification`을 기록하고 공개 HTML을 한 번 수집하여 `public.html`과 같은 증거를 Stage2 `public`에 전달합니다. 각 validator/audit 호출은 최대 90초, 공개 fetch는 15초, snapshot은 최대 10MiB입니다. 별도 audit도 Stage2의 동일 scope/URL identity helper로 배너·비이미지 embed를 검사합니다. URL wrapper/srcset 인정 범위를 임의로 넓히지 않습니다.
+
+이미지 증명은 최종 JSON의 `articleImageValidation.draft`/`.public`에 별도로 보고합니다. 기존 `TISTORY_OG_VALIDATOR`와 OG match gate가 켜져 있으면 추가 OG draft/public 검증도 실제로 실행합니다. MK 경로의 추가 validator에는 명시한 이미지 interpreter와 현재 입력/run/출처 증거를 전달하고, public에는 이미 수집한 snapshot/receipt/scope도 전달합니다. 해당 Stage2 CLI 계약과 structured `success:true` 응답이 필수이며 오류/거절/불명확 응답은 중단합니다. 추가 OG 검증이 꺼져 있으면 `draftOgValidation`/`publicOgValidation`을 내보내지 않습니다. 이미지 gate는 추가 OG 설정과 무관하게 필수입니다.
 
 ### 실패와 검증 범위
 
 MK 이미지 모드의 대표이미지는 별도 배너 업로드에서 실제 관찰한 **전체 src**로만 선택합니다. `TISTORY_SKIP_REPRESENT_IMAGE=1|true|yes`는 허용하지 않으며, src 누락·정확한 대상 미발견/중복·버튼 미발견·선택 helper 실패·반환 대상 불일치이면 제출 전에 중단합니다. 파일명/부분 일치/임의 첫 이미지로 대체하지 않습니다. helper 성공과 버튼 클릭은 실제 Tistory의 저장된 대표이미지 상태를 입증하지 않습니다.
 
 Draft/editor 실패는 발행하지 않습니다. 공개 gate 실패는 **이미 발행된 글의 `postUrl`/`postId`, `submitted:true`, `automaticRetryAllowed:false`, `success:false`**를 마지막 JSON 및 `state.json`에 남기고 non-zero로 끝납니다. gate 결과와 snapshot/부분 receipt를 보존하며 실행 탭을 닫지 않습니다. MK 이미지 모드에서는 기존 Step10 자동 편집 재저장을 실행하지 않고, 실패를 경고·성공으로 낮추거나 자동 재발행하지 않습니다. 제출 후 URL 확인 자체가 실패하면 `submission-started` 증거를 기준으로 수동 확인해야 합니다. 같은 증거 디렉터리로 재실행할 수 없고, 새 디렉터리로 우회 재시도하기 전에 기존 글을 반드시 대조해야 합니다. 기존 중복 제목/날짜 preflight·잠금·로그인 및 성공 후 실행 소유 탭 정리 조건은 유지합니다.
+
+URL/ID 확보 자체는 실패 phase를 `public`으로 바꾸지 않습니다. 실제 공개 검증 진입 전 오류는 원래 phase와 발행 identity를 함께 보존합니다. 생성자에서 거절된 옵션·marker·입력 누락 및 draft validator 오류는 CDP 진입 전에 구분 가능한 진단으로 보고합니다. validator stdout/stderr는 각각 최대 600자(절단 표시 별도), 생성자 오류는 최대 1800자로 제한하고 credential 환경값/명시적 credential 할당을 마스킹합니다. draft 거절은 증거 디렉터리를 예약하지 않습니다.
 
 현재 구현/검증은 **합성 오프라인 fixture와 mock UI**에 대한 증거입니다. 실제 Tistory가 이 native figure/thumbnail 속성을 보존하는지, 실제 업로드 serialization과 CDN 원격 바이트가 원본 SHA와 같은지, 실제 브라우저 렌더링·외부 CSS·이미지 의미/사실성이 적절한지에 대한 live 호환성 증거가 없습니다. 엔진 코드 SHA는 Stage1 replay consistency이며 과거 생성의 독립 attestation이 아닙니다. 알 수 없는 플랫폼 재작성은 fail-closed입니다.
 
@@ -128,6 +132,7 @@ MK_STAGE2_DIR="$MK_STAGE2_DIR" MK_STAGE2_PYTHON="$MK_VALIDATOR_PYTHON" \
   "$MK_VALIDATOR_PYTHON" -m unittest discover -s tistory-publish/tests \
   -p 'test_mk_article_image_publisher.py' -v
 node tistory-publish/tests/test_tistory_editor_helpers.js
+node tistory-publish/tests/test_mk_article_image_helpers.js
 ```
 
 `MK_STAGE2_DIR` 미지정 시 외부 통합 테스트만 skip하고 stdlib 계약 테스트는 실행합니다. 합성 fixture는 생성 성공 형식의 sidecar를 직접 구성하며 engine/provider/CDP/실제 업로드/공개 fetch를 실행하지 않습니다. 테스트 캐시는 저장소 밖에 둡니다.
