@@ -121,19 +121,39 @@ if [[ -n "$BANNER" && -z "$BANNER_ALT" ]]; then
 fi
 
 # Stage1 이미지 원고는 legacy publisher로 우회할 수 없다 (브라우저 접근 전).
-if ! python3 - "$SCRIPT_DIR" "$BODY_FILE" "$TEMPLATE" <<'MK_DRAFT_GUARD'
+if python3 - "$SCRIPT_DIR" "$BODY_FILE" "$TEMPLATE" <<'MK_DRAFT_GUARD'
 import sys
 from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from mk_article_image_publisher import guard_legacy_markers, bounded_diagnostic
 try:
-    guard_legacy_markers(Path(sys.argv[2]).read_text(encoding='utf-8'), sys.argv[3])
-except Exception as error:
-    print(bounded_diagnostic(error), file=sys.stderr)
-    raise SystemExit(1)
+    sys.path.insert(0, sys.argv[1])
+    from mk_article_image_publisher import guard_legacy_markers, ImagePublishError
+except Exception:
+    print('legacy-guard/dependency-failed', file=sys.stderr)
+    raise SystemExit(21)
+try:
+    body = Path(sys.argv[2]).read_text(encoding='utf-8')
+except Exception:
+    print('legacy-guard/input-unreadable', file=sys.stderr)
+    raise SystemExit(22)
+try:
+    guard_legacy_markers(body, sys.argv[3])
+except ImagePublishError:
+    print('legacy-guard/forbidden-markers', file=sys.stderr)
+    raise SystemExit(20)
+except Exception:
+    print('legacy-guard/runtime-failed', file=sys.stderr)
+    raise SystemExit(21)
 MK_DRAFT_GUARD
 then
-  fail "image marker draft requires publish-post.sh --mk-article-images and complete evidence"
+  :
+else
+  guard_status=$?
+  case "$guard_status" in
+    20) fail "legacy-guard/forbidden-markers: image marker draft requires publish-post.sh --mk-article-images and complete evidence" ;;
+    21) fail "legacy-guard/infrastructure-failed: marker guard dependency or runtime unavailable" ;;
+    22) fail "legacy-guard/input-unreadable: body must be readable UTF-8" ;;
+    *) fail "legacy-guard/execution-failed: marker guard did not complete" ;;
+  esac
 fi
 
 # ── SEO 검사 (발행 전) ──

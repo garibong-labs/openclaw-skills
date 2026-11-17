@@ -68,8 +68,8 @@ function fixture() {
   };
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'scripts', 'tistory-editor-helpers.js'), 'utf8') +
-    '\nthis.api = {beginMKImageUpload, pollMKImageUpload, finishMKImageUpload, preserveMKOGThumbnailEvidence};', sandbox);
-  return {body, api: sandbox.api, tick: () => { now += 600; },
+    '\nthis.api = {beginMKImageUpload, pollMKImageUpload, finishMKImageUpload, abortMKImageUpload, preserveMKOGThumbnailEvidence};', sandbox);
+  return {body, editor, api: sandbox.api, tick: (ms = 600) => { now += ms; },
     add(figure) { body.appendChild(figure); observer.records.push({type: 'childList', addedNodes: [figure]}); },
     mutate(node) { observer.records.push({type: 'attributes', target: node}); },
     observer: () => observer};
@@ -135,6 +135,76 @@ for (const sameSrc of [false, true]) {
   const result = f.api.finishMKImageUpload({token: 'replace', entry});
   assert.strictEqual(result.src, replacement.querySelector('img').getAttribute('src'));
   assert.strictEqual(placeholder.querySelector('img').getAttribute('alt'), null);
+}
+for (const sameSrc of [false, true]) {
+  const f = fixture();
+  f.body.appendChild(marker());
+  f.api.beginMKImageUpload('overlap');
+  const placeholder = image('https://cdn.example/transient.jpg');
+  f.add(placeholder);
+  f.api.pollMKImageUpload('overlap');
+  f.tick();
+  const final = image(sameSrc ? 'https://cdn.example/transient.jpg' : 'https://cdn.example/final.jpg');
+  f.add(final);
+  for (let i = 0; i < 3; i++) {
+    const state = f.api.pollMKImageUpload('overlap');
+    assert.strictEqual(state.ready, false, 'cross-task overlap must remain pending, including at the Python wait boundary');
+    assert.strictEqual(state.error, undefined);
+    f.tick(250);
+  }
+  assert.throws(() => f.api.finishMKImageUpload({token: 'overlap', entry}), /upload pending/);
+  placeholder.remove();
+  assert.strictEqual(f.api.pollMKImageUpload('overlap').ready, false, 'sole replacement starts a fresh stability window');
+  f.tick(499);
+  assert.strictEqual(f.api.pollMKImageUpload('overlap').ready, false);
+  f.tick(1);
+  assert.strictEqual(f.api.pollMKImageUpload('overlap').ready, true);
+  assert.strictEqual(f.api.finishMKImageUpload({token: 'overlap', entry}).src, final.querySelector('img').getAttribute('src'));
+  assert.strictEqual(placeholder.querySelector('img').getAttribute('alt'), null);
+}
+{
+  const f = fixture();
+  f.body.appendChild(marker());
+  f.api.beginMKImageUpload('ambiguous');
+  f.add(image('https://cdn.example/first.jpg'));
+  const extra = image('https://cdn.example/second.jpg');
+  f.add(extra);
+  assert.strictEqual(f.api.pollMKImageUpload('ambiguous').ready, false);
+  f.tick(999);
+  assert.strictEqual(f.api.pollMKImageUpload('ambiguous').ready, false);
+  f.tick(1);
+  assert.strictEqual(f.api.pollMKImageUpload('ambiguous').error, 'ambiguous upload attachments');
+  extra.remove(); f.tick();
+  assert.throws(() => f.api.finishMKImageUpload({token: 'ambiguous', entry}), /ambiguous upload attachments/);
+  assert.strictEqual(f.api.abortMKImageUpload('foreign'), false);
+  assert.strictEqual(f.observer().disconnected, undefined);
+  assert.strictEqual(f.api.abortMKImageUpload('ambiguous'), true);
+  assert.strictEqual(f.observer().disconnected, true);
+  assert.throws(() => f.api.beginMKImageUpload('second-delivery'), /MK upload unavailable/);
+  f.add(image('https://cdn.example/late.jpg'));
+  assert.throws(() => f.api.finishMKImageUpload({token: 'ambiguous', entry}), /ambiguous upload attachments/);
+}
+for (const scenario of ['body-replaced', 'original-mutated', 'src-reused-during-overlap', 'aborted']) {
+  const f = fixture();
+  const old = image('https://cdn.example/old.jpg');
+  f.body.appendChild(old);
+  f.body.appendChild(marker());
+  f.api.beginMKImageUpload('sticky');
+  const fresh = image('https://cdn.example/new.jpg');
+  f.add(fresh);
+  if (scenario === 'body-replaced') f.editor.getBody = () => new Node('body');
+  if (scenario === 'original-mutated') f.mutate(old.querySelector('img'));
+  const reused = image('https://cdn.example/old.jpg');
+  if (scenario === 'src-reused-during-overlap') f.add(reused);
+  if (scenario === 'aborted') f.api.abortMKImageUpload('sticky');
+  assert.strictEqual(f.api.pollMKImageUpload('sticky').ready, true, scenario);
+  assert.ok(f.api.pollMKImageUpload('sticky').error, scenario);
+  f.editor.getBody = () => f.body;
+  reused.remove(); f.tick();
+  assert.throws(() => f.api.finishMKImageUpload({token: 'sticky', entry}), undefined, 'failure stays latched: ' + scenario);
+  f.api.abortMKImageUpload('sticky');
+  assert.strictEqual(f.observer().disconnected, true);
+  assert.throws(() => f.api.beginMKImageUpload('second'), /MK upload unavailable/);
 }
 {
   const f = fixture();

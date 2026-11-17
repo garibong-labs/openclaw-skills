@@ -87,6 +87,7 @@ class MKArticleImages:
         self.ready = False
         self.rows = []
         self.banner_src = None
+        self.upload_failed = False
         options = (current, run_dir, validator, interpreter, sources, evidence_dir, selector)
         if not enabled:
             if any(options):
@@ -177,10 +178,11 @@ class MKArticleImages:
 
     def failure(self, error=None):
         result = {'success': False, 'error': 'mk-images/' + self.phase + '-failed',
+                  'detail': bounded_diagnostic(error, 500),
                   **self.status('failed')}
         if self.ready:
             try:
-                self.write('state.json', dict(result, detail=bounded_diagnostic(error, 500)))
+                self.write('state.json', result)
             except OSError:
                 pass  # Still emit the non-success publication identity on disk failure.
         return result
@@ -230,17 +232,28 @@ class MKArticleImages:
         return result
 
     def upload_one(self, page, upload, payload, entry=None):
+        if self.upload_failed:
+            raise ImagePublishError('upload previously failed; no second file delivery')
         token = uuid.uuid4().hex
-        page.evaluate('(token) => beginMKImageUpload(token)', token)
-        # FilePayload freezes exactly the bytes whose digest was checked, even if
-        # the on-disk pathname is replaced while Playwright transfers the file.
-        upload(page, payload, 'MK article' if entry else 'MK banner', single_delivery=True)
-        page.wait_for_function('(token) => pollMKImageUpload(token).ready', arg=token, timeout=30000)
-        result = page.evaluate('(args) => finishMKImageUpload(args)',
-                               {'token': token, 'entry': entry, 'bannerAlt': self.banner_alt})
-        if not isinstance(result, dict) or result.get('success') is not True or result.get('token') != token:
-            raise ImagePublishError('upload-operation attachment identity unavailable')
-        return https_src(result.get('src'))
+        try:
+            page.evaluate('(token) => beginMKImageUpload(token)', token)
+            # FilePayload freezes exactly the bytes whose digest was checked, even if
+            # the on-disk pathname is replaced while Playwright transfers the file.
+            upload(page, payload, 'MK article' if entry else 'MK banner', single_delivery=True)
+            page.wait_for_function('(token) => pollMKImageUpload(token).ready',
+                                   arg=token, timeout=30000, polling=250)
+            result = page.evaluate('(args) => finishMKImageUpload(args)',
+                                   {'token': token, 'entry': entry, 'bannerAlt': self.banner_alt})
+            if not isinstance(result, dict) or result.get('success') is not True or result.get('token') != token:
+                raise ImagePublishError('upload-operation attachment identity unavailable')
+            return https_src(result.get('src'))
+        except Exception:
+            self.upload_failed = True
+            try:
+                page.evaluate('(token) => abortMKImageUpload(token)', token)
+            except Exception:
+                pass  # Cleanup cannot replace the original cause or permit redelivery.
+            raise
 
     def upload_articles(self, page, upload):
         self.phase = 'upload'

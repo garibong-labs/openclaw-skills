@@ -36,6 +36,24 @@ def embedded():
         return ast.parse(source)
 
 
+def failure_adapter(phase):
+    adapter = object.__new__(stage3.MKArticleImages)
+    adapter.enabled = adapter.ready = True
+    adapter.submitted = False
+    adapter.post_url = adapter.post_id = None
+    adapter.phase = phase
+    adapter.write = Mock()
+    return adapter
+
+
+def failure_namespace(adapter, post_info=None):
+    functions = [n for n in embedded().body if isinstance(n, ast.FunctionDef)
+                 and n.name in ('fail', 'mk_failure_result')]
+    ns = dict(mk_images=adapter, post_info=post_info, public_url_for=lambda url: url, sys=sys, json=json)
+    exec(compile(ast.Module(body=functions, type_ignores=[]), 'actual-failure-functions', 'exec'), ns)
+    return ns
+
+
 def og_namespace(adapter, process):
     functions = [n for n in embedded().body if isinstance(n, ast.FunctionDef)
                  and n.name in ('fail', 'mk_failure_result', 'should_run_og_gate', 'run_og_gate')]
@@ -48,6 +66,44 @@ def og_namespace(adapter, process):
 
 
 class ContractTests(unittest.TestCase):
+    def test_actual_legacy_guard_distinguishes_dependency_input_and_marker_failures(self):
+        legacy = (SCRIPTS / 'publish.sh').read_text()
+        guard = legacy[legacy.index('if python3 - "$SCRIPT_DIR"'):legacy.index('# ── SEO 검사')]
+        fail_function = next(line for line in legacy.splitlines() if line.startswith('fail()'))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing = root / 'missing'; missing.mkdir()
+            broken = root / 'broken'; broken.mkdir()
+            (broken / 'mk_article_image_publisher.py').write_text('raise ImportError("token=private-import-secret")')
+            invalid = root / 'invalid.html'; invalid.write_bytes(b'\xff\xfe')
+            body = root / 'body.html'; body.write_text('<p>valid</p>')
+            cases = [(missing, body, 'infrastructure-failed', 'dependency-failed'),
+                     (broken, body, 'infrastructure-failed', 'dependency-failed'),
+                     (SCRIPTS, invalid, 'input-unreadable', 'input-unreadable'),
+                     (SCRIPTS, root / 'absent.html', 'input-unreadable', 'input-unreadable')]
+            forbidden = root / 'forbidden.html'; forbidden.write_text('<p data-image-marker="mk-article-1"/>')
+            cases.append((SCRIPTS, forbidden, 'forbidden-markers', 'forbidden-markers'))
+            source = 'set -eu\n' + fail_function + '\n' + guard + '\necho browser-entry\n'
+            for directory, path, code, diagnostic in cases:
+                with self.subTest(code=code, directory=directory, path=path):
+                    env = dict(os.environ, SCRIPT_DIR=str(directory), BODY_FILE=str(path), TEMPLATE='',
+                               PYTHONPATH='', TEST_API_TOKEN='private-import-secret')
+                    proc = subprocess.run(['bash'], input=source, text=True, capture_output=True, cwd=tmp, env=env)
+                    self.assertEqual(proc.returncode, 1)
+                    self.assertEqual(json.loads(proc.stdout)['success'], False)
+                    self.assertIn('legacy-guard/' + code, json.loads(proc.stdout)['error'])
+                    self.assertEqual(proc.stderr.strip(), 'legacy-guard/' + diagnostic)
+                    self.assertNotIn('browser-entry', proc.stdout)
+                    self.assertNotIn('private-import-secret', proc.stdout + proc.stderr)
+                    self.assertLess(len(proc.stdout + proc.stderr), 400)
+            for template in ('', 'simple-post', 'mk-review', 'daum-trends'):
+                for html in ('<p>valid legacy body</p>', '<p data-image-marker="trend-image-1"/>'):
+                    body.write_text(html)
+                    env = dict(os.environ, SCRIPT_DIR=str(SCRIPTS), BODY_FILE=str(body), TEMPLATE=template)
+                    proc = subprocess.run(['bash'], input=source, text=True, capture_output=True, cwd=tmp, env=env)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(proc.stdout.strip(), 'browser-entry')
+
     def test_both_publishers_accept_legacy_markers_and_reject_mk_attributes(self):
         legacy = (SCRIPTS / 'publish.sh').read_text()
         guard = re.search(r"<<'MK_DRAFT_GUARD'\n(.*?)\nMK_DRAFT_GUARD", legacy, re.S)[1]
@@ -155,8 +211,55 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(result['automaticRetryAllowed'])
         self.assertEqual(result['phase'], 'submit')
         self.assertEqual(result['error'], 'mk-images/submit-failed')
+        self.assertEqual(result['detail'], 'post-confirmation navigation failed')
         self.assertEqual(adapter.write.call_args.args[1]['phase'], 'submit')
         self.assertEqual(adapter.write.call_args.args[1]['postId'], '456')
+
+    def test_actual_tag_and_publish_fail_calls_preserve_bounded_cause_and_original_phase(self):
+        block = next(n for n in embedded().body if isinstance(n, ast.With))
+        tags = next(n for n in block.body if isinstance(n, ast.If) and ast.unparse(n.test) == 'TAGS_STR')
+        dialog = next(n for n in block.body if isinstance(n, ast.If) and ast.unparse(n.test) == "dlg != 'yes' and (not PRIVATE)")
+        for node, phase, expected in ((tags, 'representative', 'page closed before tag step'),
+                                      (dialog, 'editor', 'publish dialog not found after 10s')):
+            adapter = failure_adapter(phase)
+            ns = failure_namespace(adapter, {'url': 'https://blog.example/456', 'id': '456'})
+            ns.update(TAGS_STR='tag', page=Mock(), dlg='no', PRIVATE=False, log=Mock())
+            ns['page'].is_closed.return_value = True
+            with self.subTest(phase=phase), patch('builtins.print') as output, self.assertRaises(SystemExit):
+                exec(compile(ast.Module(body=[node], type_ignores=[]), 'actual-step-failure', 'exec'), ns)
+            result = json.loads(output.call_args.args[0])
+            self.assertEqual(result['phase'], phase)
+            self.assertEqual(result['detail'], expected)
+            self.assertEqual(result['postUrl'], 'https://blog.example/456')
+            self.assertEqual(result['postId'], '456')
+            self.assertFalse(result['automaticRetryAllowed'])
+            self.assertEqual(adapter.write.call_args.args[1], result)
+
+        adapter = failure_adapter('representative')
+        ns = failure_namespace(adapter)
+        with patch.dict(os.environ, TEST_API_TOKEN='private-secret'), patch('builtins.print') as output, self.assertRaises(SystemExit):
+            ns['fail']('caller/specific-code: private-secret password="two word secret" ' + 'x' * 3000)
+        result = json.loads(output.call_args.args[0])
+        self.assertIn('caller/specific-code', result['detail'])
+        self.assertNotIn('private-secret', result['detail'])
+        self.assertNotIn('two word secret', result['detail'])
+        self.assertLessEqual(len(result['detail']), 520)
+        self.assertEqual(adapter.write.call_args.args[1], result)
+
+    def test_identity_recovery_cannot_overwrite_failure_phase_even_when_recovery_raises(self):
+        for error in (None, OSError('state write failed')):
+            adapter = failure_adapter('editor')
+            def confirm(url, post_id):
+                adapter.post_url, adapter.post_id = url, post_id
+                adapter.phase = 'public'
+                if error:
+                    raise error
+            adapter.confirm_publication = confirm
+            ns = failure_namespace(adapter, {'url': 'https://blog.example/456', 'id': '456'})
+            result = ns['mk_failure_result']('original caller error')
+            self.assertEqual(result['phase'], 'editor')
+            self.assertEqual(result['detail'], 'original caller error')
+            self.assertEqual(result['postId'], '456')
 
     def test_before_submit_runs_real_editor_gate_and_failure_never_mints_submission(self):
         adapter = object.__new__(stage3.MKArticleImages)
@@ -269,7 +372,7 @@ class MKRepresentativeTests(unittest.TestCase):
     """Execute the real Step6 branch; no browser or publication is performed."""
     src = 'https://cdn.example/opaque-upload?signature=keep%2Fall&v=2'
 
-    def run_step6(self, result=None, src=None, skip='', enabled=True, template='mk-review', error=None):
+    def run_step6(self, result=None, src=None, skip='', enabled=True, template='mk-review', error=None, adapter=None):
         tree = embedded()
         helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                       and n.name == 'select_mk_banner_representative')
@@ -287,11 +390,29 @@ class MKRepresentativeTests(unittest.TestCase):
         ns = dict(page=self.page, mk_images=SimpleNamespace(enabled=enabled, banner_src=src),
                   os=SimpleNamespace(environ={'TISTORY_SKIP_REPRESENT_IMAGE': skip}, path=os.path),
                   fail=fail, log=Mock(), time=Mock(), json=json, TEMPLATE=template,
+                  bounded_diagnostic=stage3.bounded_diagnostic,
                   image_files=['01-trend.jpg'], resolve_represent_image_target=self.resolve,
                   submit=self.submit)
+        if adapter is not None:
+            ns.update(failure_namespace(adapter))
+            adapter.banner_src = src
         # The sentinel stands for all later submit work and must remain untouched on failure.
         module = ast.Module(body=[helper, step, ast.parse('submit()').body[0]], type_ignores=[])
         exec(compile(module, 'actual-step6', 'exec'), ns)
+
+    def test_actual_step6_fail_to_json_and_state_preserves_representative_code_and_detail(self):
+        adapter = failure_adapter('banner')
+        with patch.dict(os.environ, TEST_API_TOKEN='private-secret'), patch('builtins.print') as output, self.assertRaises(SystemExit):
+            self.run_step6({'success': False, 'error': 'button missing token="private-secret"'}, src=self.src, adapter=adapter)
+        result = json.loads(output.call_args.args[0])
+        self.assertEqual(result['phase'], 'representative')
+        self.assertEqual(result['error'], 'mk-images/representative-failed')
+        self.assertIn('mk-images/representative-banner-selection-failed', result['detail'])
+        self.assertIn('button missing', result['detail'])
+        self.assertNotIn('private-secret', result['detail'])
+        self.assertFalse(result['automaticRetryAllowed'])
+        self.assertEqual(adapter.write.call_args.args[1], result)
+        self.submit.assert_not_called()
 
     def test_exact_observed_banner_src_passed_and_matching_success_required(self):
         self.run_step6({'success': True, 'imageUrl': self.src}, src=self.src)
@@ -377,8 +498,8 @@ class FakeEditor:
         else:
             raise AssertionError(expression)
 
-    def wait_for_function(self, expression, *, arg, timeout):
-        assert arg == self.token and timeout == 30000
+    def wait_for_function(self, expression, *, arg, timeout, polling):
+        assert arg == self.token and timeout == 30000 and polling == 250
 
     def upload(self, page, payload, context, **options):
         assert page is self and options == {'single_delivery': True}
@@ -501,6 +622,40 @@ class MockBoundaryTests(unittest.TestCase):
         adapter.upload_articles(page, upload)
         adapter.upload_banner(page, upload)
         return adapter, page
+
+    def test_real_upload_method_numeric_polling_cleanup_and_no_redelivery_on_errors(self):
+        for where in ('delivery', 'wait', 'finish', 'cleanup'):
+            with self.subTest(where=where):
+                adapter = stage3.MKArticleImages(**dict(self.options, evidence_dir=self.tmp / where))
+                page = Mock()
+                cause = RuntimeError('original upload cause: ' + where)
+                def evaluate(expression, arg):
+                    if 'finishMKImageUpload' in expression:
+                        raise cause
+                    if 'abortMKImageUpload' in expression and where == 'cleanup':
+                        raise RuntimeError('cleanup must not mask cause')
+                page.evaluate.side_effect = evaluate
+                if where == 'wait':
+                    cause = TimeoutError('original upload timeout')
+                    page.wait_for_function.side_effect = cause
+                upload = Mock(side_effect=cause if where == 'delivery' else None)
+                payload = {'name': 'frozen.jpg', 'mimeType': 'image/jpeg', 'buffer': b'\xff\xd8\xffbytes'}
+                with self.assertRaises(type(cause)) as failure:
+                    adapter.upload_one(page, upload, payload)
+                self.assertIs(failure.exception, cause)
+                upload.assert_called_once_with(page, payload, 'MK banner', single_delivery=True)
+                token = page.evaluate.call_args_list[0].args[1]
+                self.assertEqual(page.evaluate.call_args.args, ('(token) => abortMKImageUpload(token)', token))
+                if where != 'delivery':
+                    page.wait_for_function.assert_called_once_with(
+                        '(token) => pollMKImageUpload(token).ready', arg=token, timeout=30000, polling=250)
+                previous_calls = page.mock_calls[:]
+                with self.assertRaisesRegex(stage3.ImagePublishError, 'no second file delivery'):
+                    adapter.upload_one(page, upload, payload)
+                self.assertEqual(page.mock_calls, previous_calls)
+                self.assertEqual(upload.call_count, 1)
+                self.assertFalse(adapter.submitted)
+                self.assertEqual(adapter.rows, [])
 
     def test_phase_order_mandatory_arguments_and_operation_local_sha_receipts(self):
         adapter, page = self.uploaded()
@@ -687,8 +842,10 @@ class MockBoundaryTests(unittest.TestCase):
         adapter.public_gate(Mock(return_value=page.snapshot))
         process = Mock()
         ns = og_namespace(adapter, process)
-        for code, stdout in ((1, '{"success":false}'), (0, '{"success":false}'),
-                             (0, 'not JSON'), (0, '[]'), (0, '{"success":1}')):
+        for code, stdout in ((1, '{"success":true}'), (1, '{"success":false}'), (0, '{"success":false}'),
+                             (0, 'not JSON'), (0, '[]'), (0, '{"success":1}'), (0, '{}'), (0, ''),
+                             (0, 'progress\nnull\n'), (0, 'progress\n{"success":true}\nwarning after JSON'),
+                             (0, 'progress\n{"success":false}\n'), (0, 'x' * 131073)):
             process.run.return_value = subprocess.CompletedProcess([], code, stdout, 'OG mismatch')
             with self.subTest(code=code, stdout=stdout), patch('builtins.print') as output, self.assertRaises(SystemExit) as exit_code:
                 ns['run_og_gate']('public', adapter.post_url)
@@ -700,7 +857,22 @@ class MockBoundaryTests(unittest.TestCase):
             self.assertTrue(result['submitted'])
             self.assertFalse(result['success'])
             self.assertFalse(result['automaticRetryAllowed'])
+            self.assertIn('OG public', result['detail'])
+            self.assertLessEqual(len(result['detail']), 520)
             self.assertEqual(json.loads((adapter.evidence / 'state.json').read_text())['status'], 'failed')
+
+    def test_actual_og_accepts_last_nonempty_json_line_but_stage2_remains_whole_stdout(self):
+        adapter, page = self.uploaded()
+        process = Mock()
+        proof = {'success': True, 'count': 4, 'card_count': 4}
+        process.run.return_value = subprocess.CompletedProcess([], 0, 'progress\nwarning\n' + json.dumps(proof) + '\n \n', '')
+        ns = og_namespace(adapter, process)
+        for mode in ('draft', 'public'):
+            with self.subTest(mode=mode):
+                self.assertEqual(ns['run_og_gate'](mode, 'https://blog.example/345'), proof)
+        adapter.runner = process.run
+        with self.assertRaisesRegex(stage3.ImagePublishError, 'structured success'):
+            adapter.invoke(['explicit-stage2-validator'])
 
     def test_only_stage1_jpeg_contract_is_accepted_before_evidence_or_upload(self):
         manifest = self.bundle['run'] / 'manifest.json'

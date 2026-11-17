@@ -119,9 +119,11 @@ MK 대표이미지는 별도 배너 업로드에서 실제 관찰한 전체 src�
 
 Draft/editor 실패는 발행 전 중단하고 public 실패는 `success:false`, non-zero와 `postUrl`/`postId`, `automaticRetryAllowed:false`를 보존합니다. 새 private 증거 디렉터리(0700, 파일 0600)에 receipt·snapshot·gate 결과·제출 상태를 남기고 실패한 실행 탭을 보존합니다. MK 이미지 모드의 자동 사후 재저장/재발행은 없습니다. 제출 뒤 URL 미확인은 기존 글부터 수동 확인합니다. 증거 디렉터리를 재사용하거나 새 디렉터리로 자동 우회 재시도하지 않습니다.
 
-발행 URL/ID를 확보해도 실제 공개 검증 전 실패의 phase는 바꾸지 않습니다. draft 사전검사 오류는 길이를 제한하고 credential을 마스킹한 원인/validator stdout·stderr를 보고하며 증거 디렉터리를 만들지 않습니다. 기사 파일은 Stage1/2와 같은 JPEG 계약(확장자·바이트 서명 확인)만 허용합니다. 임시 첨부 노드가 교체되면 새 노드의 안정화를 기다리며 동시에 남은 복수 첨부는 중단합니다.
+발행 URL/ID를 확보해도 실제 공개 검증 전 실패의 phase는 바꾸지 않습니다. Step6는 `representative` phase이며 실패 JSON과 state의 `detail`에는 호출자 코드/원인을 credential 마스킹·500자 제한(절단 표시 별도)으로 동일 보존합니다. draft 사전검사 오류도 제한된 원인/validator stdout·stderr를 보고하며 증거 디렉터리를 만들지 않습니다. 기사 파일은 Stage1/2와 같은 JPEG 계약(확장자·바이트 서명 확인)만 허용합니다. 첨부는 250ms 숫자 polling으로 최대 30초 대기합니다. 임시/최종 노드의 겹침은 관찰 시작부터 최대 1000ms pending이고 유일한 노드가 된 뒤 새 500ms 안정화가 필요합니다(같은 src의 교체도 초기화). 지속된 복수 첨부·body 교체·기존 이미지 변조/src 재사용은 영구 실패입니다. 오류 정리는 해당 observer만 해제하고 실패 작업을 유지하여 재전달/다른 첨부 신뢰를 허용하지 않습니다.
 
 최종 JSON의 이미지 증명은 `articleImageValidation`에 담습니다. `TISTORY_OG_VALIDATOR`와 기존 OG match gate가 켜져 있으면 추가 OG draft/public 검증도 명시한 이미지 interpreter·전체 이미지 context로 실행하며, public은 이미 수집한 snapshot을 사용합니다. Stage2 CLI 계약/structured success가 필요하고 거절 시 중단합니다. 꺼져 있으면 OG 성공 필드는 생략하며 필수 이미지 gate는 계속 실행합니다. 기존 속성 없는 `trend-image-N` marker는 기본/simple-post/Daum 및 legacy 경로에서 허용하지만 Stage1 전용 속성/알 수 없는 marker는 계속 차단합니다.
+
+추가 OG validator는 진행 로그 뒤 마지막 비어 있지 않은 stdout 줄을 JSON 객체로 해석하며 정확한 `success:true`와 종료 코드 0을 요구합니다. 필수 Stage2 이미지 validator의 전체 stdout JSON 계약은 별도 유지합니다. legacy guard는 금지 marker(`legacy-guard/forbidden-markers`), 의존성/실행 장애(`infrastructure-failed`), 본문 읽기/UTF-8 오류(`input-unreadable`)를 구분하고 모두 브라우저 접근 전에 중단합니다. 의존성 import 실패에도 원시 예외/경로/credential을 내보내지 않습니다.
 
 실제 Tistory 속성 보존/업로드/CDN 바이트/렌더링에 대한 live 호환성 증거는 없습니다. Stage2 PR285 P2 후속(OG 비이미지 embed, legacy public fallback scope)은 외부 코드를 수정/완화하지 않으며 이미지 경로는 비이미지 embed를 거부하고 scoped snapshot을 사용합니다. 생성·cron(Stage4)은 범위 밖입니다. `publish.sh`에는 우회 방지 guard만 추가하고 Stage3 기능은 legacy JS에 미러링하지 않습니다. **정확한 호출 예시·receipt 필드·실패 처리·오프라인 테스트는 [README의 Stage3 계약](README.md#mk-기사-이미지-stage3-명시적-opt-in)을 따릅니다.**
 

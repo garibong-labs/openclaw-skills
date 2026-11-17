@@ -1650,7 +1650,7 @@ function beginMKImageUpload(token) {
   if (!editor || mkImageUploadOperation || !token) throw new Error('MK upload unavailable');
   const body = editor.getBody();
   const original = new Set(body.querySelectorAll('img'));
-  const operation = { token, editor, body, original, added: new Set(), error: '', src: '', since: 0 };
+  const operation = { token, editor, body, original, added: new Set(), error: '', src: '', since: 0, ambiguousSince: null };
   operation.observe = records => {
     for (const record of records) {
       if (record.type === 'attributes' && original.has(record.target)) operation.error = 'existing image mutated';
@@ -1674,18 +1674,47 @@ function pollMKImageUpload(token) {
   op.observe(op.observer.takeRecords());
   if (op.editor.getBody() !== op.body) op.error = 'editor body replaced';
   for (const img of op.added) if (!op.body.contains(img)) op.added.delete(img);
-  if (op.added.size > 1) op.error = 'ambiguous upload attachments';
+  for (const img of op.added) {
+    if (Array.from(op.original).some(node => node.getAttribute('src') === img.getAttribute('src'))) {
+      op.error = 'upload reused existing src';
+    }
+  }
   if (op.error) return { ready: true, error: op.error };
+  // A final node may be inserted one task before its placeholder is removed.
+  // Allow at most 1000ms of observed overlap, then latch ambiguity permanently.
+  // After overlap/absence/pending src, require a fresh 500ms sole-node window.
+  if (op.added.size > 1) {
+    op.img = null; op.src = ''; op.since = 0;
+    if (op.ambiguousSince === null) op.ambiguousSince = Date.now();
+    if (Date.now() - op.ambiguousSince >= 1000) {
+      op.error = 'ambiguous upload attachments';
+      return { ready: true, error: op.error };
+    }
+    return { ready: false };
+  }
+  op.ambiguousSince = null;
   const img = Array.from(op.added)[0];
-  if (!img || !op.body.contains(img)) return { ready: false };
+  if (!img || !op.body.contains(img)) {
+    op.img = null; op.src = ''; op.since = 0;
+    return { ready: false };
+  }
   const src = img.getAttribute('src') || '';
-  if (!/^https:\/\//.test(src)) return { ready: false };
-  if (Array.from(op.original).some(node => node.getAttribute('src') === src)) {
-    op.error = 'upload reused existing src';
-    return { ready: true, error: op.error };
+  if (!/^https:\/\//.test(src)) {
+    op.img = null; op.src = ''; op.since = 0;
+    return { ready: false };
   }
   if (op.img !== img || op.src !== src) { op.img = img; op.src = src; op.since = Date.now(); }
   return { ready: Date.now() - op.since >= 500 };
+}
+
+function abortMKImageUpload(token) {
+  const op = mkImageUploadOperation;
+  if (!op || op.token !== token) return false;
+  op.observer.disconnect();
+  // Retain a failed operation tombstone: cleanup never authorizes redelivery
+  // or promotes a different DOM attachment to evidence.
+  if (!op.error) op.error = 'upload aborted';
+  return true;
 }
 
 function finishMKImageUpload({token, entry, bannerAlt}) {

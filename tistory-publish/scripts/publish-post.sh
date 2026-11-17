@@ -264,11 +264,14 @@ def mk_failure_result(error):
     # Confirmation can precede Step 9. Preserve that exact evidence even if a
     # later lookup or navigation fails before the normal Stage3 public gate.
     info = globals().get('post_info') or {}
+    failed_phase = mk_images.phase
     if not mk_images.post_url and info.get('url') and info.get('id'):
         try:
             mk_images.confirm_publication(info.get('publicUrl') or public_url_for(info['url']), info['id'])
         except Exception:
             pass
+        finally:
+            mk_images.phase = failed_phase
     return mk_images.failure(error)
 
 def log_best_effort(message):
@@ -359,8 +362,8 @@ def run_og_gate(mode, *args):
         if proc.returncode != 0:
             fail('OG ' + mode + ' validation failed: ' + detail)
         try:
-            proof = json.loads(proc.stdout)
-        except (ValueError, TypeError):
+            proof = json.loads((proc.stdout or '').strip().splitlines()[-1])
+        except (ValueError, TypeError, IndexError):
             fail('OG ' + mode + ' validator did not return structured success: ' + detail)
         if not isinstance(proof, dict) or proof.get('success') is not True:
             fail('OG ' + mode + ' validation rejected: ' + detail)
@@ -1218,7 +1221,8 @@ def select_mk_banner_representative(page, banner_src, skip_setting):
     )
     if not (isinstance(result, dict) and result.get('success') is True
             and result.get('imageUrl') == banner_src):
-        fail('mk-images/representative-banner-selection-failed')
+        detail = bounded_diagnostic(result.get('error', '') if isinstance(result, dict) else '', 300)
+        fail('mk-images/representative-banner-selection-failed' + (': ' + detail if detail else ''))
 
 
 def resolve_represent_image_target(template, image_filenames):
@@ -2167,6 +2171,7 @@ with sync_playwright() as p:
 
     # ── Step 6: 대표이미지 ──
     if mk_images.enabled:
+        mk_images.phase = 'representative'
         log("Step 6: 관찰한 MK 배너 src로 대표이미지 선택")
         select_mk_banner_representative(
             page, mk_images.banner_src, os.environ.get('TISTORY_SKIP_REPRESENT_IMAGE', ''),
