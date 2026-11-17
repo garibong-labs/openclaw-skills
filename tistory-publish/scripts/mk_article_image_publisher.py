@@ -342,6 +342,12 @@ class MKArticleImages:
 
     def editor_gate(self, page):
         self.phase = 'editor'
+        try:
+            normalized = page.evaluate('() => normalizeMKEmptyParagraphs()')
+        except Exception as error:
+            raise ImagePublishError('MK empty paragraph normalization unavailable') from error
+        if not isinstance(normalized, dict) or normalized.get('success') is not True:
+            raise ImagePublishError('MK empty paragraph normalization unsuccessful')
         observed = page.evaluate('() => preserveMKOGThumbnailEvidence()')
         if not isinstance(observed, dict) or observed.get('success') is not True:
             raise ImagePublishError('observed OG thumbnail evidence unavailable')

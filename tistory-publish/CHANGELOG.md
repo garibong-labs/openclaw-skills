@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **MK Stage3 TinyMCE 빈 문단 서식 보완**
+  - MK opt-in의 editor gate와 최종 submit 직전 gate에서 snapshot/save 전에 최상위 bare `<p>`의 BR(속성 없음 또는 정확한 `data-mce-bogus="1"`)·NBSP·공백만 확인해 `data-ke-size="size16"`을 추가. 노드 삭제/삽입, 누락된 코멘트 간격 복구, 기존 속성 변경은 하지 않음
+  - 의미 있는 텍스트·다른 자식·hidden/event/marker 등 속성·충돌하는 size·중첩 문단은 그대로 strict Stage2 검증에 전달. helper 부재/평가 오류/성공 결과 누락은 제출 전 중단하며 기존 비-MK OG cleanup과 외부 validator는 유지
+  - 실제 JS helper의 DOM fixture·멱등성·노드 보존·cleanup 상호작용, Python 양쪽 gate의 호출 순서/실패 차단, 합성 원고의 외부 Stage2 통합 회귀 추가
+
 - **MK 업로드 동일 src 쓰기 오탐 수정**
   - 시작 시 원본 이미지 노드별 정확한 src 속성 값(null·빈 문자열 구분)을 고정하고 `attributeOldValue`를 수집. 콜백과 polling의 `takeRecords()` 모두에서 모든 oldValue와 최종 값이 원래 값과 같은 경우만 무변경으로 인정
   - 실제 src 전이·같은 배치/별도 배치의 변경 후 복원·oldValue 증거 누락은 영구 실패 유지. body 교체·기존 src 재사용·복수 첨부 제한·유일 노드 안정화·노드 identity·재전달 차단 유지

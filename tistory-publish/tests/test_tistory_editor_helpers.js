@@ -29,7 +29,7 @@ function loadHelpers() {
   };
   vm.createContext(sandbox);
   vm.runInContext(
-    `${source}\nthis.__helpers = { applyImageCaption, buildBlogHTML, dcinsidePairedOGUrl, ensureIntroArticleSeparator, getOGCardStatus, getOGPlaceholderEntries, imagePresentationOptions, prepareOGRetry };`,
+    `${source}\nthis.__helpers = { applyImageCaption, buildBlogHTML, dcinsidePairedOGUrl, ensureIntroArticleSeparator, getOGCardStatus, getOGPlaceholderEntries, imagePresentationOptions, prepareOGRetry, normalizeMKEmptyParagraphs };`,
     sandbox,
     { filename: helperPath },
   );
@@ -827,3 +827,4 @@ for (const scriptFile of PLAIN_LINK_HELPER_SCRIPTS) {
 console.log('convertPendingToPlainLink/verifyOGPlainLink/cleanup preservation tests passed');
 
 require('./test_mk_article_image_helpers.js');
+require('./test_mk_empty_paragraph_helpers.js');
