@@ -157,6 +157,11 @@ fi
 [[ ! "$CDP_CONNECT_TIMEOUT_MS" =~ ^[0-9]{4,5}$ ]] && fail "--cdp-connect-timeout-ms must be 1000..60000"
 (( 10#$CDP_CONNECT_TIMEOUT_MS >= 1000 && 10#$CDP_CONNECT_TIMEOUT_MS <= 60000 )) || fail "--cdp-connect-timeout-ms must be 1000..60000"
 
+# preset 최종 제목을 SEO/에디터/확인에 쓰기 전에 통일한다.
+# sentinel은 command substitution이 제목의 기존 끝 개행을 지우지 않게 한다.
+TITLE="$(python3 "$SCRIPT_DIR/title_spacing.py" "$TITLE" && printf '.')" || fail "title normalization failed"
+TITLE="${TITLE%.}"
+
 # 배너가 있는데 alt가 없으면 제목을 alt로 사용 (빈 alt로 올라가는 것 방지)
 if [[ -n "$BANNER" && -z "$BANNER_ALT" ]]; then
   BANNER_ALT="$TITLE"
@@ -216,6 +221,7 @@ BANNER_ALT = sys.argv[12] if len(sys.argv) > 12 else ""
 sys.path.insert(0, sys.argv[13])
 from cdp_preflight import connect_preflight
 from cdp_owned_tab_cleanup import cleanup_owned_target
+from title_spacing import normalize_title_spacing
 CDP_CONNECT_TIMEOUT_MS = int(sys.argv[14])
 NEWPOST_URL = f"https://{BLOG}/manage/newpost/?type=post" if BLOG else "https://www.tistory.com/manage/newpost/?type=post"
 POSTS_URL = f"https://{BLOG}/manage/posts/" if BLOG else "https://www.tistory.com/manage/posts/"
@@ -977,6 +983,7 @@ def write_debug_artifacts(page, prefix):
 def norm_title(s):
     s = htmlmod.unescape(s or '')
     s = s.replace('&hellip;', '…')
+    s = normalize_title_spacing(s)
     s = re.sub(r'\s+', ' ', s or '').strip()
     for ch in ['"', "'", '“', '”', '‘', '’']:
         s = s.replace(ch, '')
@@ -1978,7 +1985,7 @@ with sync_playwright() as p:
     if not cat_result.startswith("ok"):
         fail(f"category select failed: {cat_result}")
 
-    final_title = TITLE if not RUN_TOKEN else f"{TITLE} [{RUN_TOKEN}]"
+    final_title = normalize_title_spacing(TITLE if not RUN_TOKEN else f"{TITLE} [{RUN_TOKEN}]")
     page.evaluate(f"""(() => {{
         const t = document.getElementById('post-title-inp');
         if (!t) return 'no el';

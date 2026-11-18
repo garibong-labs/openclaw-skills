@@ -15,6 +15,10 @@ scripts/
 
 새 워크플로우는 `publish-post.sh`를 기준으로 작성합니다. `publish.sh`와 `tistory-publish.js`는 오래된 파이프라인 호환용입니다.
 
+두 발행 스크립트는 `scripts/title_spacing.py`로 최종 제목의 U+00B7 가운데점(`·`) 양쪽을 일반 공백 한 칸으로 통일합니다(`수사 요청·시대인재` → `수사 요청 · 시대인재`). `--article-title` preset 조합 후 SEO 검사·에디터 입력 전에 적용하며, 현재 발행기의 중복 검사·발행 확인도 과거의 공백 없는 제목과 동등하게 비교합니다. 인접한 탭·개행·유니코드 공백도 통일하고, 연속 점은 `가··나` → `가 · · 나`, 맨 앞·뒤 점은 `·가·` → ` · 가 · `로 처리합니다. 재적용 결과는 같으며, 점 개수·나머지 문자/공백·다른 문장부호·본문/출처 URL은 보존합니다.
+
+집중 오프라인 회귀 검사: `python3 -m unittest discover -s tistory-publish/tests -p 'test_title_spacing.py' -v`.
+
 ## 빠른 시작
 
 `publish-post.sh`는 안전장치로 직접 실행을 막습니다. 승인된 wrapper나 오케스트레이터에서 아래 환경변수를 명시해야 합니다.
