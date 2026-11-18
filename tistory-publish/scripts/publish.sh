@@ -115,6 +115,11 @@ fi
 [[ "$SEO_CHECK" != "off" && "$SEO_CHECK" != "warn" && "$SEO_CHECK" != "strict" ]] && fail "--seo-check must be off|warn|strict"
 [[ ! "$SEO_MIN_BODY_CHARS" =~ ^[0-9]+$ ]] && fail "--seo-min-body-chars must be a non-negative integer"
 
+# preset 최종 제목을 SEO/에디터에 쓰기 전에 통일한다.
+# sentinel은 command substitution이 제목의 기존 끝 개행을 지우지 않게 한다.
+TITLE="$(python3 "$SCRIPT_DIR/title_spacing.py" "$TITLE" && printf '.')" || fail "title normalization failed"
+TITLE="${TITLE%.}"
+
 # 배너가 있는데 alt가 없으면 제목을 alt로 사용 (빈 alt로 올라가는 것 방지)
 if [[ -n "$BANNER" && -z "$BANNER_ALT" ]]; then
   BANNER_ALT="$TITLE"

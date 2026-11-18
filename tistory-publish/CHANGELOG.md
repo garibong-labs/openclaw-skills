@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **발행 제목의 가운데점 공백 통일**
+  - 현재/legacy 진입점 모두 공통 helper로 preset 최종 제목의 U+00B7 양쪽 공백을 한 칸으로 정리한 뒤 SEO·에디터에 전달. 연속/맨 앞·뒤 점과 인접 유니코드 공백을 일관되게 처리하며 다른 문자·본문·출처 URL은 보존
+  - 현재 발행기의 중복 검사·발행 확인도 같은 정규화를 사용해 과거 공백 없는 제목과 동등 비교. 기존 엔티티/따옴표 처리와 MK 날짜 중복 방지 유지. 브라우저/네트워크 없이 두 shell 진입점·preset·에디터 전달·RSS/관리 목록 중복 거절 회귀 검증
+
 - **MK editor gate의 실제 본문 DOM snapshot 사용**
   - 빈 문단 정규화·OG thumbnail 증거 보존·`save()` 순서를 유지하고, 저장 후 현재 `getBody().innerHTML`을 strict Stage2에 전달. 이미지가 shortcode로 직렬화되는 `getContent()`는 사용하지 않음
   - editor/body 부재·잘못된/빈 snapshot·읽기 오류는 제출 전 중단. validator·receipt·공개 snapshot·legacy 경로 유지
