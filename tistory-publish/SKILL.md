@@ -117,6 +117,8 @@ bash scripts/publish.sh \
 
 MK 대표이미지는 별도 배너 업로드에서 실제 관찰한 전체 src의 유일한 정확 일치 대상으로 선택합니다. `TISTORY_SKIP_REPRESENT_IMAGE=1|true|yes`를 거부하고, src 누락·대상 미발견/중복·버튼 미발견·helper 실패·반환 src 불일치이면 제출 전 중단합니다. 버튼 클릭/helper 성공만으로 플랫폼에 저장된 대표 상태를 입증하지 않습니다.
 
+이 이미지 모드의 배너 alt에서만 ASCII 큰따옴표를 전각 큰따옴표(`＂`)로 바꿔 공개 저장 시 이중 escape를 피합니다. 글 제목과 legacy 모드는 바뀌지 않습니다. 공개 배너 검증은 Stage2의 공개 본문 범위에서만 수행하며, 네이티브 `imageblock` 배너도 정확한 업로드 출처·alt·가시성 및 첨부 구조를 확인해야 합니다.
+
 Draft/editor 실패는 발행 전 중단하고 public 실패는 `success:false`, non-zero와 `postUrl`/`postId`, `automaticRetryAllowed:false`를 보존합니다. 새 private 증거 디렉터리(0700, 파일 0600)에 receipt·snapshot·gate 결과·제출 상태를 남기고 실패한 실행 탭을 보존합니다. MK 이미지 모드의 자동 사후 재저장/재발행은 없습니다. 제출 뒤 URL 미확인은 기존 글부터 수동 확인합니다. 증거 디렉터리를 재사용하거나 새 디렉터리로 자동 우회 재시도하지 않습니다.
 
 발행 URL/ID를 확보해도 실제 공개 검증 전 실패의 phase는 바꾸지 않습니다. Step6는 `representative` phase이며 실패 JSON과 state의 `detail`에는 호출자 코드/원인을 credential 마스킹·500자 제한(절단 표시 별도)으로 동일 보존합니다. draft 사전검사 오류도 제한된 원인/validator stdout·stderr를 보고하며 증거 디렉터리를 만들지 않습니다. 기사 파일은 Stage1/2와 같은 JPEG 계약(확장자·바이트 서명 확인)만 허용합니다. 첨부는 250ms 숫자 polling으로 최대 30초 대기합니다. 임시/최종 노드의 겹침은 관찰 시작부터 최대 1000ms pending이고 유일한 노드가 된 뒤 새 500ms 안정화가 필요합니다(같은 src의 교체도 초기화). 지속된 복수 첨부·body 교체·기존 이미지 변조/src 재사용은 영구 실패입니다. 오류 정리는 해당 observer만 해제하고 실패 작업을 유지하여 재전달/다른 첨부 신뢰를 허용하지 않습니다.

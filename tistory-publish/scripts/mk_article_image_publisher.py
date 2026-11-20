@@ -118,7 +118,9 @@ class MKArticleImages:
         self.sources = Path(sources).absolute()
         self.evidence = Path(evidence_dir).absolute()
         self.banner = Path(banner).absolute()
-        self.banner_alt = banner_alt
+        # Avoid the observed Tistory &quot; -> &amp;quot; rewrite in MK
+        # attachment alt. Neither the post title nor legacy alt is changed.
+        self.banner_alt = banner_alt.replace('"', '\uff02')
         self.selector = selector
         for path in (self.body, self.current, self.validator, self.interpreter, self.sources, self.banner):
             if not path.is_file():
@@ -331,7 +333,7 @@ class MKArticleImages:
         result = self.gate(phase, snapshot, post_url)
         # Use Stage2's exact scoped parser/URL identity in its own interpreter.
         command = [str(self.interpreter), str(Path(__file__).absolute()), '--audit-banner',
-                   str(self.validator.parent), str(snapshot), str(self.evidence / 'banner.json'),
+                   phase, str(self.validator.parent), str(snapshot), str(self.evidence / 'banner.json'),
                    self.selector if phase == 'public' else '']
         self.invoke(command, phase + '-banner-audit.json')
         self.check_binding()
@@ -392,15 +394,46 @@ class MKArticleImages:
         return result
 
 
-def audit_banner(directory, snapshot, banner_file, selector):
+def native_public_banner(images, figure, image, identity):
+    """Recognize the public imageblock/span/img banner, without a caption."""
+    span = image.parent
+    filename = image.attrs.get('data-filename')
+
+    def only_child(node, child):
+        return ([n for n in node.children if not isinstance(n, str)] == [child]
+                and not any(images.compact(n) for n in node.children if isinstance(n, str)))
+
+    if (span.tag != 'span' or span.parent is not figure
+            or 'data-ke-type' in figure.attrs
+            or set(figure.attrs.get('class', '').split()) != {'imageblock', 'alignCenter'}
+            or figure.attrs.get('data-ke-mobilestyle') != 'widthOrigin'
+            or not filename or figure.attrs.get('data-filename') != filename
+            or not only_child(figure, span) or not only_child(span, image)
+            or any(images.attachment_identity(span.attrs.get(key, '')) != identity
+                   for key in ('data-url', 'data-phocus'))):
+        return False
+    wrapper = figure.parent
+    if wrapper is not None and wrapper.tag == 'p' and (wrapper.attrs or not only_child(wrapper, figure)):
+        return False
+    images.validate_srcset(image, identity)
+    return True
+
+
+def audit_banner(phase, directory, snapshot, banner_file, selector):
+    if phase not in ('editor', 'public') or (phase == 'editor' and selector):
+        raise ImagePublishError('audit/input-invalid')
     # Read-only Stage2 helper import. Never import/execute the generation engine.
     sys.path.insert(0, directory)
     try:
         import mk_image_validation as images
     except Exception:
         raise ImagePublishError('audit/import-failed') from None
-    if not all(callable(getattr(images, name, None)) for name in
-               ('content_root', 'attachment_identity', 'require_visible', 'compact')):
+    public = phase == 'public'
+    parser = 'public_content_root' if public else 'content_root'
+    required = (parser, 'attachment_identity', 'require_visible', 'compact')
+    if public:
+        required += ('validate_srcset',)
+    if not all(callable(getattr(images, name, None)) for name in required):
         raise ImagePublishError('audit/dependency-api')
     try:
         html = Path(snapshot).read_text(encoding='utf-8')
@@ -410,7 +443,7 @@ def audit_banner(directory, snapshot, banner_file, selector):
     except (OSError, UnicodeError, ValueError):
         raise ImagePublishError('audit/input-invalid') from None
     try:
-        root = images.content_root(html, selector or None)
+        root = getattr(images, parser)(html, selector or None)
     except (AttributeError, TypeError):
         raise ImagePublishError('audit/dependency-api') from None
     except Exception:
@@ -428,7 +461,8 @@ def audit_banner(directory, snapshot, banner_file, selector):
         figure = before[0].parent
         while figure is not None and figure.tag != 'figure':
             figure = figure.parent
-        if figure is None or figure.attrs.get('data-ke-type') != 'image':
+        if figure is None or (figure.attrs.get('data-ke-type') != 'image'
+                              and not (public and native_public_banner(images, figure, before[0], identity))):
             raise ImagePublishError('audit/banner-mismatch')
         if any(n.tag in ('iframe', 'embed', 'object', 'video', 'audio', 'svg', 'canvas') for n in nodes):
             raise ImagePublishError('audit/embed-mismatch')
@@ -441,7 +475,7 @@ def audit_banner(directory, snapshot, banner_file, selector):
 
 if __name__ == '__main__':
     try:
-        if len(sys.argv) != 6 or sys.argv[1] != '--audit-banner':
+        if len(sys.argv) != 7 or sys.argv[1] != '--audit-banner':
             raise ImagePublishError('audit/input-invalid')
         print(json.dumps(audit_banner(*sys.argv[2:])))
     except ImagePublishError as error:
