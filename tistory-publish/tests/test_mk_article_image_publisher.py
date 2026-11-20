@@ -1224,14 +1224,15 @@ class AuditBannerEntrypointTests(unittest.TestCase):
         image = SimpleNamespace(tag='img', attrs={'src': 'https://cdn.example/banner.jpg', 'alt': 'banner'}, parent=figure)
         heading = SimpleNamespace(tag='h2', text=lambda: '기사')
         nodes = [figure, image, heading]
-        module = SimpleNamespace(content_root=Mock(return_value=SimpleNamespace(walk=lambda: iter(nodes))),
+        root = SimpleNamespace(walk=lambda: iter(nodes))
+        module = SimpleNamespace(content_root=Mock(return_value=root), public_content_root=Mock(return_value=root),
                                  attachment_identity=Mock(side_effect=lambda src: src),
-                                 compact=lambda text: text.strip(), require_visible=Mock())
+                                 compact=lambda text: text.strip(), require_visible=Mock(), validate_srcset=Mock())
         return module, nodes
 
-    def execute(self, module, expected=None, args=None):
+    def execute(self, module, expected=None, args=None, phase='public'):
         argv = [str(SCRIPTS / 'mk_article_image_publisher.py'), '--audit-banner',
-                str(self.tmp), str(self.snapshot), str(self.banner), '.contents_style']
+                phase, str(self.tmp), str(self.snapshot), str(self.banner), '.contents_style' if phase == 'public' else '']
         with patch.object(sys, 'argv', argv if args is None else args), patch.object(sys, 'path', sys.path[:]), \
                 patch.dict(sys.modules, mk_image_validation=module), patch('builtins.print') as output:
             code = 0
@@ -1250,18 +1251,39 @@ class AuditBannerEntrypointTests(unittest.TestCase):
     def test_entrypoint_success_uses_scoped_stage2_helpers(self):
         module, nodes = self.images()
         self.execute(module)
-        module.content_root.assert_called_once_with('controlled snapshot', '.contents_style')
+        module.public_content_root.assert_called_once_with('controlled snapshot', '.contents_style')
+        module.content_root.assert_not_called()
         module.require_visible.assert_called_once_with(nodes[1])
+        self.execute(module, phase='editor')
+        module.content_root.assert_called_once_with('controlled snapshot', None)
+
+    def test_native_banner_is_public_only_and_uses_bound_srcset(self):
+        module, nodes = self.images()
+        figure, image, heading = nodes
+        src = image.attrs['src']
+        span = SimpleNamespace(tag='span', attrs={'data-url': src, 'data-phocus': src},
+                               parent=figure, children=[image])
+        figure.attrs = {'class': 'imageblock alignCenter', 'data-ke-mobilestyle': 'widthOrigin',
+                        'data-filename': 'banner.jpg'}
+        figure.children = [span]
+        image.parent = span
+        image.attrs['data-filename'] = 'banner.jpg'
+        nodes[:] = [figure, span, image, heading]
+        self.execute(module)
+        module.validate_srcset.assert_called_once_with(image, src)
+        self.execute(module, 'audit/banner-mismatch', phase='editor')
+        span.attrs['data-phocus'] = 'https://cdn.example/other.jpg'
+        self.execute(module, 'audit/banner-mismatch')
 
     def test_entrypoint_classifies_import_and_changed_dependency_api(self):
         self.execute(None, 'audit/import-failed')
-        for name in ('content_root', 'attachment_identity', 'require_visible', 'compact'):
+        for name in ('public_content_root', 'attachment_identity', 'require_visible', 'compact', 'validate_srcset'):
             with self.subTest(name=name):
                 module, nodes = self.images()
                 delattr(module, name)
                 self.execute(module, 'audit/dependency-api')
         module, nodes = self.images()
-        module.content_root.side_effect = TypeError('changed signature /private/private-secret')
+        module.public_content_root.side_effect = TypeError('changed signature /private/private-secret')
         self.execute(module, 'audit/dependency-api')
         module, nodes = self.images()
         module.require_visible.side_effect = AttributeError('renamed field /private/private-secret')
@@ -1279,7 +1301,7 @@ class AuditBannerEntrypointTests(unittest.TestCase):
             self.banner.write_text(value)
             self.execute(module, 'audit/input-invalid')
         save(self.banner, {'src': 'https://cdn.example/banner.jpg', 'alt': 'banner'})
-        module.content_root.side_effect = ValueError('bad scope /private/private-secret')
+        module.public_content_root.side_effect = ValueError('bad scope /private/private-secret')
         self.execute(module, 'audit/input-invalid')
         for intro_only in (False, True):
             module, nodes = self.images()
@@ -1347,8 +1369,8 @@ class RealStage2Tests(unittest.TestCase):
     def adapter(self, **overrides):
         return stage3.MKArticleImages(**dict(self.options, **overrides))
 
-    def uploaded(self):
-        adapter = self.adapter()
+    def uploaded(self, **overrides):
+        adapter = self.adapter(**overrides)
         editor = FakeEditor(self.bundle)
         adapter.upload_articles(editor, editor.upload)
         adapter.upload_banner(editor, editor.upload)
@@ -1453,6 +1475,52 @@ class RealStage2Tests(unittest.TestCase):
         self.assertTrue(proof['success'])
         self.assertEqual(proof['card_count'], 4)
         self.assertEqual(proof['images']['verified'], 4)
+
+    def test_native_public_banner_round_trip_and_fail_closed_controls(self):
+        adapter, editor = self.uploaded(banner_alt='배너 "인용" · 소개')
+        # The production helper takes adapter.banner_alt; construct the same
+        # editor DOM using the observed uploaded source and planned alt.
+        alt = '배너 ＂인용＂ · 소개'
+        self.assertEqual(adapter.banner_alt, alt)
+        self.assertEqual(json.loads((adapter.evidence / 'banner.json').read_text())['alt'], alt)
+        editor.snapshot = editor.snapshot.replace('alt="독립 배너"', f'alt="{escape(alt)}"', 1)
+        rendered = editor.snapshot
+        banner = rendered[:rendered.index('</figure>') + len('</figure>')]
+        self.assertIn(f'alt="{alt}"', banner)
+        src = escape(editor.srcs[4])
+        native = ('<p><figure class="imageblock alignCenter" data-ke-mobilestyle="widthOrigin" '
+                  f'data-filename="banner.jpg"><span data-url="{src}" data-phocus="{src}">'
+                  f'<img src="{src}" alt="{alt}" data-filename="banner.jpg"></span></figure>\n</p>')
+        adapter.before_submit(editor)
+        adapter.confirm_publication('https://blog.example/125', '125')
+        document = ('<html><head><meta property="example" content="one" content="two"></head>'
+                    '<body><div class="contents_style">' + rendered.replace(banner, native, 1)
+                    + '</div></body></html>')
+        self.assertTrue(adapter.public_gate(Mock(return_value=document))['success'])
+
+        audit = [self.python, str(SCRIPTS / 'mk_article_image_publisher.py'), '--audit-banner']
+        observed = self.tmp / 'observed.html'
+        def check(phase, html, expected, selector=''):
+            observed.write_text(html)
+            attempt = subprocess.run([*audit, phase, str(self.directory), str(observed),
+                                      str(adapter.evidence / 'banner.json'), selector],
+                                     capture_output=True, text=True)
+            self.assertEqual(attempt.returncode, 1)
+            self.assertEqual(json.loads(attempt.stdout), {'success': False, 'error': expected})
+
+        check('editor', rendered.replace(banner, native, 1), 'audit/banner-mismatch')
+        for damage in (native.replace(alt, '배너 &amp;quot;인용&amp;quot; · 소개'),
+                       native.replace(f'data-url="{src}"', 'data-url="https://cdn.example/wrong.jpg"'),
+                       native.replace(f'data-phocus="{src}"', ''),
+                       native.replace(f'src="{src}"', f'src="{src}" srcset="https://cdn.example/wrong.jpg 1x"'),
+                       native.replace('class="imageblock alignCenter"', 'class="imageblock"'),
+                       native.replace('data-filename="banner.jpg"', 'data-filename="wrong.jpg"', 1),
+                       native.replace('<span ', '<span hidden '),
+                       native.replace('</span>', '</span><figcaption>unexpected</figcaption>'),
+                       native + native):
+            with self.subTest(damage=damage):
+                check('public', document.replace(native, damage, 1), 'audit/banner-mismatch', '.contents_style')
+        check('public', document.replace('alt="' + alt + '"', 'alt="one" alt="two"', 1), 'audit/input-invalid')
 
     def test_editor_rejects_structural_and_identity_mistakes_before_submit(self):
         adapter, editor = self.uploaded()
