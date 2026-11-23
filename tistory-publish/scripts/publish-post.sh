@@ -220,6 +220,7 @@ BANNER_ALT = sys.argv[12] if len(sys.argv) > 12 else ""
 
 sys.path.insert(0, sys.argv[13])
 from cdp_preflight import connect_preflight
+from publish_recovery import record_pre_submit_failure
 from cdp_owned_tab_cleanup import cleanup_owned_target
 from title_spacing import normalize_title_spacing
 CDP_CONNECT_TIMEOUT_MS = int(sys.argv[14])
@@ -258,7 +259,12 @@ def public_url_for(url):
     return urlunsplit((public_parts.scheme, public_parts.netloc, parts.path, parts.query, parts.fragment))
 
 def log(msg): print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr)
+pre_submit_failure_scope = None
+
 def fail(msg):
+    proof_scope = globals().get('pre_submit_failure_scope')
+    if proof_scope and TEMPLATE == 'daum-trends' and not PRIVATE:
+        record_pre_submit_failure(os.environ, proof_scope, BLOG, CATEGORY, CDP_PORT)
     if globals().get('mk_images') and mk_images.enabled:
         result = mk_failure_result(msg)
         print(json.dumps(result))
@@ -1868,6 +1874,7 @@ with sync_playwright() as p:
     try:
         browser = connect_preflight(p.chromium, int(CDP_PORT), CDP_CONNECT_TIMEOUT_MS, log)
     except RuntimeError:
+        pre_submit_failure_scope = 'cdp-attach-failed'
         fail('publish/cdp-attach-failed')
 
     # 기존 탭을 닫거나 재사용하지 않고, 성공한 연결에서 실행 전용 탭을 만든다.
@@ -1904,6 +1911,8 @@ with sync_playwright() as p:
     # 로그인 세션 확인
     _login_domains = ["auth/login", "accounts.kakao.com", "logins.daum.net", "kauth.kakao.com"]
     if any(x in page.url for x in _login_domains):
+        if TEMPLATE == 'daum-trends' and not PRIVATE and os.environ.get('TISTORY_PRE_SUBMIT_RETRY') == '1':
+            fail('publish/retry-login-not-ready')
         log(f"  ⚠️ login redirect detected: {page.url}")
         write_debug_artifacts(page, 'step1-login-redirect')
         login_ok, login_detail = run_login_recovery()
@@ -2173,7 +2182,11 @@ with sync_playwright() as p:
     log(f"  - OG URLs: {len(og_entries)}")
     # plain-link 폴백은 daum-trends가 명시적으로 켤 때만, 그리고 strict custom
     # OG validator(should_run_og_gate)가 꺼진 경우에만 허용한다.
-    og_render_summary = render_og_cards(page, og_entries, 'step5', allow_plain_link_fallback=(TEMPLATE == 'daum-trends' and not should_run_og_gate()))
+    pre_submit_failure_scope = 'initial-og-render-failed'
+    try:
+        og_render_summary = render_og_cards(page, og_entries, 'step5', allow_plain_link_fallback=(TEMPLATE == 'daum-trends' and not should_run_og_gate()))
+    finally:
+        pre_submit_failure_scope = None
     log("Step 5: 완료")
 
     # ── Step 6: 대표이미지 ──
