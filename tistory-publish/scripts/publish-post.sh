@@ -1188,10 +1188,11 @@ def find_image_file_input(page, timeout_ms=3500):
     raise RuntimeError(f"image file input not attached: {last_error}")
 
 
-def upload_editor_image(page, image_path, context, attempts=3, single_delivery=False):
+def upload_editor_image(page, image_path, context, attempts=3, single_delivery=False, daum_delivery=None):
     last_error = None
     last_state = None
     delivery_started = False
+    delivery_options = {'timeout': 5000} if daum_delivery is not None else {}
     for attempt in range(1, attempts + 1):
         chooser_error = None
         try:
@@ -1202,10 +1203,15 @@ def upload_editor_image(page, image_path, context, attempts=3, single_delivery=F
             with page.expect_file_chooser(timeout=5000) as chooser_info:
                 open_attach_image_menu(page)
             delivery_started = True
-            chooser_info.value.set_files(image_path)
-            log(f"  - {context} file input ready (attempt {attempt}/{attempts}, selector=file-chooser)")
+            if daum_delivery is not None:
+                arm_daum_inline_delivery(page, daum_delivery)
+            chooser_info.value.set_files(image_path, **delivery_options)
+            if daum_delivery is None:
+                log(f"  - {context} file input ready (attempt {attempt}/{attempts}, selector=file-chooser)")
             return
         except Exception as e:
+            if daum_delivery is not None and (delivery_started or daum_delivery['dialog'] is not None):
+                raise
             if single_delivery and delivery_started:
                 raise RuntimeError('MK upload delivery uncertain; no second file delivery') from e
             chooser_error = e
@@ -1213,10 +1219,19 @@ def upload_editor_image(page, image_path, context, attempts=3, single_delivery=F
         try:
             file_input, selector = find_image_file_input(page)
             delivery_started = True
-            file_input.set_input_files(image_path)
-            log(f"  - {context} file input ready (attempt {attempt}/{attempts}, selector={selector})")
+            if daum_delivery is not None:
+                arm_daum_inline_delivery(page, daum_delivery)
+            file_input.set_input_files(image_path, **delivery_options)
+            if daum_delivery is None:
+                log(f"  - {context} file input ready (attempt {attempt}/{attempts}, selector={selector})")
             return
         except Exception as e:
+            if daum_delivery is not None:
+                if delivery_started or daum_delivery['dialog'] is not None:
+                    raise
+                if attempt < attempts:
+                    time.sleep(2 ** attempt)
+                continue
             if single_delivery and delivery_started:
                 raise RuntimeError('MK upload delivery uncertain; no second file delivery') from e
             last_error = e
@@ -1236,12 +1251,128 @@ def upload_editor_image(page, image_path, context, attempts=3, single_delivery=F
             log(f"  - {context} upload retry in {delay_s}s")
             time.sleep(delay_s)
 
+    if daum_delivery is not None:
+        return False
     artifact_context = re.sub(r'[^a-z0-9]+', '-', context.lower()).strip('-') or 'image'
     write_debug_artifacts(page, f'{artifact_context}-upload-input-failed')
     raise RuntimeError(
         f"{context} image upload unavailable after {attempts} attempts; "
         f"last_error={type(last_error).__name__}: {last_error}; state={last_state}"
     )
+
+
+def arm_daum_inline_delivery(page, delivery):
+    if delivery['dialog'] is not None:
+        raise RuntimeError('daum-inline/pre-delivery-dialog')
+    if page.evaluate('(item) => beginDaumInlineUpload(item)', delivery['item']) is not True:
+        raise RuntimeError('daum-inline/observer-unavailable')
+    if delivery['dialog'] is not None:
+        raise RuntimeError('daum-inline/pre-delivery-dialog')
+    delivery['started'] = True
+
+
+def observe_daum_inline_dialog(dialog, delivery):
+    try:
+        if (delivery['started'] and delivery['dialog'] is None
+                and dialog.type == 'alert'
+                and dialog.message == '업로드가 실패했습니다. 네트워크 상태를 확인해 주세요.'):
+            delivery['dialog'] = 'upload-failed'
+            delivery['alert_at'] = time.monotonic()
+        else:
+            delivery['dialog'] = 'uncertain'
+        if dialog.type == 'confirm' and '이어서 작성하시겠습니까?' in dialog.message:
+            dialog.dismiss()
+        else:
+            dialog.accept()
+    except Exception:
+        delivery['dialog'] = 'uncertain'
+
+
+def confirm_daum_inline_upload(page, delivery):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        state = page.evaluate('() => pollDaumInlineUpload()')
+        dialog = delivery['dialog']
+        if state not in ('pending', 'candidate', 'ready') or dialog == 'uncertain':
+            return 'completion-uncertain'
+        if dialog == 'upload-failed':
+            if state != 'pending':
+                return 'completion-uncertain'
+            if time.monotonic() - delivery['alert_at'] >= 0.5:
+                return 'editor-reported-failure'
+        elif state == 'ready':
+            if page.evaluate('() => finishDaumInlineUpload()') is True and delivery['dialog'] is None:
+                return None
+            return 'completion-uncertain'
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            # Pump Playwright's native dialog events between DOM observations.
+            page.wait_for_timeout(min(250, remaining * 1000))
+    return 'completion-uncertain'
+
+
+def upload_daum_inline_slot(page, image_path, delivery):
+    failure = 'assignment-uncertain'
+    try:
+        try:
+            assigned = upload_editor_image(page, image_path, 'daum-inline', daum_delivery=delivery)
+        except Exception:
+            if delivery['started'] and delivery['dialog'] == 'upload-failed':
+                failure = 'completion-uncertain'
+                if confirm_daum_inline_upload(page, delivery) == 'editor-reported-failure':
+                    failure = 'editor-reported-failure'
+        else:
+            if assigned is False:
+                failure = 'input-unavailable'
+            else:
+                failure = 'completion-uncertain'
+                failure = confirm_daum_inline_upload(page, delivery)
+    except Exception:
+        pass  # Playwright errors can contain file paths, editor content or URLs.
+    finally:
+        if failure:
+            try:
+                page.evaluate('() => abortDaumInlineUpload()')
+            except Exception:
+                pass
+    if failure == 'editor-reported-failure' and delivery['dialog'] != 'upload-failed':
+        return 'completion-uncertain'
+    return failure
+
+
+def upload_daum_inline_images(page, image_files, caption):
+    global daum_inline_delivery
+    try:
+        comic_width = int(os.environ.get('DAUM_TRENDS_COMIC_DISPLAY_WIDTH', '680'))
+    except ValueError:
+        fail('daum-inline/invalid-comic-width slot=1')
+    delivery = {'started': False, 'dialog': None}
+    daum_inline_delivery = delivery
+    try:
+        for slot, image_path in enumerate(image_files, 1):
+            item = {'marker': f'trend-image-{slot}', 'filename': os.path.basename(image_path),
+                    'caption': caption, 'comicWidth': comic_width}
+            delivery.update(item=item, started=False, dialog=None)
+            failure = upload_daum_inline_slot(page, image_path, delivery)
+            if failure:
+                fail(f'daum-inline/{failure} slot={slot}')
+
+        delivery['started'] = False
+        try:
+            state = page.evaluate('(caption) => countDaumInlineFigures(caption)', caption)
+            figures_ok = state['figures'] >= len(image_files)
+            captions_ok = not caption or state['matchingCaptions'] >= len(image_files)
+        except Exception:
+            fail(f'daum-inline/completion-uncertain slot={len(image_files)}')
+        if delivery['dialog'] is not None:
+            fail(f'daum-inline/completion-uncertain slot={len(image_files)}')
+    finally:
+        daum_inline_delivery = None
+    if not figures_ok:
+        fail(f'daum-inline/figure-count-mismatch slot={len(image_files)}')
+    if not captions_ok:
+        fail(f'daum-inline/caption-count-mismatch slot={len(image_files)}')
+
 
 def select_mk_banner_representative(page, banner_src, skip_setting):
     """MK는 업로드에서 관찰한 별도 배너 src만 대표이미지 대상으로 허용한다."""
@@ -1847,6 +1978,7 @@ sys.excepthook = _classify_excepthook
 
 start = time.time()
 last_dialog_message = None
+daum_inline_delivery = None
 body_html = open(BODY_FILE, 'r', encoding='utf-8').read()
 draft_og_gate = None
 public_og_gate = None
@@ -1871,6 +2003,9 @@ if should_run_og_gate():
 
 def handle_dialog(dialog):
     global last_dialog_message
+    if daum_inline_delivery is not None:
+        observe_daum_inline_dialog(dialog, daum_inline_delivery)
+        return
     try:
         payload = {"type": dialog.type, "message": dialog.message}
         last_dialog_message = payload
@@ -2046,6 +2181,12 @@ with sync_playwright() as p:
     inline_image_caption = os.environ.get('TISTORY_INLINE_IMAGE_CAPTION', '').strip()
     if mk_images.enabled:
         mk_images.upload_articles(page, upload_editor_image)
+    elif TEMPLATE == 'daum-trends' and image_files_env:
+        image_files = [p for p in image_files_env.split(':') if p]
+        if not image_files:
+            fail('daum-inline/empty-file-list slot=1')
+        upload_daum_inline_images(page, image_files, inline_image_caption)
+        log("Step 3.5: 완료")
     elif image_files_env:
         log("Step 3.5: inline 이미지 업로드")
         image_files = [p for p in image_files_env.split(':') if p]

@@ -1642,6 +1642,161 @@ function rebuildContentWithImageFigures(sectionMarkers) {
   return { success: true, contentLength: editor.getContent().length };
 }
 
+// Daum Step 3.5 only. Keep attachment URLs and node identities in the editor.
+let daumInlineUpload = null;
+const daumInlineReceipts = [];
+const daumImageFigure = 'figure[data-ke-type="image"]';
+
+function daumAttachmentPath(src) {
+  if (!src?.startsWith('https://')) return '';
+  try {
+    const url = new URL(src);
+    return url.username || url.password || url.pathname === '/' ? '' : url.origin + url.pathname;
+  } catch {
+    return '';
+  }
+}
+
+function daumInlineMarkers(body, marker) {
+  return Array.from(body.querySelectorAll('[data-image-marker]'))
+    .filter(node => node.getAttribute('data-image-marker') === marker);
+}
+
+function daumInlineReceiptsIntact(body) {
+  return daumInlineReceipts.every(({img, figure, src, item}) => body.contains(figure)
+    && figure.querySelectorAll('img').length === 1 && figure.querySelector('img') === img
+    && img.getAttribute('src') === src && img.getAttribute('data-filename') === item.filename
+    && !daumInlineMarkers(body, item.marker).length);
+}
+
+function noteDaumInlineSource(op, img, src) {
+  const path = daumAttachmentPath(src);
+  if (!path || op.original.has(img)) return;
+  if (op.oldPaths.has(path) || (op.server && (op.server.img !== img || op.server.path !== path))) {
+    op.uncertain = true;
+  }
+  op.server = {img, path};
+}
+
+function noteDaumInlineMutations(op, records) {
+  for (const record of records) {
+    const {target, attributeName, oldValue} = record;
+    if (record.type === 'attributes') {
+      const value = target.getAttribute(attributeName);
+      if (attributeName === 'src' && target.matches('img')) {
+        if (op.original.has(target)) {
+          const originalSrc = op.original.get(target);
+          if (oldValue !== originalSrc || value !== originalSrc) op.uncertain = true;
+        } else {
+          noteDaumInlineSource(op, target, oldValue);
+          noteDaumInlineSource(op, target, value);
+        }
+      }
+      if (oldValue !== value && (target === op.stable?.img || target === op.stable?.figure)) op.stable = null;
+    }
+    for (const node of record.addedNodes || []) {
+      if (node.nodeType !== 1) continue;
+      const imgs = node.matches('img') ? [node] : node.querySelectorAll('img');
+      for (const img of imgs) noteDaumInlineSource(op, img, img.getAttribute('src'));
+    }
+    for (const node of record.removedNodes || []) {
+      if (node === op.marker || node.contains(op.marker)) op.uncertain = true;
+      if (op.stable && node.contains(op.stable.img)) op.stable = null;
+    }
+  }
+}
+
+function beginDaumInlineUpload(item) {
+  const editor = getSafeTinyEditor();
+  const body = editor?.getBody();
+  if (!body || daumInlineUpload || !item.filename || !daumInlineReceiptsIntact(body)) return false;
+  const markers = daumInlineMarkers(body, item.marker);
+  if (markers.length !== 1 || !markers[0].matches('p')) return false;
+  const original = new Map(Array.from(body.querySelectorAll('img'), img => [img, img.getAttribute('src')]));
+  const oldPaths = new Set(Array.from(original.values(), daumAttachmentPath));
+  const originalFigures = new Set(body.querySelectorAll(daumImageFigure));
+  const op = {editor, body, item, marker: markers[0], original, oldPaths, originalFigures};
+  op.observer = new MutationObserver(records => noteDaumInlineMutations(op, records));
+  op.observer.observe(body, {childList: true, subtree: true, attributes: true, attributeOldValue: true,
+    attributeFilter: ['src', 'data-filename', 'data-ke-type', 'data-placeholder', 'data-mce-placeholder', 'data-mce-bogus']});
+  daumInlineUpload = op;
+  return true;
+}
+
+function pollDaumInlineUpload() {
+  const op = daumInlineUpload;
+  if (!op) return 'uncertain';
+  noteDaumInlineMutations(op, op.observer.takeRecords());
+  const {body, original, item} = op;
+  const markers = daumInlineMarkers(body, item.marker);
+  const added = Array.from(body.querySelectorAll('img')).filter(img => !original.has(img));
+  if (getSafeTinyEditor() !== op.editor || op.editor.getBody() !== body || op.uncertain
+      || markers.length !== 1 || markers[0] !== op.marker || added.length > 1
+      || !daumInlineReceiptsIntact(body)
+      || Array.from(original).some(([img, src]) => !body.contains(img) || img.getAttribute('src') !== src)) {
+    op.uncertain = true;
+    return 'uncertain';
+  }
+  const [img] = added;
+  const src = img?.getAttribute('src');
+  if (img) noteDaumInlineSource(op, img, src);
+  const filename = img?.getAttribute('data-filename');
+  const figure = img?.closest(daumImageFigure);
+  if (op.uncertain || (filename && filename !== item.filename) || op.originalFigures.has(figure)) {
+    op.uncertain = true;
+    return 'uncertain';
+  }
+  const placeholder = '[data-placeholder], [data-mce-placeholder], [data-mce-bogus]';
+  if (!img || !daumAttachmentPath(src) || filename !== item.filename || !figure || !body.contains(figure)
+      || figure.contains(op.marker) || op.marker.contains(figure) || figure.querySelectorAll('img').length !== 1
+      || img.closest(placeholder) || !img.complete || !(img.naturalWidth > 0)) {
+    op.stable = null;
+    return op.server ? 'candidate' : 'pending';
+  }
+  const now = performance.now();
+  if (op.stable?.img !== img || op.stable.figure !== figure || op.stable.src !== src) {
+    op.stable = {img, figure, src, since: now};
+  }
+  return now - op.stable.since >= 500 ? 'ready' : 'candidate';
+}
+
+function abortDaumInlineUpload() {
+  daumInlineUpload?.observer.disconnect();
+  daumInlineUpload = null;
+}
+
+function finishDaumInlineUpload() {
+  if (pollDaumInlineUpload() !== 'ready') return false;
+  const {editor, body, item, marker, stable} = daumInlineUpload;
+  const {figure} = stable;
+  if (item.caption && figure.querySelectorAll('figcaption').length > 1) return false;
+  abortDaumInlineUpload();
+  if (/^00-comic\.(jpe?g|png|webp)$/i.test(item.filename)) {
+    normalizeImagePresentation(figure, {align: 'left', width: item.comicWidth});
+  }
+  applyImageCaption(figure, item.caption);
+  marker.replaceWith(figure);
+  editor.setDirty(true);
+  editor.fire('change');
+  editor.save();
+  const cm = document.querySelector('.CodeMirror');
+  if (cm && cm.CodeMirror) cm.CodeMirror.setValue(editor.getContent());
+  document.querySelectorAll('textarea').forEach(t => {
+    if (t.value.length > 100) t.value = editor.getContent();
+  });
+  daumInlineReceipts.push({...stable, item});
+  return editor.getBody() === body && daumInlineReceiptsIntact(body);
+}
+
+function countDaumInlineFigures(caption) {
+  const body = getSafeTinyEditor()?.getBody();
+  if (!body || !daumInlineReceiptsIntact(body)) return null;
+  const figures = Array.from(body.querySelectorAll(daumImageFigure));
+  const captions = figures.flatMap(figure => Array.from(figure.querySelectorAll('figcaption')));
+  return {figures: figures.length, matchingCaptions: captions
+    .filter(node => node.textContent.trim() === caption).length};
+}
+
 // MK Stage3 only. One file delivery, one operation, retained node references.
 // Never search by filename/marker claims to identify the returned attachment.
 let mkImageUploadOperation = null;
