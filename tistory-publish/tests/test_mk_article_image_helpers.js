@@ -9,6 +9,7 @@ class Node {
     this.nodeType = 1;
     this.attrs = {...attrs};
     this.children = [];
+    this.style = {removeProperty(name) { delete this[name]; }};
     for (const child of children) this.appendChild(child);
   }
   getAttribute(key) { return Object.hasOwn(this.attrs, key) ? this.attrs[key] : null; }
@@ -56,8 +57,8 @@ function fixture() {
   let observer;
   let now = 1000;
   const editor = {getBody: () => body, selection: {select() {}, collapse() {}}, setDirty() {}, fire() {}, save() {}};
-  const sandbox = {console, URL, Date: {now: () => now},
-    document: {createElement: tag => new Node(tag)},
+  const sandbox = {console, URL, Date: {now: () => now}, performance: {now: () => now},
+    document: {createElement: tag => new Node(tag), querySelector: () => null, querySelectorAll: () => []},
     tinymce: {activeEditor: editor},
     MutationObserver: class {
       constructor(callback) { this.callback = callback; this.records = []; observer = this; }
@@ -68,7 +69,8 @@ function fixture() {
   };
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'scripts', 'tistory-editor-helpers.js'), 'utf8') +
-    '\nthis.api = {beginMKImageUpload, pollMKImageUpload, finishMKImageUpload, abortMKImageUpload, preserveMKOGThumbnailEvidence};', sandbox);
+    `\nthis.api = {beginMKImageUpload, pollMKImageUpload, finishMKImageUpload, abortMKImageUpload, preserveMKOGThumbnailEvidence,
+      beginDaumInlineUpload, pollDaumInlineUpload, finishDaumInlineUpload, abortDaumInlineUpload, countDaumInlineFigures};`, sandbox);
   return {body, editor, api: sandbox.api, tick: (ms = 600) => { now += ms; },
     add(figure) { body.appendChild(figure); observer.records.push({type: 'childList', addedNodes: [figure]}); },
     mutate(node, value) {
@@ -387,3 +389,124 @@ for (const shape of ['og-container', 'data-og-host', 'mixed']) {
   }
 }
 console.log('MK Stage3 operation identity, marker/caption/banner and observed OG evidence tests passed');
+
+const daumItem = (slot, filename = `fixture-${slot}.jpg`) => ({
+  marker: `trend-image-${slot}`, filename, caption: '합성 캡션', comicWidth: 720,
+});
+const daumMarker = item => new Node('p', {'data-image-marker': item.marker});
+function daumFigure(src, filename) {
+  const figure = image(src, filename);
+  Object.assign(figure.querySelector('img'), {complete: true, naturalWidth: 800});
+  return figure;
+}
+
+{
+  const f = fixture();
+  const items = [daumItem(1, '00-comic.jpg'), daumItem(2), daumItem(3), daumItem(4)];
+  const original = daumFigure('https://assets.example/original.jpg', items[0].filename);
+  f.body.appendChild(original);
+  for (const item of items) {
+    f.body.appendChild(new Node('h2', {id: item.marker}));
+    f.body.appendChild(daumMarker(item));
+  }
+  for (const [index, item] of items.entries()) {
+    assert.strictEqual(f.api.beginDaumInlineUpload(item), true);
+    assert.strictEqual(f.api.pollDaumInlineUpload(), 'pending');
+    const exact = daumFigure('blob:fixture-preview', item.filename);
+    f.add(exact);
+    f.tick(900);
+    assert.strictEqual(f.api.pollDaumInlineUpload(), 'pending');
+    const img = exact.querySelector('img');
+    f.mutate(img, `https://assets.example/upload-${index}.jpg`);
+    img.complete = false;
+    assert.strictEqual(f.api.pollDaumInlineUpload(), 'candidate');
+    f.tick(900);
+    assert.strictEqual(f.api.pollDaumInlineUpload(), 'candidate');
+    img.complete = true;
+    assert.strictEqual(f.api.pollDaumInlineUpload(), 'candidate');
+    f.tick(499);
+    assert.strictEqual(f.api.finishDaumInlineUpload(), false);
+    f.tick(1);
+    assert.strictEqual(f.api.finishDaumInlineUpload(), true);
+    assert.strictEqual(f.body.children[2 * index + 2], exact, 'move the observed figure into this exact marker');
+    assert.strictEqual(exact.querySelector('figcaption').textContent, item.caption);
+    assert.strictEqual(f.observer().disconnected, true);
+  }
+  assert.strictEqual(f.body.firstChild, original, 'same-name preexisting figure stays put');
+  assert.strictEqual(original.querySelector('figcaption'), null);
+  const comic = f.body.children[2];
+  assert.strictEqual(comic.getAttribute('data-ke-style'), 'alignLeft');
+  assert.strictEqual(comic.querySelector('img').getAttribute('width'), '720');
+  assert.strictEqual(f.body.querySelectorAll('[data-image-marker]').length, 0);
+  const state = f.api.countDaumInlineFigures(items[0].caption);
+  assert.strictEqual(state.figures, 5);
+  assert.strictEqual(state.matchingCaptions, 4);
+}
+
+for (const scenario of ['preexisting', 'placeholder', 'mismatch', 'multiple', 'transient', 'reused',
+  'old-image-mutated', 'old-figure-reused', 'replaced-marker', 'duplicate-marker']) {
+  const f = fixture();
+  const item = daumItem(1);
+  const target = daumMarker(item);
+  const original = daumFigure('https://assets.example/old.jpg?variant=1', item.filename);
+  f.body.appendChild(original);
+  f.body.appendChild(target);
+  if (scenario === 'duplicate-marker') {
+    f.body.appendChild(daumMarker(item));
+    assert.strictEqual(f.api.beginDaumInlineUpload(item), false);
+    continue;
+  }
+  assert.strictEqual(f.api.beginDaumInlineUpload(item), true);
+  if (scenario !== 'preexisting') {
+    const candidate = daumFigure(scenario === 'reused' ? 'https://assets.example/old.jpg?variant=2' : 'https://assets.example/new.jpg',
+      scenario === 'mismatch' ? `prefix-${item.filename}` : item.filename);
+    if (scenario === 'placeholder') candidate.setAttribute('data-mce-placeholder', '1');
+    if (scenario === 'old-figure-reused') {
+      const added = candidate.querySelector('img');
+      original.appendChild(added);
+      f.observer().records.push({type: 'childList', addedNodes: [added]});
+    } else {
+      f.add(candidate);
+    }
+  }
+  if (['multiple', 'transient'].includes(scenario)) {
+    const extra = daumFigure('https://assets.example/unrelated.jpg', item.filename);
+    f.add(extra);
+    if (scenario === 'transient') extra.remove();
+  }
+  if (scenario === 'old-image-mutated') {
+    const img = original.querySelector('img');
+    const src = img.getAttribute('src');
+    f.mutate(img, 'https://assets.example/changed.jpg');
+    f.mutate(img, src);
+  }
+  if (scenario === 'replaced-marker') target.replaceWith(daumMarker(item));
+  const expected = {preexisting: 'pending', placeholder: 'candidate'}[scenario] || 'uncertain';
+  assert.strictEqual(f.api.pollDaumInlineUpload(), expected, scenario);
+  f.tick();
+  assert.strictEqual(f.api.finishDaumInlineUpload(), false, scenario);
+  assert.strictEqual(f.body.querySelectorAll('[data-image-marker]').length, 1);
+  f.api.abortDaumInlineUpload();
+}
+
+{
+  const f = fixture();
+  const first = daumItem(1);
+  const second = daumItem(2, first.filename);
+  f.body.appendChild(daumMarker(first));
+  f.body.appendChild(daumMarker(second));
+  assert.strictEqual(f.api.beginDaumInlineUpload(first), true);
+  const observed = daumFigure('https://assets.example/upload.jpg', first.filename);
+  f.add(observed);
+  f.api.pollDaumInlineUpload();
+  f.tick();
+  assert.strictEqual(f.api.finishDaumInlineUpload(), true);
+  assert.strictEqual(f.api.beginDaumInlineUpload(second), true);
+  assert.strictEqual(f.api.pollDaumInlineUpload(), 'pending', 'a prior receipt is never a new observation');
+  f.add(daumFigure('https://assets.example/upload.jpg?variant=2', first.filename));
+  assert.strictEqual(f.api.pollDaumInlineUpload(), 'uncertain');
+  assert.strictEqual(f.api.finishDaumInlineUpload(), false);
+  observed.remove();
+  assert.strictEqual(f.api.countDaumInlineFigures(first.caption), null, 'dropping an earlier receipt invalidates the final count');
+}
+console.log('Daum Step 3.5 attachment observation and exact marker binding tests passed');

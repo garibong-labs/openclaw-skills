@@ -133,6 +133,8 @@ Draft/editor 실패는 발행 전 중단하고 public 실패는 `success:false`,
 
 Use `--template daum-trends` for Daum 실시간 트렌드 posts. This preset supplies content defaults such as tags only. The caller must still pass `--blog` and `--category` explicitly.
 
+`TISTORY_INLINE_IMAGE_FILES`를 지정하면 각 슬롯에서 파일명이 정확히 일치하고 HTTPS 이미지 로드가 완료된 새 `figure`를 확인해 해당 마커에 배치합니다. 파일 전달은 슬롯당 한 번으로 제한합니다. 실패하면 제출 전에 `daum-inline/<고정 코드> slot=<1부터 시작하는 번호>`로 중단합니다. 예를 들어 빈 콜론 구분 목록은 `empty-file-list`, 정확한 업로드 실패 알림과 일치하는 관찰 결과가 확인되면 `editor-reported-failure`를 보고합니다. 검증 범위는 오프라인 테스트입니다.
+
 ```bash
 ALLOW_DIRECT_TISTORY_PUBLISH=1 bash scripts/publish-post.sh \
   --template daum-trends \
