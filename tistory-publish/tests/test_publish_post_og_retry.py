@@ -1,6 +1,6 @@
 """Behavior tests for the publish-post.sh OG bounded retry, the
 confirmed-40002 DCInside mobile/desktop paired fallback (2026-08-13 abort),
-and the confirmed HTTP 500 / code 40009 Daum next-source fallback.
+and the confirmed HTTP 500 Daum next-source fallbacks.
 
 The publish engine is embedded Python inside a bash heredoc; like
 test_publish_post_upload.py these tests extract the relevant functions via
@@ -40,6 +40,9 @@ DAUM_PRIMARY = "https://v.daum.net/v/20260816090000001"
 DAUM_NEXT = "https://v.daum.net/v/20260816090000002"
 DAUM_THIRD = "https://v.daum.net/v/20260816090000003"
 NAVER_URL = "https://n.news.naver.com/article/001/0015000000"
+DAUM_REDIRECT = "https://cp.news.search.daum.net/p/12345"
+DAUM_REDIRECT_NEXT = "https://v.daum.net/v/TestArticle1"
+DAUM_REDIRECT_THIRD = "https://v.daum.net/v/TestArticle2"
 
 
 class PublishAbort(RuntimeError):
@@ -75,6 +78,7 @@ def load_og_functions(overrides):
         "json": json,
         "urlsplit": urlsplit,
         "parse_qs": parse_qs,
+        "TEMPLATE": "",
         **overrides,
     }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(SCRIPT_PATH), "exec"), namespace)
@@ -115,6 +119,7 @@ class FakePage:
         self.enter_presses = 0
         self.listeners = []
         self.prepare_calls = []
+        self.status_urls = []
         self.injected_helpers = []
         self.current_status = {"found": False, "ogCardCount": 0}
 
@@ -144,6 +149,7 @@ class FakePage:
                 return self.helpers_ready.pop(0)
             return True
         if "getOGCardStatus" in script:
+            self.status_urls.append(arg)
             return dict(self.current_status)
         if "prepareOGRetry" in script:
             self.prepare_calls.append(("retry", dict(arg)))
@@ -175,7 +181,7 @@ def not_found_status():
 
 
 class OGRetryFallbackTests(unittest.TestCase):
-    def make_namespace(self, env=None):
+    def make_namespace(self, env=None, **overrides):
         logs = []
         fake_time = FakeTime()
 
@@ -189,6 +195,7 @@ class OGRetryFallbackTests(unittest.TestCase):
                 "fail": fail,
                 "os": FakeOS(env or {}),
                 "HELPER_JS": "/fake/helper.js",
+                **overrides,
             }
         )
         return namespace, fake_time, logs
@@ -490,6 +497,155 @@ class DaumNextSourceFallbackTests(OGRetryFallbackTests):
 
     def scrap_40009(self, url):
         return scrap_response(url, 500, '{"code": 40009}')
+
+    def redirect_failure(self, url=DAUM_REDIRECT):
+        return {
+            "responses": [scrap_response(url, blog="publisher.example")],
+            "status": not_found_status(),
+        }
+
+    def test_redirect_40002_uses_own_first_eligible_candidate_in_both_phases(self):
+        for phase in ("step5", "recovery"):
+            with self.subTest(phase=phase):
+                ns, _, logs = self.make_namespace(TEMPLATE="daum-trends")
+                page = FakePage(
+                    [self.redirect_failure(), self.redirect_failure(), {"status": found_status()}],
+                    cleanup_og_cards=1,
+                )
+                result = ns["render_og_cards"](
+                    page,
+                    [{"url": DAUM_REDIRECT, "fallbackUrls": [
+                        "https://source.example/article/123",
+                        DAUM_REDIRECT_NEXT, DAUM_REDIRECT_THIRD,
+                    ]}],
+                    phase,
+                )
+                self.assertEqual(result, {"phase": phase, "ogCards": 1, "plainLinkFallbacks": []})
+                self.assertEqual(page.enter_presses, 3)
+                self.assertEqual(page.prepare_calls, [
+                    ("placeholder", DAUM_REDIRECT),
+                    ("retry", {"fromUrl": DAUM_REDIRECT, "toUrl": DAUM_REDIRECT}),
+                    ("retry", {"fromUrl": DAUM_REDIRECT, "toUrl": DAUM_REDIRECT_NEXT}),
+                ])
+                self.assertEqual(page.status_urls[:-1], [DAUM_REDIRECT] * 16)
+                self.assertEqual(page.status_urls[-1], DAUM_REDIRECT_NEXT)
+                self.assertTrue(any("500/code=40002 confirmed twice" in line for line in logs))
+
+    def test_redirect_40002_stops_after_two_with_no_eligible_owned_candidate(self):
+        for candidates in (
+            None,
+            [],
+            DAUM_REDIRECT_NEXT,
+            [
+                DAUM_REDIRECT_NEXT + "?ref=search",
+                DAUM_REDIRECT_NEXT.replace("/v/", "/series/"),
+                "https://v.daum.net.example/v/TestArticle1",
+            ],
+        ):
+            with self.subTest(candidates=candidates):
+                ns, _, _ = self.make_namespace(TEMPLATE="daum-trends")
+                page = FakePage([self.redirect_failure(), self.redirect_failure()])
+                with self.assertRaisesRegex(PublishAbort, "OG card render failed before publish"):
+                    ns["render_og_cards"](
+                        page,
+                        [
+                            {"url": DAUM_REDIRECT, "fallbackUrls": candidates},
+                            {"url": DAUM_REDIRECT + "6", "fallbackUrls": [DAUM_REDIRECT_NEXT]},
+                        ],
+                        "step5",
+                        allow_plain_link_fallback=True,
+                    )
+                self.assertEqual(page.enter_presses, 2)
+
+    def test_redirect_40002_requires_exact_https_wrapper_and_daum_trends_template(self):
+        foreign_urls = [
+            DAUM_REDIRECT.replace("https:", "http:"),
+            DAUM_REDIRECT.replace("https://", "https://user@"),
+            DAUM_REDIRECT.replace(".net/", ".net:443/"),
+            DAUM_REDIRECT.replace(".net/", ".net.example/"),
+            DAUM_REDIRECT.replace(".net/", ".net./"),
+            DAUM_REDIRECT.replace("/p/", "/article/"),
+            DAUM_REDIRECT.replace("12345", "١٢٣٤٥"),
+            DAUM_REDIRECT.replace("12345", "%31"),
+            DAUM_REDIRECT.replace("12345", ""),
+            DAUM_REDIRECT + "/",
+            DAUM_REDIRECT + "?q=1",
+            DAUM_REDIRECT + "#section",
+            DAUM_REDIRECT + "?",
+            DAUM_REDIRECT + "#",
+            DAUM_REDIRECT + "\n",
+            DAUM_REDIRECT_NEXT,
+        ]
+        cases = [(url, "daum-trends") for url in foreign_urls] + [
+            (DAUM_REDIRECT, template) for template in ("", "mk-review", "simple-post")
+        ]
+        for url, template in cases:
+            with self.subTest(url=url, template=template):
+                ns, _, _ = self.make_namespace(TEMPLATE=template)
+                page = FakePage([self.redirect_failure(url), self.redirect_failure(url)])
+                with self.assertRaisesRegex(PublishAbort, "OG card render failed before publish"):
+                    self.render(ns, page, url, fallback_urls=[DAUM_REDIRECT_NEXT])
+                self.assertEqual(page.enter_presses, 2)
+
+    def test_redirect_40002_stops_after_two_with_missing_or_mixed_evidence(self):
+        confirmed = self.redirect_failure()
+        for label, responses in {
+            "unobserved": [],
+            "wrong URL": [scrap_response(DAUM_REDIRECT + "6", blog="publisher.example")],
+            "unparsable": [scrap_response(DAUM_REDIRECT, 500, "<html>error</html>")],
+            "unreadable": [scrap_response(DAUM_REDIRECT, 500, RuntimeError("body gone"))],
+            "wrong status": [scrap_response(DAUM_REDIRECT, 502)],
+            "non-integer status": [scrap_response(DAUM_REDIRECT, 500.0)],
+            "wrong code": [self.scrap_40009(DAUM_REDIRECT)],
+            "embedded code": [scrap_response(DAUM_REDIRECT, 500, '{"error":{"code":40002}}')],
+            "code prefix": [scrap_response(DAUM_REDIRECT, 500, "code=40002.5")],
+            "conflicting responses": [self.scrap_40009(DAUM_REDIRECT), *confirmed["responses"]],
+        }.items():
+            other = {"responses": responses}
+            for attempts in ([confirmed, other], [other, confirmed], [other, other]):
+                if label == "wrong code" and attempts == [other, other]:
+                    continue  # Two confirmed 40009 responses use the existing fallback.
+                with self.subTest(case=label, attempts=attempts):
+                    ns, _, _ = self.make_namespace(TEMPLATE="daum-trends")
+                    page = FakePage(attempts)
+                    with self.assertRaisesRegex(PublishAbort, "OG card render failed before publish"):
+                        self.render(ns, page, DAUM_REDIRECT, fallback_urls=[DAUM_REDIRECT_NEXT])
+                    self.assertEqual(page.enter_presses, 2)
+
+    def test_redirect_40002_stops_after_one_failed_or_incomplete_candidate(self):
+        for status in (not_found_status(), found_status(count=0)):
+            with self.subTest(status=status):
+                ns, _, _ = self.make_namespace(TEMPLATE="daum-trends")
+                page = FakePage([
+                    self.redirect_failure(),
+                    self.redirect_failure(),
+                    {"responses": [self.scrap_40009(DAUM_REDIRECT_NEXT)], "status": status},
+                ])
+                with self.assertRaisesRegex(PublishAbort, "OG card render failed before publish") as ctx:
+                    ns["render_og_cards"](
+                        page,
+                        [{"url": DAUM_REDIRECT, "fallbackUrls": [DAUM_REDIRECT_NEXT, DAUM_REDIRECT_THIRD]}],
+                        "step5",
+                        allow_plain_link_fallback=True,
+                    )
+                self.assertEqual(page.enter_presses, 3)
+                attempts = json.loads(str(ctx.exception).split("before publish: ", 1)[1])["attempts"]
+                self.assertEqual([attempt["kind"] for attempt in attempts], [
+                    "original", "original-retry", "daum-next-source-fallback",
+                ])
+                self.assertEqual(attempts[-1]["url"], DAUM_REDIRECT_NEXT)
+
+    def test_redirect_40002_success_still_requires_cleanup_card_count(self):
+        ns, _, _ = self.make_namespace(TEMPLATE="daum-trends")
+        page = FakePage(
+            [self.redirect_failure(), self.redirect_failure(), {"status": found_status()}],
+            cleanup_og_cards=0,
+        )
+        with self.assertRaisesRegex(PublishAbort, "OG card count mismatch before publish: expected 1, got 0"):
+            ns["render_og_cards"](
+                page, [{"url": DAUM_REDIRECT, "fallbackUrls": [DAUM_REDIRECT_NEXT]}], "recovery",
+            )
+        self.assertEqual(page.enter_presses, 3)
 
     # ── URL contract and candidate selection ────────────────────────────────
 
