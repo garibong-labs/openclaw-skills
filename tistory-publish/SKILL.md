@@ -175,7 +175,8 @@ bash scripts/login.sh \
 - `<p data-ke-size="size16">` 태그 사용
 - 단락 = 여러 문장 묶음 (`<p>` 하나에 2~4문장)
 - OG 카드 위치: `<p data-og-placeholder="URL">&#8203;</p>`
-- 뉴스 OG 카드 폴백 후보(선택): `<p data-og-placeholder="URL" data-og-fallback-urls="URL1 URL2">&#8203;</p>` — 같은 항목의 v.daum.net 기사 후보를 공백 구분으로 나열. scrap이 두 시도 모두 HTTP 500 + `code=40009`로 확정될 때만 첫 적격 후보를 정확히 1회 시도. 커뮤니티 카드에는 사용 금지
+- 뉴스 OG 카드 폴백 후보(선택): `<p data-og-placeholder="URL" data-og-fallback-urls="URL1 URL2">&#8203;</p>` — 같은 항목의 v.daum.net 기사 후보를 공백 구분으로 나열. 원본과 같은 URL 재시도가 모두 HTTP 500 + `code=40009`로 확정되면 첫 적격 후보를 정확히 1회 시도. 커뮤니티 카드에는 사용 금지
+- **`daum-trends` 뉴스 리다이렉트의 40002 다음 기사 폴백** — 원본이 정확히 `https://cp.news.search.daum.net/p/12345` 형태(예시 ID, ASCII 숫자만)이고 원본과 같은 URL 재시도에서 각각 안전하게 연관·파싱된 HTTP 500 + `code=40002`가 확인되면, 해당 placeholder의 첫 적격 v.daum.net 후보를 정확히 1회 시도. 후보 URL 일치와 카드 수를 검증하며, 후보가 없거나 렌더가 실패·미완료이면 일반 링크 변환 없이 발행 전 중단
 - **`daum-trends` 한정 plain-link 폴백**: 두 원본 시도가 모두 HTTP 500 + `code=40009`로 확정되고 적격 v.daum.net 후보가 전혀 없을 때만, 실패한 placeholder를 카드 대신 일반 출처 하이퍼링크(`data-og-plain-link` 마킹, `href`=원본 URL, `_blank`, `noopener noreferrer`)로 유지하고 최종 결과 JSON의 `ogPlainLinkFallbacks`에 URL/사유/phase를 보고. **깨진 OG는 절대 카드로 계산하지 않는다** — 카드 수 게이트는 `placeholder 수 − plain link 수`와 비교하고 마킹된 plain link 수도 별도 검증. 후보가 있으면 기존대로 후보 1회 시도 후 실패 시 fail-closed. **strict custom OG validator(`TISTORY_OG_VALIDATOR` 설정 시)가 켜져 있으면 이 폴백은 비활성화**되어 기존 엄격한 카드 의미론이 유지되며, 다른 템플릿(mk-review 등)에는 어떤 영향도 없다
 - **`daum-trends` 한정 짝 소진(exhausted-pair) 40002 plain-link 폴백**: 엄격한 DCInside 짝이 계산되는 게시글 URL에서 제한된 3회 시퀀스(원본, 원본 재시도, 계산된 짝으로의 짝 폴백 정확히 1회)가 **전부 안전 연관된 HTTP 500 + `code=40002`로 확정** 실패한 경우에만 (마이너 갤러리 모바일 URL은 짝 helper가 regular `/board/view` 경로를 계산하지만 실제 canonical은 `/mgallery/board/view`라 짝도 같은 40002로 죽는 부류), 원본 URL(계산된 짝이 아님)을 위와 같은 일반 출처 하이퍼링크로 유지하고 `ogPlainLinkFallbacks`에 보고 (짝 시도가 짝 URL로 키잉해 둔 pending 문단은 변환 전에 `prepareOGRetry`로 원본 URL에 재바인딩 — 추가 Enter/scrap 시도 없음). **깨진 OG나 실패한 짝은 절대 카드로 계산하지 않는다**. 짝 시도 성공은 기존대로 카드로 유지·계산되고, 짝이 없거나 짝 시도에 도달하지 못한 40002 실패, 시퀀스 종류/순서/횟수 불일치, 짝 URL 불일치, 미관측/미파싱/타 상태/타 코드는 전부 기존 fail-closed abort. 40009 케이스와 같은 opt-in 게이트를 공유하므로 **custom OG validator가 켜져 있으면 이 폴백도 비활성화**되며, 다른 템플릿에는 영향 없다
 - 구분선: `<hr contenteditable="false" data-ke-type="horizontalRule" data-ke-style="style1">`
@@ -223,7 +224,7 @@ templates/my-template/
 - `getOGPlaceholders()` — placeholder URL 목록
 - `getOGPlaceholderEntries()` — placeholder별 URL + ordered Daum 다음 기사 폴백 후보 목록 (`data-og-fallback-urls`, 없거나 파싱 불가 시 빈 후보로 fail-closed)
 - `prepareOGPlaceholder(url)` — placeholder → URL 텍스트 교체
-- `prepareOGRetry(fromUrl, toUrl)` — 실패한 시도의 pending 문단 재사용 (같은 URL 재시도 / 확정 40002 시 DCInside 짝 폴백 / 확정 500·40009 시 Daum 다음 기사 폴백)
+- `prepareOGRetry(fromUrl, toUrl)` — 실패한 시도의 pending 문단 재사용 (같은 URL 재시도 / DCInside 짝 폴백 / Daum 다음 기사 폴백)
 - `dcinsidePairedOGUrl(url)` — 엄격한 DCInside 모바일↔데스크톱 게시글 짝 계산 (그 외 URL은 null)
 - `verifyOGCard(url)` — 카드 렌더링 확인 (엄격한 DCInside 짝은 같은 글로 인정)
 - `convertPendingToPlainLink(url)` — 확정 500/40009 + 후보 없음일 때 실패한 pending 문단을 일반 출처 링크로 변환 (`data-og-plain-link` 마킹, daum-trends 폴백 전용)

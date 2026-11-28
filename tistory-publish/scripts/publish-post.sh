@@ -397,8 +397,9 @@ def run_og_gate(mode, *args):
 # 전용 다음 기사 폴백. placeholder가 실어 온 같은 트렌드 항목의 ordered
 # 후보(data-og-fallback-urls) 중 첫 적격 v.daum.net 기사 URL을, 두 시도 모두
 # 500/40009로 확정된 경우에만 정확히 1회 시도한다. 후보가 없거나 그 1회가
-# 실패하면 기존 fail-closed abort를 유지한다. 확정 40002 DCInside 짝 폴백은
-# 그대로이며 Daum이나 다른 호스트로 넓히지 않는다.
+# 실패하면 기존 fail-closed abort를 유지한다.
+# daum-trends의 정확한 Daum 뉴스 리다이렉트 URL도 두 원본 시도가 모두
+# HTTP 500 + code=40002로 확정되면 같은 다음 기사 렌더 경로를 사용한다.
 #
 # 2026-09-29 추가: daum-trends 전용 plain-link 폴백. 두 원본 시도가 모두
 # HTTP 500 + payload code=40009로 확정되고, 적격 Daum 다음 기사 후보가 전혀
@@ -474,7 +475,7 @@ def scrap_response_matches(target_url, response_url):
     return any(value.strip() == target for values in params.values() for value in values)
 
 
-def classify_scrap_code(body_text):
+def classify_scrap_code(body_text, *, exact=False):
     """Parse the scrap payload's `code`. Returns the code as a string, or
     None when the payload cannot be parsed (never guessed)."""
     text = (body_text or '').strip()
@@ -486,6 +487,9 @@ def classify_scrap_code(body_text):
         payload = None
     if isinstance(payload, dict) and payload.get('code') is not None:
         return str(payload.get('code')).strip()
+    if exact:
+        match = re.fullmatch(r'code\s*[:=]\s*(-?[0-9]+)', text)
+        return match.group(1) if match else None
     # NOTE: keep this regex free of single-quote characters — the embedded
     # script lives in a bash $( << heredoc ) and unbalanced quotes break
     # bash's substitution parser. Unparsable payloads stay None (fail-closed).
@@ -493,7 +497,7 @@ def classify_scrap_code(body_text):
     return match.group(1) if match else None
 
 
-def summarize_scrap_responses(responses):
+def summarize_scrap_responses(responses, *, confirm_500_40002=False):
     summary = {'observed': False, 'status': None, 'code': None}
     if not responses:
         return summary
@@ -509,6 +513,12 @@ def summarize_scrap_responses(responses):
     except Exception as e:
         summary['bodyError'] = f'{type(e).__name__}: {e}'
     summary['code'] = classify_scrap_code(body)
+    if confirm_500_40002:
+        summary['confirmed50040002'] = (
+            type(summary['status']) is int
+            and summary['status'] == 500
+            and classify_scrap_code(body, exact=True) == '40002'
+        )
     return summary
 
 
@@ -750,7 +760,7 @@ def ensure_og_helpers(page, require_plain_link_helpers=False):
         fail('OG helper functions unavailable after helper injection')
 
 
-def attempt_og_render(page, target_url, min_card_count):
+def attempt_og_render(page, target_url, min_card_count, *, confirm_500_40002=False):
     """One prepared attempt: press Enter, poll for a matching card, and
     passively collect the /manage/scrap response tied to this exact URL.
     Bodies are read only after polling, never inside the event handler."""
@@ -781,16 +791,26 @@ def attempt_og_render(page, target_url, min_card_count):
             page.remove_listener('response', on_response)
         except Exception:
             pass
+    scrap = summarize_scrap_responses(responses, confirm_500_40002=confirm_500_40002)
+    if scrap.get('confirmed50040002'):
+        # 같은 Enter에 연관된 응답끼리도 증거가 일치해야 한다.
+        scrap['confirmed50040002'] = all(
+            summarize_scrap_responses([response], confirm_500_40002=True)['confirmed50040002']
+            for response in responses[:-1]
+        )
     return {
         'found': bool(og_status.get('found')),
         'ogStatus': og_status,
-        'scrap': summarize_scrap_responses(responses),
+        'scrap': scrap,
     }
 
 
 def render_og_card_with_fallback(page, url, index, phase, fallback_urls=None, allow_plain_link_fallback=False):
     prefix = '' if phase == 'step5' else f'{phase} '
     attempts = []
+    daum_redirect = TEMPLATE == 'daum-trends' and re.fullmatch(
+        r'https://cp\.news\.search\.daum\.net/p/[0-9]+', url
+    ) is not None
 
     def describe(attempt_url, kind, outcome):
         scrap = outcome.get('scrap') or {}
@@ -807,11 +827,12 @@ def render_og_card_with_fallback(page, url, index, phase, fallback_urls=None, al
     prep_result = page.evaluate("(url) => prepareOGPlaceholder(url)", url)
     if isinstance(prep_result, dict) and not prep_result.get('success', False):
         fail(f"{prefix}OG placeholder preparation failed before publish: {json.dumps(prep_result, ensure_ascii=False)}")
-    outcome = attempt_og_render(page, url, index)
+    outcome = attempt_og_render(page, url, index, confirm_500_40002=daum_redirect)
     attempts.append(describe(url, 'original', outcome))
     log(f"  - {prefix}OG [{url[:40]}...] attempt 1: {json.dumps(attempts[-1], ensure_ascii=False)}")
     if outcome['found']:
         return url
+    first_confirmed_redirect_40002 = outcome['scrap'].get('confirmed50040002') is True
 
     # 원본 URL 재시도: 정확히 1회, 제한된 지수 백오프 지연 후
     time.sleep(og_backoff_delay_s(1))
@@ -821,11 +842,16 @@ def render_og_card_with_fallback(page, url, index, phase, fallback_urls=None, al
     )
     if isinstance(prep_result, dict) and not prep_result.get('success', False):
         fail(f"{prefix}OG retry preparation failed before publish: {json.dumps(prep_result, ensure_ascii=False)}")
-    outcome = attempt_og_render(page, url, index)
+    outcome = attempt_og_render(page, url, index, confirm_500_40002=daum_redirect)
     attempts.append(describe(url, 'original-retry', outcome))
     log(f"  - {prefix}OG [{url[:40]}...] attempt 2: {json.dumps(attempts[-1], ensure_ascii=False)}")
     if outcome['found']:
         return url
+    both_confirmed_redirect_40002 = (
+        daum_redirect
+        and first_confirmed_redirect_40002
+        and outcome['scrap'].get('confirmed50040002') is True
+    )
 
     # 짝 URL 폴백: 두 시도 모두 scrap payload code=40002로 확정된 경우에만.
     # generic found=false, HTTP 오류, timeout, 미관측/미파싱 응답은 폴백 금지.
@@ -867,21 +893,20 @@ def render_og_card_with_fallback(page, url, index, phase, fallback_urls=None, al
                 pending_url=paired_url,
             )
 
-    # Daum 다음 기사 폴백: 두 시도 모두 HTTP 500 + payload code=40009로 확정된
-    # 경우에만, 이 placeholder에 딸린 같은 트렌드 항목의 ordered 후보에서 첫
-    # 적격 v.daum.net 기사 URL을 정확히 1회 시도한다 (같은 URL 재시도 없음,
-    # 2차 후보 없음). generic found=false, timeout, 미관측/미파싱 응답,
-    # 500 아닌 상태, 40009 아닌 코드, 1회 확정+1회 불명은 폴백 금지.
+    # Daum 다음 기사 폴백: 확정 500/40009와 daum-trends의 정확한 뉴스
+    # 리다이렉트에서 확정 500/40002가 각각 두 번 관측된 경우, 이 placeholder의
+    # 첫 적격 v.daum.net 기사 URL을 정확히 1회 시도한다.
     both_confirmed_500_40009 = len(attempts) == 2 and all(
         attempt.get('scrapObserved')
         and attempt.get('scrapStatus') == 500
         and attempt.get('scrapCode') == '40009'
         for attempt in attempts
     )
-    if both_confirmed_500_40009:
+    if both_confirmed_500_40009 or both_confirmed_redirect_40002:
+        scrap_code = '40009' if both_confirmed_500_40009 else '40002'
         next_daum_url = select_daum_fallback_url(url, fallback_urls)
         if next_daum_url:
-            log(f"  - {prefix}OG [{url[:40]}...] scrap 500/code=40009 confirmed twice; trying next Daum source once: {next_daum_url}")
+            log(f"  - {prefix}OG [{url[:40]}...] scrap 500/code={scrap_code} confirmed twice; trying next Daum source once: {next_daum_url}")
             time.sleep(og_backoff_delay_s(2))
             prep_result = page.evaluate(
                 "({fromUrl, toUrl}) => typeof prepareOGRetry === 'function' ? prepareOGRetry(fromUrl, toUrl) : {success: false, error: 'prepareOGRetry unavailable'}",
@@ -892,9 +917,11 @@ def render_og_card_with_fallback(page, url, index, phase, fallback_urls=None, al
             outcome = attempt_og_render(page, next_daum_url, index)
             attempts.append(describe(next_daum_url, 'daum-next-source-fallback', outcome))
             log(f"  - {prefix}OG [{url[:40]}...] next-source fallback: {json.dumps(attempts[-1], ensure_ascii=False)}")
-            if outcome['found']:
+            if outcome['found'] and (
+                not both_confirmed_redirect_40002 or attempts[-1]['ogCardCount'] >= index
+            ):
                 return next_daum_url
-        elif allow_plain_link_fallback and safe_plain_link_source_url(url):
+        elif both_confirmed_500_40009 and allow_plain_link_fallback and safe_plain_link_source_url(url):
             # plain-link 폴백: 확정 500/40009 + 적격 Daum 후보 없음 + caller의
             # 명시적 opt-in + 보수적 safe external URL일 때만. 변환/검증/집계
             # 정책은 확정 40002 짝 소진 케이스와 degrade_to_plain_link로 공유.
@@ -905,7 +932,7 @@ def render_og_card_with_fallback(page, url, index, phase, fallback_urls=None, al
                 'confirmed 500/code=40009',
             )
         else:
-            log(f"  - {prefix}OG [{url[:40]}...] scrap 500/code=40009 confirmed twice but no eligible next Daum candidate; failing closed")
+            log(f"  - {prefix}OG [{url[:40]}...] scrap 500/code={scrap_code} confirmed twice but no eligible next Daum candidate; failing closed")
 
     fail(f"{prefix}OG card render failed before publish: {json.dumps({'url': url, 'attempts': attempts}, ensure_ascii=False)}")
 
